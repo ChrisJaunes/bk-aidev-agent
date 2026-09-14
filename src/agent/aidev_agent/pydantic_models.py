@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from enum import Enum
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
@@ -369,6 +370,280 @@ class AgentOptions(BaseModel):
     )
 
 
+_DISABLE_VALUES = {"0", "false", "no", "off", "disable", "disabled"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔型环境变量。
+
+    未设置返回 ``default``；命中禁用值（``0`` / ``false`` / ``no`` / ``off`` /
+    ``disable`` / ``disabled``，不区分大小写）返回 ``False``，其余返回 ``True``。
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in _DISABLE_VALUES
+
+
+class SandboxMode(str, Enum):
+    """沙箱隔离模式（平台无关，Linux/macOS/Windows 共用语义）。"""
+
+    READONLY = "readonly"
+    WORKSPACE_WRITE = "workspace_write"
+    FULL_ACCESS = "full_access"
+
+
+class SandboxPolicy(BaseModel):
+    """平台无关的沙箱安全策略。
+
+    描述「沙箱应该如何隔离」，由各平台后端（Linux bwrap / macOS Seatbelt /
+    Windows 受限令牌+AppContainer）翻译成各自的隔离机制。核心策略只收敛
+    三平台能力的最小公共子集：文件（只读/可写出口/拒绝路径）、网络（开关+
+    域名白名单）、模式（三档）。syscall/capability 等平台特有项作为扩展字段，
+    由各后端按能力实现，不在核心策略中强制。
+
+    字段语义：
+    - ``mode``：隔离模式三档（readonly / workspace_write / full_access）。
+    - ``readonly_paths``：只读挂载路径（系统命令 + 动态库），默认不含 /etc、
+      /root、/home 等敏感目录。
+    - ``writable_paths``：可写出口（通常仅工作区根）。
+    - ``deny_paths``：敏感路径强制拒绝（如 /etc/ssh、~/.ssh、~/.aws），
+      沙箱内「不存在」而非「无权限」。
+    - ``allow_network``：是否保留网络；默认关闭，阻断外泄/SSRF。
+    - ``allow_network_domains``：网络白名单域名（空则完全禁网）。
+    - ``drop_privileges``：是否降权（Linux user namespace / macOS Seatbelt /
+      Windows 非提升令牌）；默认开启。
+    """
+
+    mode: SandboxMode = Field(default=SandboxMode.WORKSPACE_WRITE, description="隔离模式三档")
+    readonly_paths: list[str] = Field(
+        default_factory=lambda: ["/usr", "/bin", "/lib", "/lib64"],
+        description="只读挂载路径（系统命令 + 动态库），不含 /etc、/root、/home 等敏感目录",
+    )
+    writable_paths: list[str] = Field(default_factory=list, description="可写出口（通常仅工作区根）")
+    deny_paths: list[str] = Field(default_factory=list, description="敏感路径强制拒绝（如 /etc/ssh、~/.ssh、~/.aws）")
+    allow_network: bool = Field(default=False, description="是否保留网络；默认关闭（阻断外泄/SSRF）")
+    allow_network_domains: list[str] = Field(default_factory=list, description="网络白名单域名（空则完全禁网）")
+    drop_privileges: bool = Field(default=True, description="是否降权（默认开启）")
+
+
+# mandatory 脱敏项：平台下发 False 时静默归 True（D-06）
+_MANDATORY_REDACT_FIELDS = (
+    "redact_registered_secrets",
+    "redact_authorization_headers",
+    "redact_private_keys",
+)
+
+
+class SecuritySettings(BaseModel):
+    """安全防护配置（所有安全功能的开关与配置项统一收口）。
+
+    字段名即平台下发 ``security_settings`` 的键名。取值来源分两级：
+
+    1. 字段默认工厂从环境变量读取（本地开发 / 兜底）；
+    2. 平台侧在 ``agent_info["security_settings"]`` 下发同名字段时，由
+       ``SecuritySettings.from_mapping`` 以平台值覆盖环境变量，实现 per-agent /
+       per-user 差异化配置。
+
+    该实例在构建期统一解析**一次**：``BaseResourceManager.get_agent_config`` 从
+    ``agent_info["security_settings"]`` 经 ``from_mapping`` 构造，填入
+    ``AgentConfig.security_settings``；随后沿构建链拆入 ``ToolNodeSettings`` /
+    ``ModelNodeSettings`` / 运行时 provider 等消费点。``agent_config`` 是运行时
+    唯一的配置入口 —— 叶节点不再各自读取环境变量。
+
+    设计意图：
+    - 评估时逐项关闭（观察单个安全功能对行为 / 性能的影响）；
+    - 出问题（误拦截 / 误放行）时通过平台下发关闭（应急熔断）。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # ---- 布尔开关（默认开启；命令审批默认关闭，fail-closed）----
+    network_allowlist: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_NETWORK_ALLOWLIST", True),
+        description="网络/域名白名单",
+    )
+    reward_hacking: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REWARD_HACKING_GUARD", True),
+        description="Reward Hacking 防护",
+    )
+    content_safety: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_CONTENT_SAFETY", True),
+        description="内容安全防护",
+    )
+    command_blacklist: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_COMMAND_BLACKLIST", True),
+        description="危险命令黑名单",
+    )
+    command_approval: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_COMMAND_APPROVAL", False),
+        description="命令级审批（HITL）",
+    )
+    command_approval_mode: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_COMMAND_APPROVAL_MODE", "manual"),
+        description="命令审批模式：manual(全量ITS审批) / smart(LLM预分流)",
+    )
+    result_limit: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_RESULT_LIMIT", True),
+        description="工具结果最小化截断",
+    )
+    security_guard: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_SECURITY_GUARD", True),
+        description="工具结果脱敏 / 注入检测",
+    )
+    file_deny_list: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_FILE_DENY_LIST", True),
+        description="文件读写敏感路径拒绝清单",
+    )
+    redact_secrets: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_SECRETS", True),
+        description="脱敏总开关；置 False 时仅关闭 optional 层，mandatory 层仍生效",
+    )
+    # ---- 脱敏分层开关（mandatory 不可关闭 / optional 可逐项关闭）----
+    redact_registered_secrets: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_REGISTERED_SECRETS", True),
+        description="已知 secret 精确值脱敏（mandatory，不可被平台关闭）",
+    )
+    redact_authorization_headers: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_AUTHORIZATION_HEADERS", True),
+        description="Authorization / API key header 脱敏（mandatory，不可被平台关闭）",
+    )
+    redact_private_keys: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_PRIVATE_KEYS", True),
+        description="PEM/PGP private key 脱敏（mandatory，不可被平台关闭）",
+    )
+    redact_vendor_tokens: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_VENDOR_TOKENS", True),
+        description="厂商前缀 Token 脱敏（optional，可逐项关闭）",
+    )
+    redact_structured_fields: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_STRUCTURED_FIELDS", True),
+        description="结构化凭据字段脱敏（optional，可逐项关闭）",
+    )
+    redact_url_credentials: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_URL_CREDENTIALS", True),
+        description="URL 凭据脱敏（optional，可逐项关闭）",
+    )
+    redact_dsn_passwords: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_DSN_PASSWORDS", True),
+        description="DSN 密码脱敏（optional，可逐项关闭）",
+    )
+    redact_cookies: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_COOKIES", True),
+        description="Cookie 脱敏（optional，可逐项关闭）",
+    )
+    # ---- 裸熵兜底（heuristic 层，可按 sink 关闭）----
+    redact_bare_entropy: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_REDACT_BARE_ENTROPY", True),
+        description="裸高熵兜底检测（全 purpose 默认开启，可按 sink 关闭；非 mandatory）",
+    )
+    redact_secrets_min_length: int = Field(
+        default=int(os.getenv("AIDEV_REDACT_SECRETS_MIN_LENGTH", "32")),
+        description="裸熵候选最小长度（默认 32）",
+    )
+    redact_secrets_entropy_threshold: float = Field(
+        default=float(os.getenv("AIDEV_REDACT_SECRETS_ENTROPY_THRESHOLD", "4.2")),
+        description="裸熵 alnum/Base64URL 阈值（默认 4.2；标准 Base64 固定 4.5）",
+    )
+    # ---- partial 掩码阈值（默认与 masking.py 历史硬编码常量一致：32 / 6 / 4）----
+    redact_partial_min_len: int = Field(
+        default=int(os.getenv("AIDEV_REDACT_PARTIAL_MIN_LEN", "32")),
+        description="partial 掩码保留首尾的最小长度（>= 该值保留首尾，< 该值整体替换；默认 32）",
+    )
+    redact_partial_head: int = Field(
+        default=int(os.getenv("AIDEV_REDACT_PARTIAL_HEAD", "6")),
+        description="partial 掩码保留的首部字符数（默认 6，常含厂商前缀）",
+    )
+    redact_partial_tail: int = Field(
+        default=int(os.getenv("AIDEV_REDACT_PARTIAL_TAIL", "4")),
+        description="partial 掩码保留的尾部字符数（默认 4）",
+    )
+    security_guidance: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_SECURITY_GUIDANCE", True),
+        description="模型引导层",
+    )
+    prompt_injection_guard: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_PROMPT_INJECTION_GUARD", True),
+        description="提示词注入净化",
+    )
+    file_send_guard: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_FILE_SEND_GUARD", True),
+        description="文件发送拦截（可执行/脚本/密钥文件 + 内容）",
+    )
+
+    # ---- 字符串 / 列表配置（逗号分隔原文）----
+    network_allow_domains: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_ALLOW_DOMAINS", ""),
+        description="网络白名单域名（逗号分隔，支持 *.example.com 通配）",
+    )
+    network_block_domains: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_BLOCK_DOMAINS", ""),
+        description="网络黑名单域名（逗号分隔，支持 *.example.com 通配）",
+    )
+    file_allowed_paths: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_FILE_ALLOWED_PATHS", ""),
+        description="文件读写允许的根目录前缀（逗号分隔，root jail 白名单）；空字符串则不限制",
+    )
+    known_sensitive_values: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_KNOWN_SENSITIVE_VALUES", ""),
+        description="已知敏感值（逗号分隔原文）—— 经 detector 管线（RegisteredSecretDetector）"
+        "在工具结果进入模型上下文前做精确匹配脱敏。"
+        "沙箱工具返回值出口另走 SBX_SENSITIVE_VALUES（见 redact_known_values）",
+    )
+    file_bwrap: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_FILE_BWRAP", False),
+        description="文件读写 bubblewrap 内核级沙箱（read/write/ls/glob/grep/edit/execute）；默认关闭，fail-open（bwrap 不可用时降级同进程执行）",
+    )
+    file_bwrap_readonly_paths: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_FILE_BWRAP_READONLY_PATHS", "/usr,/bin,/lib,/lib64"),
+        description="bwrap 沙箱只读挂载的系统目录（逗号分隔，提供命令与动态库）；不含 /etc、/root、/home 等敏感目录",
+    )
+    file_bwrap_allow_network: bool = Field(
+        default_factory=lambda: _env_bool("AIDEV_FILE_BWRAP_ALLOW_NETWORK", False),
+        description="bwrap 沙箱是否保留网络；默认关闭（--unshare-net，阻断外泄/SSRF）",
+    )
+    file_bwrap_path: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_FILE_BWRAP_PATH", "bwrap"),
+        description="bwrap 二进制路径，默认从 PATH 解析",
+    )
+    sandbox_policy: SandboxPolicy | None = Field(
+        default=None,
+        description="平台无关沙箱策略（SandboxPolicy）；平台下发 dict 时由 from_mapping 自动解析，"
+        "优先于 file_bwrap_* 字段。None 时回落 file_bwrap_* 拼装默认策略",
+    )
+    command_approval_approvers: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_COMMAND_APPROVAL_APPROVERS", ""),
+        description="命令级审批人（逗号分隔）",
+    )
+    content_safety_endpoint: str = Field(
+        default_factory=lambda: os.getenv("AIDEV_CONTENT_SAFETY_ENDPOINT", ""),
+        description="远程内容安全服务地址（空则仅本地关键词基线）",
+    )
+
+    @model_validator(mode="before")
+    def _force_mandatory_redaction(cls, values: Any) -> Any:
+        """mandatory 脱敏项被平台下发 False 时静默归 True（D-06：不报错、不抛 ValidationError）。
+
+        挂 ``mode="before"``（而非 ``from_mapping``）使直接构造路径
+        ``SecuritySettings(redact_registered_secrets=False)`` 同样受保护。
+        """
+        if isinstance(values, dict):
+            for name in _MANDATORY_REDACT_FIELDS:
+                if values.get(name) is False:
+                    values[name] = True
+        return values
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any] | None) -> "SecuritySettings":
+        """从平台下发 dict 构建；缺失字段回落字段级默认（含环境变量兜底）。
+
+        平台下发可能只包含部分字段（如仅关闭某个开关）；未提供的字段由字段
+        默认工厂从环境变量读取，实现「平台值覆盖、缺失回落环境变量」。
+        这是全项目**唯一**的 ``SecuritySettings`` 构造入口。
+        """
+        return cls(**(data or {}))
+
+
 class AgentExecutorKwargs(BaseModel):
     """Agent 执行器构建参数（标准协议）。
 
@@ -466,6 +741,12 @@ class AgentExecutorKwargs(BaseModel):
         "缺省时若 enable_runtime_tool=True，build() 将抛出异常。",
     )
 
+    # 安全防护配置（构建期统一解析一次，含平台下发覆盖；ReActAgentBuilder 据此拆入 ToolNodeSettings / ModelNodeSettings）
+    security_settings: Optional[SecuritySettings] = Field(
+        default=None,
+        description="安全防护配置实例；由 ChatCompletionAgent 从 AgentConfig.security_settings 传入。",
+    )
+
 
 class AgentConfig(BaseModel):
     """智能体配置"""
@@ -509,3 +790,8 @@ class AgentConfig(BaseModel):
     max_spawn_depth: int = Field(default=1, description="最大 Agent 嵌套深度")
     # 原始配置信息（来自 retrieve_agent_config 的完整字典，含 otel_info 等平台透传字段）
     agent_info: dict | None = Field(None, description="智能体配置信息，agent_info 接口的原始值，仅仅用于数据上报")
+    # 安全防护配置（构建期统一解析一次，含平台下发覆盖；由 base.py 在 get_agent_config 时填充）
+    security_settings: SecuritySettings = Field(
+        default_factory=SecuritySettings,
+        description="安全防护配置（平台下发覆盖环境变量，统一读取后拆入各节点）",
+    )

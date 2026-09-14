@@ -22,9 +22,32 @@ from aidev_agent.config import settings
 
 
 class ToolNodeSettings(BaseModel):
-    """ToolNode wrappers settings."""
+    """ToolNode wrappers settings.
+
+    安全相关字段（use_security_guard / use_network_allowlist / use_reward_hacking_guard /
+    use_result_limit / allow_domains / block_domains）默认取安全开启态，最终值由
+    ``ReActAgentBuilder`` 在 graph 装配层从 ``SecuritySettings`` 拆解后注入。本类
+    不持有 ``SecuritySettings`` 对象、也不直接读取环境变量。
+    """
 
     use_timer: bool = True
     use_result_limit: bool = True
     result_limit_thrd: int = Field(default=settings.TOOL_RESULT_LIMIT_THRD, ge=1, description="结果长度限制阈值")
+    result_truncate_head: int = Field(
+        default=settings.TOOL_RESULT_TRUNCATE_HEAD, ge=0, description="截断时头部保留字符数（0=自动 80%）"
+    )
+    result_truncate_tail: int = Field(
+        default=settings.TOOL_RESULT_TRUNCATE_TAIL, ge=0, description="截断时尾部保留字符数（0=自动 20%）"
+    )
     use_json_repair_on_error: bool = True
+    use_security_guard: bool = True
+    use_network_allowlist: bool = True
+    use_reward_hacking_guard: bool = True
+    allow_domains: list[str] = Field(
+        default_factory=list,
+        description="网络白名单域名（由 graph 装配层从 SecuritySettings.network_allow_domains 拆解注入）",
+    )
+    block_domains: list[str] = Field(
+        default_factory=list,
+        description="网络黑名单域名（由 graph 装配层从 SecuritySettings.network_block_domains 拆解注入）",
+    )

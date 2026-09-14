@@ -43,6 +43,8 @@ from e2b_code_interpreter import Sandbox  # type: ignore
 from langchain_core.runnables import RunnableConfig
 from packaging.version import Version
 
+from aidev_agent.packages.security.file_safety import deny_reason
+
 from .types import (
     EditResult,
     ExecuteResult,
@@ -419,8 +421,21 @@ class E2BSandboxBackend(RuntimeBackend):
         """释放 E2B Sandbox 远程资源。"""
         self.kill()
 
+    def _deny_reason(self, path: str) -> str | None:
+        """敏感路径拒绝清单检查，命中返回原因，否则 None。
+
+        拒绝清单无条件生效：``file_deny_list`` 开关已随统一配置收口移除，
+        后端不再读取环境变量（安全配置唯一入口是 ``AgentConfig.security_settings``，
+        而本层是运行时执行内部，不持有该配置）。
+        """
+        return deny_reason(path)
+
     def ls_info(self, path: str, *, config: RunnableConfig | None = None, state: dict | None = None) -> list[FileInfo]:
         """列出目录中的文件和目录（非递归）。"""
+
+        reason = self._deny_reason(path)
+        if reason:
+            return []
 
         sandbox = self._ensure_sandbox()
         try:
@@ -449,6 +464,10 @@ class E2BSandboxBackend(RuntimeBackend):
         state: dict | None = None,
     ) -> str:
         """读取文件内容（带行号）。"""
+
+        reason = self._deny_reason(file_path)
+        if reason:
+            return f"Error: 拒绝访问敏感路径: {file_path}（{reason}）"
 
         sandbox = self._ensure_sandbox()
 
@@ -486,6 +505,10 @@ class E2BSandboxBackend(RuntimeBackend):
     ) -> WriteResult:
         """创建新文件并写入内容。"""
 
+        reason = self._deny_reason(file_path)
+        if reason:
+            return WriteResult(error=f"拒绝访问敏感路径: {file_path}（{reason}）")
+
         sandbox = self._ensure_sandbox()
 
         # 文件已存在则失败
@@ -515,6 +538,10 @@ class E2BSandboxBackend(RuntimeBackend):
         state: dict | None = None,
     ) -> EditResult:
         """通过替换字符串编辑文件。"""
+
+        reason = self._deny_reason(file_path)
+        if reason:
+            return EditResult(error=f"拒绝访问敏感路径: {file_path}（{reason}）")
 
         sandbox = self._ensure_sandbox()
 
@@ -556,6 +583,10 @@ class E2BSandboxBackend(RuntimeBackend):
             return f"Invalid regex pattern: {e}"
 
         base_path = path or "/"
+        reason = self._deny_reason(base_path)
+        if reason:
+            return []
+
         qpattern = shlex.quote(pattern)
         qbase = shlex.quote(base_path)
 

@@ -32,6 +32,8 @@ from tenacity import RetryError
 
 from aidev_agent.config import settings
 from aidev_agent.packages.langchain_core.output_parsers import StructuredOutputToToolMessageParser
+from aidev_agent.packages.security import SecurityEvent, SecurityStage, run_hooks
+from aidev_agent.packages.security.content_safety import BLOCK_MARKER
 
 try:
     from aidev_agent.packages.opentelemetry.resilience import record_model_rate_limit, record_model_retry
@@ -177,11 +179,16 @@ def _build_model_chain(
     use_structured_response: bool,
     enable_parallel_tool_calls: bool,
     use_tool_call_promotion: bool,
+    enable_content_safety: bool = False,
 ) -> Runnable:
     """构建共享的 LCEL 模型链。
 
     将原 _run_recovery_loop / _arun_recovery_loop 的 while 循环逻辑
     替换为 LCEL 管道：RunnableLambda 步骤 → RunnableRetry → RunnableWithFallbacks。
+
+    链尾追加两个**结算语义**步骤（位于 with_fallbacks 之外）：模型 I/O 审计与
+    内容安全。两者都对链的最终结果执行且仅执行一次 —— 重试不产生重复审计记录，
+    重试耗尽走 fallback 时也仍会审计一次。
 
     Args:
         llm: 语言模型
@@ -191,6 +198,7 @@ def _build_model_chain(
         use_structured_response: 是否使用结构化响应模式
         enable_parallel_tool_calls: 是否启用并行工具调用
         use_tool_call_promotion: 是否启用工具调用提升
+        enable_content_safety: 是否启用内容安全防护（链尾结算步骤）
 
     Returns:
         Runnable，支持 .invoke() 和 .ainvoke()
@@ -363,7 +371,33 @@ def _build_model_chain(
         return ctx
 
     # ------------------------------------------------------------------
-    # 链组合：_render_messages（仅一次）| model_chain（含重试 + 回退）
+    # 链尾结算步骤（在 with_fallbacks 之外，每次节点调用各执行一次）
+    # ------------------------------------------------------------------
+    def _apply_content_safety_step(ctx: ProcessorContext) -> ProcessorContext:
+        """内容安全防护：扫描模型产出文本，命中违规即替换为安全兜底标记。
+
+        保留既有 ``packages/security`` 外置 hook 分发（``run_hooks`` at MODEL_OUTPUT）；
+        仅当链尾保证在最终产出上执行一次。
+        """
+        response = ctx.response
+        if response is None or not enable_content_safety:
+            return ctx
+        content = getattr(response, "content", None)
+        if not isinstance(content, str):
+            return ctx
+        verdict = run_hooks(SecurityEvent(stage=SecurityStage.MODEL_OUTPUT, content=content))
+        if verdict.action == "block":
+            logger.warning(
+                "[ContentSafety] model output blocked hook=%s reason=%s findings=%s",
+                verdict.hook,
+                verdict.reason,
+                verdict.findings,
+            )
+            response.content = BLOCK_MARKER
+        return ctx
+
+    # ------------------------------------------------------------------
+    # 链组合：_render_messages（仅一次）| model_chain（含重试 + 回退）| 链尾结算
     # ------------------------------------------------------------------
     # _render_messages 不参与重试——消息渲染是幂等的、只应跑一次，
     # 重试时只需重建 model_chain（llm | capture | quality）。
@@ -379,9 +413,17 @@ def _build_model_chain(
 
     # _exhaustion_fallback 是模块级函数（无闭包依赖）
 
-    model_chain = RunnableLambda(_render_messages) | retryable_model_chain.with_fallbacks(
-        [RunnableLambda(_exhaustion_fallback)],
-        exceptions_to_handle=(RetryError,),
+    # 链尾两步挂**单个同步 callable**，与 _render_messages / quality_gate /
+    # _exhaustion_fallback 的既有写法一致：审计是纯 CPU（正则 + stdlib logging），
+    # 内容安全是有界的本地 hook 分发；而同链内的 quality_gate 本就会同步调用
+    # judge LLM（更重），故此处不新增事件循环阻塞类别，无需 async 变体。
+    model_chain = (
+        RunnableLambda(_render_messages)
+        | retryable_model_chain.with_fallbacks(
+            [RunnableLambda(_exhaustion_fallback)],
+            exceptions_to_handle=(RetryError,),
+        )
+        | RunnableLambda(_apply_content_safety_step)  # 内容安全（可能覆写为 BLOCK_MARKER）
     )
 
     return model_chain

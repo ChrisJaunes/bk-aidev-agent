@@ -71,7 +71,8 @@ from aidev_agent.core.tools.task import TeamTaskRecord, get_task_tools
 from aidev_agent.enums import Decision
 from aidev_agent.packages.langchain_core.models.utils import is_model_without_function_calling
 from aidev_agent.packages.langgraph.streaming.streaming_protocol import AgentStreamAdapter
-from aidev_agent.pydantic_models import AgentExecutorKwargs, KnowledgeSettings, ModelContextSettings
+from aidev_agent.packages.security.command.command_risk_assessor import CommandRiskAssessor
+from aidev_agent.pydantic_models import AgentExecutorKwargs, KnowledgeSettings, ModelContextSettings, SecuritySettings
 
 if TYPE_CHECKING:
     from langchain_core.runnables import Runnable
@@ -214,6 +215,7 @@ class ReActAgentBuilder:
         self._enable_query_clarification: Optional[bool] = None
         self._langchain_middleware: Sequence[AgentMiddleware] = ()
         self._tool_node_options: ToolNodeSettings | None = None
+        self._security_settings: SecuritySettings | None = None
         self._resource_manager = None
 
     # ====================================================================================================
@@ -573,6 +575,8 @@ class ReActAgentBuilder:
         """将 BkAi 平台通用配置（AgentExecutorKwargs）映射到 builder 内部状态。"""
         if options.resource_manager is not None:
             self._resource_manager = options.resource_manager
+        if options.security_settings is not None:
+            self._security_settings = options.security_settings
         if options.llm is not None:
             self._llm = options.llm
         if options.non_thinking_llm is not None:
@@ -679,6 +683,48 @@ class ReActAgentBuilder:
     # ====================================================================================================
     # 预处理，将配置信息标准化处理
     # ====================================================================================================
+    def _resolve_security_settings(self) -> SecuritySettings:
+        """解析安全配置的单一事实来源。
+
+        仅有两个显式来源，均**不读环境变量**：
+        1. ``set_bkai_options`` 注入的 ``security_settings``；
+        2. ``resource_manager.get_agent_config(agent_code).security_settings``
+           —— 平台下发经 ``SecuritySettings.from_mapping`` 构造的唯一入口。
+
+        两者皆不可得时（如 SDK 默认 ``CommonQAAgent`` 不接平台配置、或测试直接构建
+        builder），回落到 ``SecuritySettings()`` 的字段级默认 —— 这是 ``from_mapping``
+        之下的最后一层默认，语义与 ``from_mapping({})`` 一致；缺省即「安全能力按默认
+        开关运行」，而非「静默丢弃平台策略」。此时记 warning 以便定位配置缺失。
+
+        在 ``build()`` 装配节点前解析一次，后续拆入 ``ToolNodeSettings`` /
+        ``ModelNodeSettings`` 的具体字段。
+        """
+        if self._security_settings is not None:
+            return self._security_settings
+
+        rm = self._resource_manager
+        if rm is not None:
+            try:
+                agent_config = rm.get_agent_config(rm.get_agent_code())
+                resolved = getattr(agent_config, "security_settings", None)
+                if resolved is not None:
+                    self._security_settings = resolved
+                    return resolved
+            except Exception:  # noqa: BLE001
+                logger.warning("从 resource_manager 解析 security_settings 失败，回落字段默认")
+
+        logger.debug(
+            "未取得 AgentConfig.security_settings（既未注入也未由 resource_manager 下发），"
+            "回落 SecuritySettings() 字段默认"
+        )
+        self._security_settings = SecuritySettings()
+        return self._security_settings
+
+    @staticmethod
+    def _split_domains(raw: str | None) -> list[str]:
+        """把 ``SecuritySettings`` 的逗号分隔域名字符串拆成小写 list。"""
+        return [d.strip().lower().rstrip(".") for d in (raw or "").split(",") if d.strip()]
+
     def _compute_use_structured_response(self) -> bool:
         """判断是否使用结构化输出模式。"""
         llm_code_agent_type = self._model_context_options.llm_code_agent_type if self._model_context_options else None
@@ -799,6 +845,15 @@ class ReActAgentBuilder:
             )
             node_options_kwargs["enable_query_clarification"] = knowledge_query_options.enable_query_clarification
 
+        # 安全配置拆入：从统一解析的 SecuritySettings 注入模型节点开关
+        security_settings = self._resolve_security_settings()
+        node_options_kwargs.update(
+            {
+                "enable_security_guidance": security_settings.security_guidance,
+                "enable_content_safety": security_settings.content_safety,
+                "enable_prompt_injection_guard": security_settings.prompt_injection_guard,
+            }
+        )
         node_options = ModelNodeSettings(**node_options_kwargs)
 
         if self._enable_skills and self._skill_registry is not None:
@@ -850,10 +905,13 @@ class ReActAgentBuilder:
 
         # 加载 Runtime 工具 (ls/read_file/write_file/edit_file/glob/grep/execute)
         if self._enable_runtime_tool and self._runtime_backend_resolver is not None:
+            # smart 审批模式：注入命令风险评估器（fast_llm 优先，non_thinking/主 llm 兜底）
+            risk_assessor = CommandRiskAssessor(self._fast_llm or self._non_thinking_llm or self._llm)
             tools.extend(
                 get_client_tools_with_runtime(
                     self._runtime_backend_resolver,
                     enable_security=self._enable_security_runtime,
+                    risk_assessor=risk_assessor,
                 )
             )
 
@@ -913,6 +971,19 @@ class ReActAgentBuilder:
             # 实例化独立 backend 所需构造参数
             extractor = self._runtime_param_with_skill.get(skill_runtime)
             params = extractor(skill, self._executor_info or {}) if extractor is not None else {}
+            # local runtime：从统一 SecuritySettings 注入 bubblewrap 沙箱配置
+            # （read/write/ls/glob/grep/edit/execute 的内核级文件隔离）。
+            if skill_runtime == "local":
+                ss = self._resolve_security_settings()
+                params.update(
+                    {
+                        "bwrap_enabled": ss.file_bwrap,
+                        "bwrap_readonly_paths": ss.file_bwrap_readonly_paths,
+                        "bwrap_allow_network": ss.file_bwrap_allow_network,
+                        "bwrap_path": ss.file_bwrap_path,
+                        "sandbox_policy": ss.sandbox_policy,
+                    }
+                )
             if skill_runtime == "paas_sandbox" and self._resource_manager is not None:
                 client = self._resource_manager.get_paas_sbx_client(self._executor_info or {})
                 params["client"] = client
@@ -1011,6 +1082,24 @@ class ReActAgentBuilder:
             if m.__class__.awrap_tool_call is not AgentMiddleware.awrap_tool_call
         ]
         if tools:
+            # 安全配置拆入：node_options 缺省时用统一解析的 SecuritySettings 构造；
+            # 显式传入（``set_tool_node_options``）则原样透传，尊重显式设置，不覆盖。
+            # graph 装配层负责把 SecuritySettings 转换成 ToolNodeSettings 的具体字段，
+            # ToolNode / ModelNode 不直接持有 SecuritySettings 对象。
+            #
+            # 但结果脱敏（security_wrapper）需要 SecuritySettings 本体（已知敏感值 +
+            # 掩码阈值共 7 个字段），故无论 node_options 是否显式传入，
+            # security_settings 都必须解析后单独注入（T-06-24）。
+            security_settings = self._resolve_security_settings()
+            if node_options is None:
+                node_options = ToolNodeSettings(
+                    use_security_guard=security_settings.security_guard,
+                    use_network_allowlist=security_settings.network_allowlist,
+                    use_reward_hacking_guard=security_settings.reward_hacking,
+                    use_result_limit=security_settings.result_limit,
+                    allow_domains=self._split_domains(security_settings.network_allow_domains),
+                    block_domains=self._split_domains(security_settings.network_block_domains),
+                )
             return build_tool_node(
                 tools=tools,
                 name=name,
@@ -1018,6 +1107,7 @@ class ReActAgentBuilder:
                 wrappers=middleware_w_wrap_tool_call,
                 async_wrappers=middleware_w_awrap_tool_call,
                 node_options=node_options,
+                security_settings=security_settings,
             )
         return None
 

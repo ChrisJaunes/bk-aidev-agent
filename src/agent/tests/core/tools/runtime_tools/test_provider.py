@@ -25,8 +25,8 @@ from aidev_agent.core.tools.runtime_tools.provider import (
     get_read_file_tool,
     get_write_file_tool,
 )
-from aidev_agent.core.tools.runtime_tools.security import validate_path
 from aidev_agent.core.tools.runtime_tools.types import ExecuteResult
+from aidev_agent.packages.security.command.command_security import validate_path
 
 
 def _local_provider(backend: FilesystemBackend) -> RuntimeBackendResolver:
@@ -1135,3 +1135,75 @@ class TestPaasSandboxBackendExtraSensitiveValues:
             backend = PaasSandboxBackend.__new__(PaasSandboxBackend)
             backend._extra_sensitive_values = ["secret1", "secret2"]
             assert backend.extra_sensitive_values == ["secret1", "secret2"]
+
+
+class _FakeRiskLLM:
+    """Fake LLM for risk assessment (returns fixed risk)."""
+
+    def __init__(self, risk: str) -> None:
+        self._risk = risk
+
+    def with_structured_output(self, schema):  # noqa: ANN001
+        return self
+
+    def invoke(self, prompt: str):  # noqa: ANN001
+        from aidev_agent.packages.security.command.command_risk_assessor import RiskAssessment
+
+        return RiskAssessment(risk=self._risk, reason="")  # type: ignore[arg-type]
+
+
+class TestSmartCommandApproval:
+    """Test smart approval mode (LLM pre-triage) in command security."""
+
+    @staticmethod
+    def _smart_settings():
+        from aidev_agent.pydantic_models import SecuritySettings
+
+        return SecuritySettings(
+            command_approval=True,
+            command_approval_mode="smart",
+            command_approval_approvers="u1",
+        )
+
+    def test_smart_low_auto_approves(self):
+        """smart 模式：low 风险灰名单命令自动放行（无需审批）。"""
+        from aidev_agent.packages.security.command.command_risk_assessor import CommandRiskAssessor
+        from aidev_agent.packages.security.command.command_security import enforce_command_security
+
+        # touch 不在白名单（灰名单），风险评估 low → 放行（不抛异常）
+        enforce_command_security(
+            "touch /tmp/foo.txt",
+            "local",
+            self._smart_settings(),
+            CommandRiskAssessor(_FakeRiskLLM("low")),
+        )
+
+    def test_smart_high_rejects(self):
+        """smart 模式：high 风险灰名单命令直接拒绝。"""
+        from aidev_agent.packages.security.command.command_risk_assessor import CommandRiskAssessor
+        from aidev_agent.packages.security.command.command_security import enforce_command_security
+
+        with pytest.raises(ValueError, match="风险评估：high"):
+            enforce_command_security(
+                "touch /tmp/foo.txt",
+                "local",
+                self._smart_settings(),
+                CommandRiskAssessor(_FakeRiskLLM("high")),
+            )
+
+    def test_smart_uncertain_falls_back_to_itsm(self, monkeypatch):
+        """smart 模式：uncertain 灰名单命令升级 ITSM 审批。"""
+        from aidev_agent.packages.security.command.command_risk_assessor import CommandRiskAssessor
+        from aidev_agent.packages.security.command.command_security import enforce_command_security
+
+        monkeypatch.setattr(
+            "aidev_agent.packages.security.command.command_approval.interrupt",
+            lambda value: {"payload": {"approved": True}},
+        )
+        # uncertain 升级 ITSM，审批通过 → 放行（不抛异常）
+        enforce_command_security(
+            "touch /tmp/foo.txt",
+            "local",
+            self._smart_settings(),
+            CommandRiskAssessor(_FakeRiskLLM("uncertain")),
+        )

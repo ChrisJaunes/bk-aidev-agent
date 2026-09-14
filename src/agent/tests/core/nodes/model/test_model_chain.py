@@ -31,6 +31,7 @@ from aidev_agent.core.nodes.model.pydantic_models import (
     ProcessorContext,
 )
 from aidev_agent.core.nodes.model.quality_gate import QualityGate
+from aidev_agent.packages.security.content_safety import BLOCK_MARKER
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableBinding, RunnableConfig, RunnableLambda, RunnableSequence
 from langchain_core.tools import BaseTool, StructuredTool
@@ -882,3 +883,53 @@ class TestExtractQueryTextAndImages:
         assert isinstance(last.content, list)
         assert {"type": "text", "text": "以下是用户最新提问内容：图片内容是啥呀"} in last.content
         assert binary in last.content
+
+
+class TestTerminalSecuritySteps:
+    """链尾结算步骤：内容安全（报告 R4 回归守卫）。"""
+
+    @pytest.fixture
+    def mock_context_assembly(self):
+        ca = Mock()
+        ca.get_choice_tools = Mock(return_value=[])
+        ca.get_chat_prompt_variables = Mock(return_value={})
+        ca.get_chat_prompt_template = Mock(
+            return_value=Mock(invoke=Mock(return_value=Mock(to_messages=Mock(return_value=[]))))
+        )
+        return ca
+
+    @staticmethod
+    def _initial_ctx() -> ProcessorContext:
+        return ProcessorContext(
+            state={"messages": []},
+            config=RunnableConfig(),
+            store=Mock(),
+            messages=[],
+            model_chain_state=ModelChainState(max_retries=3),
+            response=None,
+        )
+
+    def test_content_safety_applies_on_final_response(self, mock_context_assembly):
+        """内容安全在链尾对最终 response 生效：命中 block 即覆写为 BLOCK_MARKER（R4）。"""
+        mock_llm = _make_response_queue_llm([AIMessage(content="违规原文")])
+        mock_context_assembly.get_chat_prompt_template().invoke().to_messages.return_value = [
+            HumanMessage(content="test")
+        ]
+        chain = _build_model_chain(
+            llm=mock_llm,
+            context_assembly=mock_context_assembly,
+            max_retries=1,
+            quality_gate=QualityGate(enable_judge_response=False),
+            use_structured_response=False,
+            enable_parallel_tool_calls=False,
+            use_tool_call_promotion=False,
+            enable_content_safety=True,
+        )
+        block_verdict = Mock(action="block", hook="content_safety_hook", reason="test", findings=[])
+
+        with patch("aidev_agent.core.nodes.model.model_chain.run_hooks", return_value=block_verdict) as run_hooks:
+            result = chain.invoke(self._initial_ctx())
+
+        assert result.response.content == BLOCK_MARKER
+        # 内容安全置于 retry 之外：每次 invoke 恰好对最终产出分发一次
+        assert run_hooks.call_count == 1

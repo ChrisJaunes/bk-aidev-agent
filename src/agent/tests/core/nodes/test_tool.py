@@ -217,7 +217,7 @@ class TestBuildToolNode:
         assert "description" not in tool_msg.additional_kwargs
 
     def test_result_limit_wrapper_truncates_long_result(self):
-        """测试2++: 开启 result_limit_wrapper 后超长结果应设置 status=error"""
+        """测试2++: 开启 result_limit_wrapper 后超长字符串结果做最小化截断"""
         tool_node = build_tool_node(
             tools=[long_text_tool],
             node_options=ToolNodeSettings(use_result_limit=True, result_limit_thrd=10),
@@ -245,10 +245,13 @@ class TestBuildToolNode:
         assert len(tool_messages) == 1
 
         tool_msg = tool_messages[0]
-        assert "本次工具调用返回结果超长" in tool_msg.content
+        # 字符串内容走最小化截断：保头保尾、中间省略，保留关键信息而非整段拒绝
+        assert "内容过长" in tool_msg.content
+        assert tool_msg.content.startswith("x")
+        assert tool_msg.content.endswith("x")
         assert tool_msg.tool_call_id == "call_1"
         assert tool_msg.name == "long_text_tool"
-        assert getattr(tool_msg, "status", None) == "error"
+        assert getattr(tool_msg, "status", None) != "error"
 
     def test_result_limit_wrapper_keeps_short_result(self):
         """测试2++: 开启 result_limit_wrapper 后短结果应保持不变"""
@@ -836,7 +839,7 @@ class TestBuildToolNodeAsync:
         assert "description" not in tool_msg.additional_kwargs
 
     async def test_result_limit_wrapper_truncates_long_result_async(self):
-        """测试2++: 开启 result_limit_wrapper 后超长结果应设置 status=error（异步）"""
+        """测试2++: 开启 result_limit_wrapper 后超长字符串结果做最小化截断（异步）"""
         tool_node = build_tool_node(
             tools=[long_text_tool],
             node_options=ToolNodeSettings(use_result_limit=True, result_limit_thrd=10),
@@ -864,10 +867,13 @@ class TestBuildToolNodeAsync:
         assert len(tool_messages) == 1
 
         tool_msg = tool_messages[0]
-        assert "本次工具调用返回结果超长" in tool_msg.content
+        # 字符串内容走最小化截断：保头保尾、中间省略，保留关键信息而非整段拒绝
+        assert "内容过长" in tool_msg.content
+        assert tool_msg.content.startswith("x")
+        assert tool_msg.content.endswith("x")
         assert tool_msg.tool_call_id == "call_1"
         assert tool_msg.name == "long_text_tool"
-        assert getattr(tool_msg, "status", None) == "error"
+        assert getattr(tool_msg, "status", None) != "error"
 
     async def test_single_tool_call_with_exception_async(self):
         """测试3: 模型返回一个工具调用，工具抛出异常（异步）"""
@@ -1443,7 +1449,7 @@ class TestResultLimitBoundary:
         assert tool_messages[0].content == "x" * 10
 
     def test_result_limit_one_over_threshold(self):
-        """测试长度超过阈值 1 时应被替换"""
+        """测试长度超过阈值 1 时做最小化截断"""
         tool_node = build_tool_node(
             tools=[long_text_tool],
             node_options=ToolNodeSettings(use_result_limit=True, result_limit_thrd=10),
@@ -1469,8 +1475,9 @@ class TestResultLimitBoundary:
         result = run_tool_node_in_graph(tool_node, state)
         tool_messages = [msg for msg in result["messages"] if isinstance(msg, ToolMessage)]
         assert len(tool_messages) == 1
-        # 长度超过阈值，应被替换
-        assert tool_messages[0].content == "本次工具调用返回结果超长，请重新调整调用参数"
+        # 长度超过阈值，做最小化截断（保头保尾、中间省略）
+        assert "内容过长" in tool_messages[0].content
+        assert tool_messages[0].content != "x" * 11
 
     @pytest.mark.parametrize(
         "length,should_truncate",
@@ -1508,7 +1515,9 @@ class TestResultLimitBoundary:
         tool_messages = [msg for msg in result["messages"] if isinstance(msg, ToolMessage)]
 
         if should_truncate:
-            assert tool_messages[0].content == "本次工具调用返回结果超长，请重新调整调用参数"
+            # 超阈值：最小化截断（保头保尾、中间省略）
+            assert "内容过长" in tool_messages[0].content
+            assert tool_messages[0].content != "x" * length
         else:
             assert tool_messages[0].content == "x" * length
 

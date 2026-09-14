@@ -163,7 +163,7 @@ class TestSkillRuntimeBackend:
         # 而 pytest 在 macOS 上的 tmp_path 实际是 /private/var/folders/...
         # 这里将 tmp_path 加入白名单，保证脚本能被允许执行。
         monkeypatch.setattr(
-            "aidev_agent.core.tools.runtime_tools.security.DEFAULT_ALLOWED_SCRIPT_DIRS",
+            "aidev_agent.packages.security.command.command_security.DEFAULT_ALLOWED_SCRIPT_DIRS",
             [str(tmp_path)],
         )
 
@@ -192,7 +192,7 @@ class TestReActBuilderSkillsIntegration:
 
         # 同上：将 tmp_path 加入安全校验白名单
         monkeypatch.setattr(
-            "aidev_agent.core.tools.runtime_tools.security.DEFAULT_ALLOWED_SCRIPT_DIRS",
+            "aidev_agent.packages.security.command.command_security.DEFAULT_ALLOWED_SCRIPT_DIRS",
             [str(tmp_path)],
         )
 

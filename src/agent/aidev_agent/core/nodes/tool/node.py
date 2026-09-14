@@ -27,10 +27,20 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import AsyncToolCallWrapper, ToolCallRequest, ToolCallWrapper
 from langgraph.types import Command
 
+from aidev_agent.pydantic_models import SecuritySettings
+
 from .approval_wrapper import itsm_approval_async_wrapper, itsm_approval_sync_wrapper
 from .json_repair_wrapper import json_repair_on_error_async_wrapper, json_repair_on_error_sync_wrapper
 from .pydantic_models import ToolNodeSettings
 from .result_limit_wrapper import build_result_limit_async_wrapper, build_result_limit_sync_wrapper
+from .security_wrapper import (
+    build_network_allowlist_async_wrapper,
+    build_network_allowlist_sync_wrapper,
+    build_reward_hacking_async_wrapper,
+    build_reward_hacking_sync_wrapper,
+    build_security_guard_async_wrapper,
+    build_security_guard_sync_wrapper,
+)
 from .timer_wrapper import timer_async_wrapper, timer_sync_wrapper
 
 logger = logging.getLogger(__name__)
@@ -177,6 +187,7 @@ def build_tool_node(
     | tuple[type[Exception], ...] = default_tool_call_handler,
     messages_key: str = "messages",
     node_options: ToolNodeSettings | None = None,
+    security_settings: SecuritySettings | None = None,
     wrappers: Sequence[ToolCallWrapper] | None = None,
     async_wrappers: Sequence[AsyncToolCallWrapper] | None = None,
 ) -> ToolNode:
@@ -192,6 +203,9 @@ def build_tool_node(
         handle_tool_errors: 错误处理配置。True 表示捕获所有错误并返回包含错误信息的 ToolMessage。
         messages_key: 状态字典中包含消息列表的键名。
         node_options: ToolNodeSettings，用于控制内置包装器开关。
+        security_settings: 安全配置实例（含已知敏感值 / 掩码阈值），供结果脱敏使用。
+            由装配层从 ``AgentConfig.security_settings`` 注入；``None`` 时脱敏回落到
+            ``SecuritySettings()`` 默认工厂（已知值为空、模式规则仍生效）。
         wrappers: 可选的自定义同步包装器列表，会在内置包装器之后执行。
         async_wrappers: 可选的自定义异步包装器列表，会在内置包装器之后执行。
 
@@ -216,13 +230,51 @@ def build_tool_node(
     node_options = node_options or ToolNodeSettings()
 
     # 组合包装器：内置包装器 + 用户自定义包装器
+    sync_wrapper_list: list[ToolCallWrapper] = []
+    async_wrapper_list: list[AsyncToolCallWrapper] = []
+
+    # Reward Hacking 防护（前置短路）：识别会话内重复危险意图并升级，置于最外层
+    if node_options.use_reward_hacking_guard:
+        sync_wrapper_list.append(
+            build_reward_hacking_sync_wrapper(
+                enabled=True,
+                allow_domains=node_options.allow_domains,
+                block_domains=node_options.block_domains,
+            )
+        )
+        async_wrapper_list.append(
+            build_reward_hacking_async_wrapper(
+                enabled=True,
+                allow_domains=node_options.allow_domains,
+                block_domains=node_options.block_domains,
+            )
+        )
+
+    # 网络/域名白名单（前置短路）：工具执行前拦截未授权域名，阻止数据外泄
+    if node_options.use_network_allowlist:
+        sync_wrapper_list.append(
+            build_network_allowlist_sync_wrapper(
+                enabled=True,
+                allow_domains=node_options.allow_domains,
+                block_domains=node_options.block_domains,
+            )
+        )
+        async_wrapper_list.append(
+            build_network_allowlist_async_wrapper(
+                enabled=True,
+                allow_domains=node_options.allow_domains,
+                block_domains=node_options.block_domains,
+            )
+        )
+
+    # 安全防护（脱敏 + 不可信包裹）置于结果出口，作为工具结果进入模型前的最后一道净化闸门
+    if node_options.use_security_guard:
+        sync_wrapper_list.append(build_security_guard_sync_wrapper(settings=security_settings))
+        async_wrapper_list.append(build_security_guard_async_wrapper(settings=security_settings))
+
     # ITSM 审批 wrapper（直插函数），ask_user 由工具本体直调 interrupt（D-12）
-    sync_wrapper_list: list[ToolCallWrapper] = [
-        itsm_approval_sync_wrapper,
-    ]
-    async_wrapper_list: list[AsyncToolCallWrapper] = [
-        itsm_approval_async_wrapper,
-    ]
+    sync_wrapper_list.append(itsm_approval_sync_wrapper)
+    async_wrapper_list.append(itsm_approval_async_wrapper)
     # 是否启用参数校验失败时自动修复重试（响应式）
     if node_options.use_json_repair_on_error:
         sync_wrapper_list.append(json_repair_on_error_sync_wrapper)
@@ -232,10 +284,22 @@ def build_tool_node(
     if node_options.use_timer:
         sync_wrapper_list.append(timer_sync_wrapper)
         async_wrapper_list.append(timer_async_wrapper)
-    # 是否启用返回结果超长限制
+    # 是否启用返回结果超长限制（最小化截断：保头保尾，超长不再整段拒绝）
     if node_options.use_result_limit:
-        sync_wrapper_list.append(build_result_limit_sync_wrapper(node_options.result_limit_thrd))
-        async_wrapper_list.append(build_result_limit_async_wrapper(node_options.result_limit_thrd))
+        sync_wrapper_list.append(
+            build_result_limit_sync_wrapper(
+                node_options.result_limit_thrd,
+                keep_head=node_options.result_truncate_head or None,
+                keep_tail=node_options.result_truncate_tail or None,
+            )
+        )
+        async_wrapper_list.append(
+            build_result_limit_async_wrapper(
+                node_options.result_limit_thrd,
+                keep_head=node_options.result_truncate_head or None,
+                keep_tail=node_options.result_truncate_tail or None,
+            )
+        )
     # 其他外部传入的
     if wrappers:
         sync_wrapper_list.extend(wrappers)

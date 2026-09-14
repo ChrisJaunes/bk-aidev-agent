@@ -2,31 +2,31 @@
 """Tests for command whitelist security validation module.
 
 This module contains comprehensive tests for the security validation
-logic in aidev_agent.core.tools.runtime_tools.security.
+logic in aidev_agent.packages.security.command.command_security.
 """
 
 from __future__ import annotations
 
 import pytest
-from aidev_agent.core.tools.runtime_tools.security import (
+from aidev_agent.packages.security.command.command_parser import (
+    _check_rejected_patterns,
+    _check_script_path_allowed,
+    _extract_bash_c_content,
+    _is_bash_c_form,
+    _normalize_command_name,
+)
+from aidev_agent.packages.security.command.command_security import (
     ALLOWED_COMMANDS,
     DEFAULT_ALLOWED_SCRIPT_DIRS,
     EFFECTIVE_ALLOWED_COMMANDS,
     AllowedFlagsOnly,
     ForbiddenFlags,
     ValidationResult,
-    _check_redirection_in_command,
-    _check_rejected_patterns,
-    _check_script_path_allowed,
-    _extract_bash_c_content,
-    _is_bash_c_form,
-    _is_script_file,
-    _normalize_command_name,
     is_command_allowed,
-    redact_output,
     validate_command,
     validate_path,
 )
+from aidev_agent.packages.security.redaction.operations import redact_known_values
 
 
 class TestAllowedCommands:
@@ -221,20 +221,6 @@ class TestBashCMethods:
 class TestScriptFileHelpers:
     """Test script file detection helpers."""
 
-    def test_is_script_file_positive(self):
-        """Should detect script file extensions."""
-        assert _is_script_file("script.sh")
-        assert _is_script_file("script.py")
-        assert _is_script_file("script.pl")
-        assert _is_script_file("script.rb")
-        assert _is_script_file("script.js")
-
-    def test_is_script_file_negative(self):
-        """Should not flag non-script files."""
-        assert not _is_script_file("file.txt")
-        assert not _is_script_file("image.png")
-        assert not _is_script_file("data.csv")
-
     def test_check_script_path_allowed(self):
         """Script path in allowed dir should pass."""
         ok, _ = _check_script_path_allowed("/workspace/script.py", ["/workspace", "/tmp"])
@@ -364,71 +350,6 @@ class TestRejectedPatterns:
     def test_redirect_to_regular_file_still_rejected(self):
         """Redirect to regular file should still be rejected."""
         ok, _ = _check_rejected_patterns("ls > /tmp/output.txt")
-        assert not ok
-
-
-class TestRedirectionDetection:
-    """Test redirection operator detection."""
-
-    def test_input_redirection(self):
-        """< should be detected."""
-        ok, reason = _check_redirection_in_command("cat < file.txt")
-        assert not ok
-        assert "重定向" in reason
-
-    def test_output_redirection(self):
-        """> should be detected."""
-        ok, reason = _check_redirection_in_command("ls > file.txt")
-        assert not ok
-
-    def test_append_redirection(self):
-        """>> should be detected."""
-        ok, reason = _check_redirection_in_command("ls >> file.txt")
-        assert not ok
-
-    def test_error_redirection(self):
-        """2> should be detected."""
-        ok, reason = _check_redirection_in_command("ls 2> err.txt")
-        assert not ok
-
-    def test_all_redirection(self):
-        """>& should be detected."""
-        ok, reason = _check_redirection_in_command("ls &> all.txt")
-        assert not ok
-
-    def test_no_redirection(self):
-        """Commands without redirection should pass."""
-        ok, _ = _check_redirection_in_command("ls -la /tmp")
-        assert ok
-
-    def test_redirect_to_dev_null_allowed(self):
-        """Redirect to /dev/null should be allowed."""
-        ok, _ = _check_redirection_in_command("ls 2>/dev/null")
-        assert ok
-
-    def test_redirect_stdout_to_dev_null_allowed(self):
-        """Stdout redirect to /dev/null should be allowed."""
-        ok, _ = _check_redirection_in_command("ls >/dev/null")
-        assert ok
-
-    def test_redirect_all_to_dev_null_allowed(self):
-        """&>/dev/null should be allowed."""
-        ok, _ = _check_redirection_in_command("ls &>/dev/null")
-        assert ok
-
-    def test_redirect_append_to_dev_null_allowed(self):
-        """>>/dev/null should be allowed."""
-        ok, _ = _check_redirection_in_command("ls >>/dev/null")
-        assert ok
-
-    def test_redirect_to_dev_null_with_space_allowed(self):
-        """Redirect to /dev/null with space should be allowed."""
-        ok, _ = _check_redirection_in_command("ls 2> /dev/null")
-        assert ok
-
-    def test_redirect_to_file_still_rejected(self):
-        """Redirect to a regular file should still be rejected."""
-        ok, _ = _check_redirection_in_command("ls 2>/tmp/err.txt")
         assert not ok
 
 
@@ -781,7 +702,7 @@ class TestValidateCommandEdgeCases:
         through the visited-set mechanism, which also triggers the depth check
         path.
         """
-        from aidev_agent.core.tools.runtime_tools.security import _validate_single_command
+        from aidev_agent.packages.security.command.command_security import _validate_single_command
 
         # Use the visited-set loop detection which also guards against infinite recursion
         result = _validate_single_command(
@@ -972,4 +893,4 @@ class TestRedactOutput:
     )
     def test_redact_output(self, text, sensitive_values, expected):
         """测试脱敏函数各种场景。"""
-        assert redact_output(text, sensitive_values) == expected
+        assert redact_known_values(text, sensitive_values) == expected

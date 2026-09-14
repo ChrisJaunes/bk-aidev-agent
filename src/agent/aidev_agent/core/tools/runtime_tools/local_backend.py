@@ -34,6 +34,10 @@ from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
 
+from aidev_agent.packages.security.file_safety import deny_reason
+from aidev_agent.pydantic_models import SandboxPolicy
+
+from .bubblewrap import DEFAULT_READONLY_PATHS, BubblewrapSandbox
 from .types import (
     EditResult,
     ExecuteResult,
@@ -115,6 +119,11 @@ class FilesystemBackend(RuntimeBackend):
         virtual_mode: bool = False,
         max_file_size_mb: int = 10,
         envs: dict[str, str] | None = None,
+        bwrap_enabled: bool = False,
+        bwrap_readonly_paths: str = DEFAULT_READONLY_PATHS,
+        bwrap_allow_network: bool = False,
+        bwrap_path: str = "bwrap",
+        sandbox_policy: SandboxPolicy | None = None,
     ) -> None:
         """初始化文件系统后端。
 
@@ -137,6 +146,19 @@ class FilesystemBackend(RuntimeBackend):
             max_file_size_mb: grep 搜索时的最大文件大小限制（MB）。
                 超过此限制的文件在搜索时会被跳过。默认为 10 MB。
             envs: 环境变量字典
+            bwrap_enabled: 是否启用 bubblewrap 子进程沙箱（内核级文件隔离）。
+                默认 False（fail-open，评估时关闭可观测行为差异）。启用后
+                read/write/ls/glob/grep/edit/execute/upload/download 改为在
+                bwrap 子进程内执行；bwrap 不可用（未安装 / user namespace
+                被禁）时 fail-open 降级回同进程执行路径。
+            bwrap_readonly_paths: bwrap 沙箱只读挂载的系统目录（逗号分隔）。
+                默认 ``DEFAULT_READONLY_PATHS``（/usr,/bin,/lib,/lib64），
+                不含 /etc、/root、/home 等敏感目录（按需最小暴露）。
+            bwrap_allow_network: bwrap 沙箱是否保留网络。默认 False（关网）。
+            bwrap_path: bwrap 二进制路径，默认 ``bwrap``。
+            sandbox_policy: 平台无关沙箱策略（:class:`SandboxPolicy`）。提供时
+                优先于 ``bwrap_readonly_paths`` / ``bwrap_allow_network``；且
+                ``sandbox_policy`` 非 None 即视为启用沙箱（无需 ``bwrap_enabled``）。
         """
         self.cwd = Path(root_dir).resolve() if root_dir else Path.cwd()
         self.virtual_mode = virtual_mode
@@ -149,6 +171,20 @@ class FilesystemBackend(RuntimeBackend):
                 scripts_dir = os.path.join(skill_dir, "scripts")
                 target = scripts_dir if os.path.isdir(scripts_dir) else skill_dir
                 self.cwd = Path(target).resolve()
+        # bwrap 沙箱（fail-open）：显式启用 bwrap 或提供 sandbox_policy 时构造；运行时再探测可用性
+        self._bwrap: BubblewrapSandbox | None = None
+        if bwrap_enabled or sandbox_policy is not None:
+            self._bwrap = BubblewrapSandbox(
+                root_dir=str(self.cwd),
+                policy=sandbox_policy,
+                readonly_paths=bwrap_readonly_paths,
+                allow_network=bwrap_allow_network,
+                bwrap_path=bwrap_path,
+            )
+
+    def _bwrap_ready(self) -> bool:
+        """bwrap 沙箱是否已启用且可用（fail-open 判定）。"""
+        return self._bwrap is not None and self._bwrap.is_available()
 
     def _resolve_path(self, key: str) -> Path:
         """解析文件路径并进行安全检查。
@@ -178,12 +214,142 @@ class FilesystemBackend(RuntimeBackend):
                 full.relative_to(self.cwd)
             except ValueError:
                 raise ValueError(f"路径 {full} 超出根目录范围: {self.cwd}") from None
-            return full
+        else:
+            path = Path(key)
+            full = path if path.is_absolute() else (self.cwd / path).resolve()
 
-        path = Path(key)
-        if path.is_absolute():
-            return path
-        return (self.cwd / path).resolve()
+        # 敏感路径拒绝清单（.ssh / .aws / .gnupg / .env / 私钥 / 凭据库等）
+        # 无条件生效：file_deny_list 开关已随统一配置收口移除，后端不再读取环境变量。
+        reason = deny_reason(full)
+        if reason:
+            raise ValueError(f"拒绝访问敏感路径: {key}（{reason}）")
+
+        return full
+
+    def _to_virtual_path(self, abs_path: str) -> str:
+        """将绝对路径映射为虚拟路径（virtual_mode 时去 cwd 前缀）。"""
+        if not self.virtual_mode:
+            return abs_path
+        cwd_str = str(self.cwd)
+        if not cwd_str.endswith("/"):
+            cwd_str += "/"
+        if abs_path.startswith(cwd_str):
+            relative = abs_path[len(cwd_str) :]
+        elif abs_path.startswith(str(self.cwd)):
+            relative = abs_path[len(str(self.cwd)) :].lstrip("/")
+        else:
+            relative = abs_path
+        return "/" + relative
+
+    # --- bwrap 沙箱实现（fail-open：仅在 _bwrap_ready() 时被调用） ---
+
+    def _ls_info_via_bwrap(self, path: str) -> list[FileInfo]:
+        try:
+            dir_path = self._resolve_path(path)
+        except ValueError:
+            return []
+        assert self._bwrap is not None
+        results: list[FileInfo] = []
+        for e in self._bwrap.list_entries(str(dir_path)):
+            virt = self._to_virtual_path(e["path"])
+            display = virt + "/" if e["is_dir"] else virt
+            results.append({"path": display, "is_dir": e["is_dir"], "size": e["size"], "modified_at": e["modified_at"]})
+        results.sort(key=lambda x: x.get("path", ""))
+        return results
+
+    def _read_via_bwrap(self, file_path: str, offset: int, limit: int) -> str:
+        try:
+            resolved_path = self._resolve_path(file_path)
+        except ValueError as e:
+            return f"Error: {e}"
+        assert self._bwrap is not None
+        content = self._bwrap.read_text(str(resolved_path))
+        if content is None:
+            return f"Error: File '{file_path}' not found"
+        empty_msg = check_empty_content(content)
+        if empty_msg:
+            return empty_msg
+        lines = content.splitlines()
+        start_idx = offset
+        end_idx = min(start_idx + limit, len(lines))
+        if start_idx >= len(lines):
+            return f"Error: Line offset {offset} exceeds file length ({len(lines)} lines)"
+        selected_lines = lines[start_idx:end_idx]
+        return format_content_with_line_numbers(selected_lines, start_line=start_idx + 1)
+
+    def _write_via_bwrap(self, file_path: str, content: str) -> WriteResult:
+        try:
+            resolved_path = self._resolve_path(file_path)
+        except ValueError as e:
+            return WriteResult(error=str(e))
+        if resolved_path.exists():
+            return WriteResult(
+                error=f"Cannot write to {file_path} because it already exists. "
+                "Read and then make an edit, or write to a new path."
+            )
+        try:
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return WriteResult(error=f"Error writing file '{file_path}': {e}")
+        assert self._bwrap is not None
+        ok = self._bwrap.write_text(str(resolved_path), content)
+        if not ok:
+            return WriteResult(error=f"Error writing file '{file_path}'")
+        return WriteResult(path=file_path, files_update=None)
+
+    def _edit_via_bwrap(self, file_path: str, old_string: str, new_string: str, replace_all: bool) -> EditResult:
+        try:
+            resolved_path = self._resolve_path(file_path)
+        except ValueError as e:
+            return EditResult(error=str(e))
+        assert self._bwrap is not None
+        content = self._bwrap.read_text(str(resolved_path))
+        if content is None:
+            return EditResult(error=f"Error: File '{file_path}' not found")
+        try:
+            new_content, occurrences = perform_string_replacement(content, old_string, new_string, replace_all)
+        except ValueError as e:
+            return EditResult(error=str(e))
+        ok = self._bwrap.write_text(str(resolved_path), new_content)
+        if not ok:
+            return EditResult(error=f"Error editing file '{file_path}'")
+        return EditResult(path=file_path, files_update=None, occurrences=int(occurrences))
+
+    def _glob_info_via_bwrap(self, pattern: str, path: str) -> list[FileInfo]:
+        if pattern.startswith("/"):
+            pattern = pattern.lstrip("/")
+        try:
+            search_path = self.cwd if path == "/" else self._resolve_path(path)
+        except ValueError:
+            return []
+        assert self._bwrap is not None
+        results: list[FileInfo] = []
+        for e in self._bwrap.glob_entries(str(search_path), pattern):
+            virt = self._to_virtual_path(e["path"])
+            results.append({"path": virt, "is_dir": False, "size": e["size"], "modified_at": e["modified_at"]})
+        results.sort(key=lambda x: x.get("path", ""))
+        return results
+
+    def _grep_via_bwrap(self, pattern: str, base_full: Path, glob: str | None) -> list[GrepMatch] | None:
+        """bwrap 内 ripgrep 搜索；rg 不可用返回 None（交由调用方 fail-open 回退）。"""
+        assert self._bwrap is not None
+        matches = self._bwrap.grep(pattern, str(base_full), glob)
+        if matches is None:
+            return None
+        result: list[GrepMatch] = []
+        for fpath, line_num, line_text in matches:
+            result.append({"path": self._to_virtual_path(fpath), "line": int(line_num), "text": line_text})
+        return result
+
+    def _execute_via_bwrap(self, command: str, timeout: int, max_output_size: int) -> ExecuteResult:
+        assert self._bwrap is not None
+        res = self._bwrap.run_shell(command, timeout=timeout)
+        output = res.output
+        truncated = False
+        if len(output) > max_output_size:
+            output = output[:max_output_size]
+            truncated = True
+        return ExecuteResult(output=output, exit_code=res.exit_code, truncated=truncated)
 
     def ls_info(self, path: str, *, config: RunnableConfig | None = None, state: dict | None = None) -> list[FileInfo]:
         """列出目录中的文件和目录（非递归）。
@@ -195,6 +361,8 @@ class FilesystemBackend(RuntimeBackend):
             FileInfo 字典列表，包含目录中文件和目录的信息。
             目录的路径以 '/' 结尾，is_dir=True。
         """
+        if self._bwrap_ready():
+            return self._ls_info_via_bwrap(path)
         try:
             dir_path = self._resolve_path(path)
         except ValueError:
@@ -313,6 +481,8 @@ class FilesystemBackend(RuntimeBackend):
         Returns:
             带行号格式化的文件内容，或错误信息
         """
+        if self._bwrap_ready():
+            return self._read_via_bwrap(file_path, offset, limit)
         try:
             resolved_path = self._resolve_path(file_path)
         except ValueError as e:
@@ -361,6 +531,8 @@ class FilesystemBackend(RuntimeBackend):
             WriteResult，成功时包含路径，失败时包含错误信息。
             外部存储时 files_update=None。
         """
+        if self._bwrap_ready():
+            return self._write_via_bwrap(file_path, content)
         try:
             resolved_path = self._resolve_path(file_path)
         except ValueError as e:
@@ -412,6 +584,8 @@ class FilesystemBackend(RuntimeBackend):
             EditResult，成功时包含路径和替换次数，失败时包含错误信息。
             外部存储时 files_update=None。
         """
+        if self._bwrap_ready():
+            return self._edit_via_bwrap(file_path, old_string, new_string, replace_all)
         try:
             resolved_path = self._resolve_path(file_path)
         except ValueError as e:
@@ -478,6 +652,12 @@ class FilesystemBackend(RuntimeBackend):
 
         if not base_full.exists():
             return []
+
+        # bwrap 优先；沙箱内 rg 不可用时 fail-open 回退宿主机搜索
+        if self._bwrap_ready():
+            bwrap_result = self._grep_via_bwrap(pattern, base_full, glob)
+            if bwrap_result is not None:
+                return bwrap_result
 
         # 优先尝试 ripgrep
         results = self._ripgrep_search(pattern, base_full, glob)
@@ -629,6 +809,8 @@ class FilesystemBackend(RuntimeBackend):
             匹配文件的 FileInfo 字典列表，按路径排序。
             每个字典包含 `path`、`is_dir`、`size` 和 `modified_at` 字段。
         """
+        if self._bwrap_ready():
+            return self._glob_info_via_bwrap(pattern, path)
         if pattern.startswith("/"):
             pattern = pattern.lstrip("/")
 
@@ -708,6 +890,14 @@ class FilesystemBackend(RuntimeBackend):
             try:
                 resolved_path = self._resolve_path(path)
 
+                # bwrap 沙箱内写入（bytes 经 stdin 传，规避同进程文件过滤）
+                if self._bwrap_ready():
+                    assert self._bwrap is not None
+                    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+                    ok = self._bwrap.write_bytes(str(resolved_path), content)
+                    responses.append({"path": path, "error": None if ok else "write_failed"})
+                    continue
+
                 # 如果需要则创建父目录
                 resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -747,6 +937,16 @@ class FilesystemBackend(RuntimeBackend):
             try:
                 resolved_path = self._resolve_path(path)
 
+                # bwrap 沙箱内读取（bytes 二进制模式）
+                if self._bwrap_ready():
+                    assert self._bwrap is not None
+                    content = self._bwrap.read_bytes(str(resolved_path))
+                    if content is None:
+                        responses.append({"path": path, "content": None, "error": "file_not_found"})
+                    else:
+                        responses.append({"path": path, "content": content, "error": None})
+                    continue
+
                 # 如果操作系统支持，使用 O_NOFOLLOW 防止符号链接跟随
                 fd = os.open(resolved_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                 with os.fdopen(fd, "rb") as f:
@@ -784,6 +984,8 @@ class FilesystemBackend(RuntimeBackend):
         Returns:
             ExecuteResult，包含输出、退出码和截断标志
         """
+        if self._bwrap_ready():
+            return self._execute_via_bwrap(command, timeout, max_output_size)
         try:
             proc = subprocess.run(  # noqa: S602
                 command,
@@ -845,6 +1047,8 @@ class FilesystemBackend(RuntimeBackend):
         Returns:
             ExecuteResult，包含输出、退出码和截断标志
         """
+        if self._bwrap_ready():
+            return await asyncio.to_thread(self._execute_via_bwrap, command, timeout, max_output_size)
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,

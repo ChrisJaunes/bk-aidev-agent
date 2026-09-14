@@ -42,6 +42,7 @@ from langchain_core.runnables import RunnableConfig
 from requests.exceptions import HTTPError
 
 from aidev_agent.config import settings
+from aidev_agent.packages.security.file_safety import deny_reason
 from aidev_agent.utils.tracing import CLIENT_SPAN_KIND, recording_span, trace_headers
 
 from .types import (
@@ -564,17 +565,30 @@ class PaasSandboxBackend(RuntimeBackend):
         都只看到绝对路径。
         """
         storage_path = str(self._env_vars.get("STORAGE_PATH") or "/app/storage").rstrip("/")
+        resolved: str | None = None
         for prefix in ("$STORAGE_PATH", "${STORAGE_PATH}"):
             if path == prefix:
-                return storage_path
+                resolved = storage_path
+                break
             if path.startswith(f"{prefix}/"):
-                return f"{storage_path}{path[len(prefix) :]}"
-        if not path.startswith("~"):
-            return path
-        if self._home_dir is None:
-            res = self._run(["bash", "-c", "echo $HOME"], state=state)
-            self._home_dir = res.stdout.strip() or "/root"  # PaaS 沙箱默认以 root 用户运行
-        return self._home_dir + path[1:] if len(path) > 1 else self._home_dir
+                resolved = f"{storage_path}{path[len(prefix) :]}"
+                break
+        if resolved is None:
+            if not path.startswith("~"):
+                resolved = path
+            else:
+                if self._home_dir is None:
+                    res = self._run(["bash", "-c", "echo $HOME"], state=state)
+                    self._home_dir = res.stdout.strip() or "/root"  # PaaS 沙箱默认以 root 用户运行
+                resolved = self._home_dir + path[1:] if len(path) > 1 else self._home_dir
+
+        # 敏感路径拒绝清单（.ssh / .aws / .gnupg / .env / 私钥 / 凭据库等）
+        # 无条件生效：file_deny_list 开关已随统一配置收口移除，后端不再读取环境变量。
+        reason = deny_reason(resolved)
+        if reason:
+            raise ValueError(f"拒绝访问敏感路径: {path}（{reason}）")
+
+        return resolved
 
     # ---- 沙箱复用序列化 ----
 

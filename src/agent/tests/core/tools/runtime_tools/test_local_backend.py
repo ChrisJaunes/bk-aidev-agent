@@ -6,8 +6,10 @@ This module contains tests for the FilesystemBackend class which provides
 direct file system read/write operations.
 """
 
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
+from unittest.mock import patch
 
 import pytest
 from aidev_agent.core.tools.runtime_tools.local_backend import FilesystemBackend
@@ -89,6 +91,48 @@ class TestFilesystemBackendResolvePath:
             backend = FilesystemBackend(root_dir=tmpdir, virtual_mode=True)
             with pytest.raises(ValueError, match="不允许路径遍历"):
                 backend._resolve_path("../../../etc/passwd")
+
+
+class TestFilesystemBackendDenyList:
+    """Test sensitive-path deny list integration in FilesystemBackend."""
+
+    def test_resolve_path_denies_ssh_dir(self):
+        with TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".ssh").mkdir()
+            backend = FilesystemBackend(root_dir=tmpdir)
+            with pytest.raises(ValueError, match="拒绝访问敏感路径"):
+                backend._resolve_path(".ssh/id_rsa")
+
+    def test_read_denies_env_file(self):
+        with TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".env").write_text("SECRET=123")
+            backend = FilesystemBackend(root_dir=tmpdir)
+            result = backend.read(".env")
+            assert "拒绝访问敏感路径" in result
+
+    def test_write_denies_pem_file(self):
+        with TemporaryDirectory() as tmpdir:
+            backend = FilesystemBackend(root_dir=tmpdir)
+            result = backend.write("server.pem", "key")
+            assert isinstance(result, WriteResult)
+            assert "拒绝访问敏感路径" in result.error
+
+    def test_edit_denies_aws_credentials(self):
+        with TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".aws").mkdir()
+            backend = FilesystemBackend(root_dir=tmpdir)
+            result = backend.edit(".aws/credentials", "old", "new")
+            assert isinstance(result, EditResult)
+            assert "拒绝访问敏感路径" in result.error
+
+    def test_deny_list_always_enforced(self):
+        """拒绝清单无条件生效（开关已随统一配置收口移除，环境变量不再能关闭）。"""
+        with TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".env").write_text("SECRET=123")
+            backend = FilesystemBackend(root_dir=tmpdir)
+            with patch.dict(os.environ, {"AIDEV_FILE_DENY_LIST": "false"}):
+                result = backend.read(".env")
+            assert "拒绝访问敏感路径" in result
 
 
 class TestFilesystemBackendLsInfo:
