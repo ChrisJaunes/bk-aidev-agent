@@ -21,6 +21,9 @@ import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from langchain_core.tools import StructuredTool
+from langchain_core.tools.base import ToolException
+
 from aidev_agent.config import settings
 from aidev_agent.packages.langchain_core.tools.base import (
     MCPExceptionWrapper,
@@ -32,8 +35,6 @@ from aidev_agent.packages.langchain_core.tools.base import (
 from aidev_agent.packages.resource_manager.agent import AgentResourceManager
 from aidev_agent.packages.resource_manager.registry import resource_manager
 from aidev_agent.pydantic_models import ExecuteKwargs
-from langchain_core.tools import StructuredTool
-from langchain_core.tools.base import ToolException
 
 # ================== make_structured_tool Mock 测试 ==================
 
@@ -1344,3 +1345,214 @@ def test_construct_tool_injects_expected_authorization_header(
     auth_header = _extract_auth_header(tool)
     assert auth_header is not None
     assert json.loads(auth_header) == expected_auth
+
+
+# ================== MCP 工具重名去重与审批豁免 ==================
+
+DUP_MCP_CONFIG = {
+    "msdk-console-prod-mcp": {"url": "http://msdk1.example.com/mcp", "transport": "streamable_http"},
+    "msdk-console-prod-mcp2": {"url": "http://msdk2.example.com/mcp", "transport": "streamable_http"},
+}
+
+
+def _make_mcp_tool(name: str, args: dict | None = None) -> MagicMock:
+    tool = MagicMock(spec=StructuredTool)
+    tool.name = name
+    tool.description = f"{name} description"
+    tool.coroutine = AsyncMock()
+    tool.metadata = {}
+    tool.args = args if args is not None else {"query": {"type": "string"}}
+    return tool
+
+
+def _mock_multi_server_client(class_mock, server_tools: dict[str, list]) -> None:
+    """按 server_name 返回各自的工具列表。"""
+
+    async def _get_tools(*, server_name):
+        return list(server_tools[server_name])
+
+    client = MagicMock()
+    client.get_tools = AsyncMock(side_effect=_get_tools)
+    class_mock.return_value = client
+
+
+@patch("aidev_agent.packages.resource_manager.base.MultiServerMCPClient")
+def test_construct_mcp_same_service_duplicate_merged(mock_mcp_client_class, caplog):
+    """同服务双端点的同名工具只保留配置顺序中先出现的实例，且不改名。"""
+    server_tools = {
+        "msdk-console-prod-mcp": [_make_mcp_tool("get_task_list"), _make_mcp_tool("msdk_a")],
+        "msdk-console-prod-mcp2": [_make_mcp_tool("get_task_list"), _make_mcp_tool("msdk_b")],
+    }
+    _mock_multi_server_client(mock_mcp_client_class, server_tools)
+
+    rm = AgentResourceManager(app_code="dummy_app", app_secret="dummy_secret")
+    with caplog.at_level("INFO"):
+        result = rm.construct_mcp(DUP_MCP_CONFIG)
+
+    assert [t.name for t in result.tools] == ["get_task_list", "msdk_a", "msdk_b"]
+    keeper = result.tools[0]
+    assert keeper.metadata["mcp_name"] == "msdk-console-prod-mcp"
+    assert keeper.metadata["mcp_merged_servers"] == ["msdk-console-prod-mcp2"]
+    assert keeper.metadata["original_name"] == "get_task_list"
+    assert keeper.metadata["display_name"] == "get_task_list"
+    assert "tool merged" in caplog.text
+
+
+@patch("aidev_agent.packages.resource_manager.base.MultiServerMCPClient")
+def test_construct_mcp_cross_service_duplicate_renamed(mock_mcp_client_class, caplog):
+    """不同服务的同名工具：首个保留原名，其余改为 <MCP_NAME>__<TOOL_NAME>。"""
+    config = {
+        "foo-mcp": {"url": "http://foo.example.com/mcp", "transport": "streamable_http"},
+        "bar-mcp": {"url": "http://bar.example.com/mcp", "transport": "streamable_http"},
+    }
+    _mock_multi_server_client(
+        mock_mcp_client_class,
+        {"foo-mcp": [_make_mcp_tool("get_task_list")], "bar-mcp": [_make_mcp_tool("get_task_list")]},
+    )
+
+    rm = AgentResourceManager(app_code="dummy_app", app_secret="dummy_secret")
+    with caplog.at_level("INFO"):
+        result = rm.construct_mcp(config)
+
+    assert [t.name for t in result.tools] == ["get_task_list", "bar-mcp__get_task_list"]
+    renamed = result.tools[1]
+    assert renamed.metadata["mcp_name"] == "bar-mcp"
+    assert renamed.metadata["original_name"] == "get_task_list"
+    assert renamed.metadata["display_name"] == "get_task_list"
+    assert "mcp_merged_servers" not in renamed.metadata
+    assert "tool renamed" in caplog.text
+    assert "original=get_task_list" in caplog.text
+    assert "server=bar-mcp" in caplog.text
+
+
+@patch("aidev_agent.packages.resource_manager.base.MultiServerMCPClient")
+def test_construct_mcp_no_duplicate_keeps_metadata_and_silent(mock_mcp_client_class, caplog):
+    """无重名时不改名、不写新 metadata、不产生新增日志。"""
+    _mock_multi_server_client(
+        mock_mcp_client_class,
+        {"msdk-console-prod-mcp": [_make_mcp_tool("a")], "msdk-console-prod-mcp2": [_make_mcp_tool("b")]},
+    )
+
+    rm = AgentResourceManager(app_code="dummy_app", app_secret="dummy_secret")
+    with caplog.at_level("INFO"):
+        result = rm.construct_mcp(DUP_MCP_CONFIG)
+
+    assert [t.name for t in result.tools] == ["a", "b"]
+    for tool in result.tools:
+        assert set(tool.metadata) == {"mcp_name", "mcp_transport"}
+    assert "tool renamed" not in caplog.text
+    assert "tool merged" not in caplog.text
+
+
+@patch("aidev_agent.packages.resource_manager.base.MultiServerMCPClient")
+def test_construct_mcp_selected_tools_filter_before_dedupe(mock_mcp_client_class):
+    """selected_tools 先过滤：过滤后不再重名则不改名。"""
+    config = {
+        "foo-mcp": {
+            "url": "http://foo.example.com/mcp",
+            "transport": "streamable_http",
+            "selected_tools": ["keep_me"],
+        },
+        "bar-mcp": {"url": "http://bar.example.com/mcp", "transport": "streamable_http"},
+    }
+    _mock_multi_server_client(
+        mock_mcp_client_class,
+        {
+            "foo-mcp": [_make_mcp_tool("get_task_list"), _make_mcp_tool("keep_me")],
+            "bar-mcp": [_make_mcp_tool("get_task_list")],
+        },
+    )
+
+    rm = AgentResourceManager(app_code="dummy_app", app_secret="dummy_secret")
+    result = rm.construct_mcp(config)
+
+    assert [t.name for t in result.tools] == ["keep_me", "get_task_list"]
+    assert all("original_name" not in t.metadata for t in result.tools)
+
+
+@patch("aidev_agent.packages.resource_manager.base.MultiServerMCPClient")
+def test_construct_mcp_approval_matcher_skips_merge(mock_mcp_client_class, caplog):
+    """审批组不合并：两个实例都保留，非首个改为 <MCP_NAME>__<TOOL_NAME>。"""
+    _mock_multi_server_client(
+        mock_mcp_client_class,
+        {
+            "msdk-console-prod-mcp": [_make_mcp_tool("get_task_list")],
+            "msdk-console-prod-mcp2": [_make_mcp_tool("get_task_list")],
+        },
+    )
+
+    rm = AgentResourceManager(app_code="dummy_app", app_secret="dummy_secret")
+    with caplog.at_level("INFO"):
+        result = rm.construct_mcp(
+            DUP_MCP_CONFIG,
+            approval_matcher=lambda mcp_name, tool_name: (
+                (mcp_name, tool_name) == ("msdk-console-prod-mcp2", "get_task_list")
+            ),
+        )
+
+    assert [t.name for t in result.tools] == ["get_task_list", "msdk-console-prod-mcp2__get_task_list"]
+    assert "skip_merge_reason=approval" in caplog.text
+    assert "tool merged" not in caplog.text
+
+
+@patch("aidev_agent.packages.resource_manager.base.MultiServerMCPClient")
+def test_make_mcp_tools_inherits_same_dedupe_rule(mock_mcp_client_class):
+    """兼容入口 make_mcp_tools 与主链路同一实现（无审批上下文时合并）。"""
+    _mock_multi_server_client(
+        mock_mcp_client_class,
+        {
+            "msdk-console-prod-mcp": [_make_mcp_tool("get_task_list")],
+            "msdk-console-prod-mcp2": [_make_mcp_tool("get_task_list")],
+        },
+    )
+
+    result = make_mcp_tools(DUP_MCP_CONFIG)
+
+    assert [t.name for t in result.tools] == ["get_task_list"]
+
+
+@pytest.mark.asyncio
+async def test_renamed_mcp_tool_routes_to_original_tool_name():
+    """改名只影响模型可见名：实际 call_tool 仍用原始工具名，入参原样透传。"""
+    from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
+    from mcp.types import CallToolResult, TextContent
+    from mcp.types import Tool as MCPTool
+
+    from aidev_agent.utils.tool_naming import dedupe_mcp_tools
+
+    class _FakeSession:
+        def __init__(self, name: str):
+            self.name = name
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call_tool(self, tool_name, arguments, progress_callback=None):
+            self.calls.append((tool_name, arguments))
+            return CallToolResult(content=[TextContent(type="text", text="ok")], isError=False)
+
+    def _build(session, server_name):
+        mcp_tool = MCPTool(
+            name="get_task_list", description="task list", inputSchema={"type": "object", "properties": {}}
+        )
+        tool = convert_mcp_tool_to_langchain_tool(session, mcp_tool, server_name=server_name)
+        tool.metadata = {**(tool.metadata or {}), "mcp_name": server_name}
+        return tool
+
+    foo_session = _FakeSession("foo-mcp")
+    bar_session = _FakeSession("bar-mcp")
+    foo_tool = _build(foo_session, "foo-mcp")
+    bar_tool = _build(bar_session, "bar-mcp")
+
+    result = dedupe_mcp_tools([foo_tool, bar_tool])
+
+    assert [t.name for t in result.tools] == ["get_task_list", "bar-mcp__get_task_list"]
+    # 模型请求体中的工具名唯一
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    payload_names = [each["function"]["name"] for each in map(convert_to_openai_tool, result.tools)]
+    assert payload_names == ["get_task_list", "bar-mcp__get_task_list"]
+
+    renamed = result.tools[1]
+    await renamed.ainvoke({"page": 2})
+
+    assert bar_session.calls == [("get_task_list", {"page": 2})]
+    assert foo_session.calls == []

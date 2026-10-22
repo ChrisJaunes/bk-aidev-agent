@@ -15,7 +15,7 @@ from aidev_agent.packages.interrupt_manager import is_approval_configured
 
 from .events import ExtendToolCallResultEvent
 from .types import ExtendFunctionCall, ExtendToolCall
-from .utils import TOOL_CALLING_PLACEHOLDER
+from .utils import TOOL_CALLING_PLACEHOLDER, resolve_display_name
 
 
 def _resolve_function_type(tool_call_name: str, _tool: Any) -> str | None:
@@ -60,24 +60,31 @@ def enhance_tool_call(tool_call_name: str, tools: dict[str, Any]) -> dict[str, A
         tools: 工具名→工具对象映射
 
     Returns:
-        dict 含 description + mcp_name + function_type 键，供 ExtendToolCallStartEvent 或 ExtendFunctionCall 使用。
+        dict 含 description + mcp_name + function_type + tool_call_name 键，供 ExtendToolCallStartEvent 或 ExtendFunctionCall 使用。
         function_type 缺省为 None 而非空串（判空语义见 ``_resolve_function_type``）。
+        tool_call_name 为展示名（改名工具回落原始工具名），用于覆盖事件里的模型名。
     """
     _tool = tools.get(tool_call_name)
     return {
         "description": _tool.description if _tool else "",
         "mcp_name": _tool.metadata.get("mcp_name", "") if _tool and _tool.metadata else "",
         "function_type": _resolve_function_type(tool_call_name, _tool),
+        "tool_call_name": resolve_display_name(tool_call_name, tools),
     }
 
 
-def build_tool_result_event(tool_msg: Any, is_immediate: bool = False) -> ExtendToolCallResultEvent:
+def build_tool_result_event(
+    tool_msg: Any,
+    is_immediate: bool = False,
+    tools_mapping: dict[str, Any] | None = None,
+) -> ExtendToolCallResultEvent:
     """从 ToolMessage 构造 ExtendToolCallResultEvent。
 
     Args:
         tool_msg: LangGraph ToolMessage 对象
         is_immediate: True 表示子 Agent 中间步骤（duration=None, is_error=False, skip_db=True）；
                      False 表示正常工具完成（从 additional_kwargs 取 duration，从 status/error 推导 is_error，skip_db=False）
+        tools_mapping: 工具名（模型名）→ 工具对象映射；传入时 tool_call_name 回落为展示名
 
     Returns:
         ExtendToolCallResultEvent 事件对象，携带 additional_metadata（完整 additional_kwargs dict 副本）
@@ -96,10 +103,11 @@ def build_tool_result_event(tool_msg: Any, is_immediate: bool = False) -> Extend
         is_error = getattr(tool_msg, "status", None) == "error" or bool(getattr(tool_msg, "error", None))
         skip_db = False
 
+    name = getattr(tool_msg, "name", None)
     return ExtendToolCallResultEvent(
         type=EventType.TOOL_CALL_RESULT,
         tool_call_id=tool_msg.tool_call_id,
-        tool_call_name=getattr(tool_msg, "name", None),
+        tool_call_name=resolve_display_name(name, tools_mapping) if name else name,
         message_id=tool_msg.id or str(uuid.uuid4()),
         content=content,
         role="tool",
@@ -159,17 +167,23 @@ def build_tool_calls_with_approval_filter(output_message: Any, tools_mapping: di
     immediate_tool_calls = []
     deferred_tool_calls = []
     for each in output_message.tool_calls or []:
-        _tool = tools_mapping.get(each["name"])
+        model_name = each["name"]
+        _tool = tools_mapping.get(model_name)
+        display_name = resolve_display_name(model_name, tools_mapping)
         tool_call_dict = ExtendToolCall(
             id=each["id"],
             function=ExtendFunctionCall(
-                name=each["name"],
+                name=display_name,
                 arguments=json.dumps(each["args"]),
                 description=_tool.description if _tool else "",
                 mcp_name=_tool.metadata.get("mcp_name", "") if _tool and _tool.metadata else "",
-                function_type=_resolve_function_type(each["name"], _tool),
+                function_type=_resolve_function_type(model_name, _tool),
+                model_name=model_name if model_name != display_name else None,
             ),
         ).model_dump()
+        if model_name == display_name:
+            # 未改名时账本逐字不变：不落 model_name 键
+            tool_call_dict["function"].pop("model_name", None)
 
         if _is_deferred_tool(_tool):
             deferred_tool_calls.append(tool_call_dict)

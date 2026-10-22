@@ -9,6 +9,8 @@ should_end_thinking / should_switch_thinking_step / build_model_end_payload 六�
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
+
 from aidev_agent.core.ag_ui.event_builders import (
     _is_deferred_tool,
     build_model_end_payload,
@@ -20,7 +22,6 @@ from aidev_agent.core.ag_ui.event_builders import (
     should_suppress_approval_tool_call,
     should_switch_thinking_step,
 )
-from langchain_core.messages import AIMessage, ToolMessage
 
 
 def _make_tool(
@@ -29,6 +30,7 @@ def _make_tool(
     mcp_name: str = "",
     approval: dict | None = None,
     function_type: str = "",
+    display_name: str = "",
 ) -> MagicMock:
     """构造 Mock Tool 对象，带 description / metadata 属性。"""
     tool = MagicMock()
@@ -40,6 +42,8 @@ def _make_tool(
         metadata["approval"] = approval
     if function_type:
         metadata["function_type"] = function_type
+    if display_name:
+        metadata["display_name"] = display_name
     tool.metadata = metadata
     return tool
 
@@ -91,17 +95,30 @@ class TestEnhanceToolCall:
         tool = _make_tool(description="my description", mcp_name="my-mcp")
         tools = {"my_tool": tool}
         result = enhance_tool_call("my_tool", tools)
-        assert result == {"description": "my description", "mcp_name": "my-mcp", "function_type": None}
+        assert result == {
+            "description": "my description",
+            "mcp_name": "my-mcp",
+            "function_type": None,
+            "tool_call_name": "my_tool",
+        }
 
     def test_tool_none_returns_empty_strings(self):
         result = enhance_tool_call("missing_tool", {})
-        assert result == {"description": "", "mcp_name": "", "function_type": None}
+        assert result == {"description": "", "mcp_name": "", "function_type": None, "tool_call_name": "missing_tool"}
 
     def test_tool_without_mcp_name_returns_empty_mcp_name(self):
         tool = _make_tool(description="desc")
         tools = {"my_tool": tool}
         result = enhance_tool_call("my_tool", tools)
-        assert result == {"description": "desc", "mcp_name": "", "function_type": None}
+        assert result == {"description": "desc", "mcp_name": "", "function_type": None, "tool_call_name": "my_tool"}
+
+    def test_renamed_tool_falls_back_to_display_name(self):
+        """改名工具的事件名回落为原始工具名，mcp_name 仍取改名后对象。"""
+        tool = _make_tool(description="desc", mcp_name="bar-mcp", display_name="get_task_list")
+        tools = {"bar-mcp__get_task_list": tool}
+        result = enhance_tool_call("bar-mcp__get_task_list", tools)
+        assert result["tool_call_name"] == "get_task_list"
+        assert result["mcp_name"] == "bar-mcp"
 
     @pytest.mark.parametrize(
         "function_type, expected",
@@ -429,3 +446,75 @@ class TestToolCallFunctionType:
             function_type=function_type,
         )
         assert event.model_dump(by_alias=True)["functionType"] == expected
+
+
+class TestRenamedToolDisplayName:
+    """改名 MCP 工具的展示名下沉：事件与账本用原始名，模型名单独存放。"""
+
+    MODEL_NAME = "bar-mcp__get_task_list"
+    DISPLAY_NAME = "get_task_list"
+
+    def _mapping(self) -> dict:
+        return {
+            self.MODEL_NAME: _make_tool(
+                description="task list",
+                mcp_name="bar-mcp",
+                display_name=self.DISPLAY_NAME,
+            )
+        }
+
+    def test_model_end_ledger_keeps_display_name_and_model_name(self):
+        output_message = AIMessage(
+            content="",
+            id="msg-1",
+            tool_calls=[{"name": self.MODEL_NAME, "args": {"page": 1}, "id": "call-1"}],
+            additional_kwargs={},
+        )
+        immediate, deferred = build_tool_calls_with_approval_filter(output_message, self._mapping())
+        assert deferred == []
+        function = immediate[0]["function"]
+        assert function["name"] == self.DISPLAY_NAME
+        assert function["model_name"] == self.MODEL_NAME
+        assert function["mcp_name"] == "bar-mcp"
+        assert "__" not in function["name"]
+
+    def test_unchanged_tool_ledger_has_no_model_name_key(self):
+        tool = _make_tool(description="desc", mcp_name="foo-mcp")
+        output_message = AIMessage(
+            content="",
+            id="msg-2",
+            tool_calls=[{"name": "get_task_list", "args": {}, "id": "call-2"}],
+            additional_kwargs={},
+        )
+        immediate, _ = build_tool_calls_with_approval_filter(output_message, {"get_task_list": tool})
+        assert "model_name" not in immediate[0]["function"]
+        assert immediate[0]["function"]["name"] == "get_task_list"
+
+    def test_tool_result_event_uses_display_name(self):
+        message = ToolMessage(content="done", tool_call_id="call-1", name=self.MODEL_NAME)
+        event = build_tool_result_event(message, tools_mapping=self._mapping())
+        assert event.tool_call_name == self.DISPLAY_NAME
+
+    def test_tool_result_event_without_mapping_keeps_model_name(self):
+        message = ToolMessage(content="done", tool_call_id="call-1", name=self.MODEL_NAME)
+        event = build_tool_result_event(message)
+        assert event.tool_call_name == self.MODEL_NAME
+
+    def test_replay_events_use_display_name(self):
+        from aidev_agent.core.ag_ui.utils import langchain_messages_to_streaming_events
+
+        ai_message = AIMessage(
+            content="",
+            id="msg-3",
+            tool_calls=[{"name": self.MODEL_NAME, "args": {}, "id": "call-3"}],
+            additional_kwargs={},
+        )
+        tool_message = ToolMessage(content="done", tool_call_id="call-3", name=self.MODEL_NAME, id="msg-4")
+        events = list(langchain_messages_to_streaming_events([ai_message, tool_message], tools_mapping=self._mapping()))
+
+        names = [
+            ev.model_dump(by_alias=True)["toolCallName"]
+            for ev in events
+            if ev.model_dump(by_alias=True).get("toolCallName")
+        ]
+        assert names == [self.DISPLAY_NAME, self.DISPLAY_NAME]

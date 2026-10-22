@@ -1973,6 +1973,8 @@ class ChatAgentBuilder:
     def build_tools(self) -> List[Any]:
         """构建工具"""
         config = self.ctx.agent_config
+        # 审批绑定先算出，供 MCP 装配的同名去重（审批豁免）与后续审批 metadata 复用同一份结果
+        approval_items = self._normalize_tool_approval_bindings()
         specific_mcps = [each.get("code") for each in self._specific_resources if each.get("type") == "mcp"]
         if specific_mcps:
             mcp_server_config = {each: config.mcp_server_config.get(each) for each in specific_mcps}
@@ -1983,6 +1985,7 @@ class ChatAgentBuilder:
             username=self.ctx.username,
             executor_info=self._executor_info,
             ssl_verify=config.tool_ssl_verify,
+            approval_matcher=self._build_approval_matcher(approval_items),
         )
         self._mcp_fetch_failures = [f.model_dump() for f in mcp_result.fetch_failures]
         logger.info(f"ChatAgentBuilder: mcp_server_config->[{mcp_server_config}]")
@@ -2001,11 +2004,20 @@ class ChatAgentBuilder:
             )
             for tool_code in tool_codes
         ] + mcp_result.tools
-        self._apply_tool_approval_settings(tools)
+        self._apply_tool_approval_settings(tools, approval_items)
         return tools
 
-    def _apply_tool_approval_settings(self, tools: list[Any]) -> None:
-        approval_items = self._normalize_tool_approval_bindings()
+    def _build_approval_matcher(self, approval_items: list[dict[str, Any]]):
+        """构造 MCP 同名去重用的审批匹配函数，复用 ``_match_approval_item`` 同一套判定。"""
+        if not approval_items:
+            return None
+
+        def _matcher(mcp_name: str, tool_name: str) -> bool:
+            return bool(self._match_approval_item({"mcp_name": mcp_name}, tool_name, approval_items))
+
+        return _matcher
+
+    def _apply_tool_approval_settings(self, tools: list[Any], approval_items: list[dict[str, Any]]) -> None:
         logger.info("[ToolApproval] ========== _apply_tool_approval_settings 被调用 ==========")
         logger.info("[ToolApproval] 归一化审批配置: %s", approval_items)
         logger.info("[ToolApproval] 工具对象 id 列表: %s", [(getattr(t, "name", ""), id(t)) for t in tools])
@@ -2033,7 +2045,7 @@ class ChatAgentBuilder:
                     "type": target_type,
                     "id": metadata.get("tool_id"),
                     "name": tool_name,
-                    "display_name": metadata.get("tool_name") or tool_name,
+                    "display_name": metadata.get("display_name") or metadata.get("tool_name") or tool_name,
                     "code": metadata.get("tool_code") or tool_name,
                     "mcp_name": metadata.get("mcp_name"),
                     "skill_name": metadata.get("skill_name"),
@@ -2132,29 +2144,34 @@ class ChatAgentBuilder:
         tool_code = metadata.get("tool_code") or tool_name
         tool_id = metadata.get("tool_id")
         mcp_name = metadata.get("mcp_name")
+        # 因重名被改名的工具保留原始名：审批配置按原始名（或模型名）命中，避免改名后绕过审批
+        match_names = {tool_name, tool_code}
+        original_name = metadata.get("original_name")
+        if original_name:
+            match_names.add(original_name)
         for item in approval_items:
             resource_type = item.get("resource_type") or item.get("tool_type")
             if resource_type == "tool":
                 if item.get("id") and item.get("id") == tool_id:
                     return item
-                if item.get("tool_code") and item.get("tool_code") == tool_code:
+                if item.get("tool_code") and item.get("tool_code") in match_names:
                     return item
-                if item.get("tool_name") and item.get("tool_name") in {tool_name, tool_code}:
+                if item.get("tool_name") and item.get("tool_name") in match_names:
                     return item
             elif resource_type in {"mcp_tool", "mcp"}:
                 if item.get("mcp_name") and item.get("mcp_name") != mcp_name:
                     continue
-                if item.get("tool_name") and item.get("tool_name") in {tool_name, tool_code}:
+                if item.get("tool_name") and item.get("tool_name") in match_names:
                     return item
-                if item.get("tool_code") and item.get("tool_code") == tool_code:
+                if item.get("tool_code") and item.get("tool_code") in match_names:
                     return item
                 if item.get("mcp_code") and item.get("mcp_code") == mcp_name:
                     expected_tool_code = item.get("code") or item.get("tool_code")
-                    if not expected_tool_code or expected_tool_code == tool_code:
+                    if not expected_tool_code or expected_tool_code in match_names:
                         return item
-            if item.get("code") and item.get("code") == tool_code:
+            if item.get("code") and item.get("code") in match_names:
                 return item
-            if item.get("tool_code") and item.get("tool_code") == tool_code:
+            if item.get("tool_code") and item.get("tool_code") in match_names:
                 return item
         return None
 

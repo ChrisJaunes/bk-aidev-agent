@@ -344,3 +344,56 @@ class TestCurrentTurnImageRecognizableGuard:
         messages = self._convert([ChatPrompt(id="now", role=PromptRole.USER.value, content="纯文本")])
 
         assert messages[0].content == "纯文本"
+
+
+class TestExtractToolCallsModelName:
+    """账本展示名与模型名分离：历史装配优先取 function.model_name。"""
+
+    def test_prefers_model_name(self):
+        from aidev_agent.core.nodes.model.chat_history_assembly import _extract_tool_calls
+
+        builtin_property = {
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_task_list",
+                        "model_name": "bar-mcp__get_task_list",
+                        "arguments": '{"page": 1}',
+                    },
+                }
+            ]
+        }
+        assert _extract_tool_calls(builtin_property) == [
+            {"id": "call-1", "name": "bar-mcp__get_task_list", "args": {"page": 1}, "type": "tool_call"}
+        ]
+
+    def test_falls_back_to_name_for_legacy_records(self):
+        from aidev_agent.core.nodes.model.chat_history_assembly import _extract_tool_calls
+
+        builtin_property = {
+            "tool_calls": [{"id": "call-2", "function": {"name": "get_task_list", "arguments": "{}"}}]
+        }
+        assert _extract_tool_calls(builtin_property) == [
+            {"id": "call-2", "name": "get_task_list", "args": {}, "type": "tool_call"}
+        ]
+
+    def test_same_display_name_two_services_stay_distinguishable(self):
+        from aidev_agent.core.nodes.model.chat_history_assembly import _extract_tool_calls
+
+        builtin_property = {
+            "tool_calls": [
+                {"id": "call-3", "function": {"name": "get_task_list", "arguments": "{}"}},
+                {
+                    "id": "call-4",
+                    "function": {
+                        "name": "get_task_list",
+                        "model_name": "bar-mcp__get_task_list",
+                        "arguments": "{}",
+                    },
+                },
+            ]
+        }
+        names = [each["name"] for each in _extract_tool_calls(builtin_property)]
+        assert names == ["get_task_list", "bar-mcp__get_task_list"]

@@ -480,10 +480,10 @@ class AidevAGUIAgent(LangGraphAGUIAgent):
             )
             return
         elif name == CustomEventNames.OnToolNodeFinish.value:
-            yield build_tool_result_event(event["data"], is_immediate=False)
+            yield build_tool_result_event(event["data"], is_immediate=False, tools_mapping=self._tool_mapping)
             return
         elif name == CustomEventNames.OnToolNodeImmediate.value:
-            yield build_tool_result_event(event["data"], is_immediate=True)
+            yield build_tool_result_event(event["data"], is_immediate=True, tools_mapping=self._tool_mapping)
             return
         async for ev in super()._handle_on_custom_event(event):
             yield ev

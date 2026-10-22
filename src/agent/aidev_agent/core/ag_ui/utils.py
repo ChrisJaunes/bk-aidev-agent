@@ -79,6 +79,23 @@ from ...enums import PromptRole
 # 定义在 utils（低层模块）供 event_builders 复用，避免 event_builders ↔ utils 循环依赖。
 TOOL_CALLING_PLACEHOLDER = "正在调用工具..."
 
+
+def resolve_display_name(tool_name: str, tools_mapping: dict[str, Any] | None) -> str:
+    """取工具的用户可见展示名。
+
+    MCP 工具因跨服务重名被改名为 ``<MCP_NAME>__<TOOL_NAME>`` 时，
+    ``metadata["display_name"]`` 保留原始工具名；未改名或非 MCP 工具回落到模型名。
+    ``tools_mapping`` 以**模型名**为键。
+    """
+    if not tool_name or not tools_mapping:
+        return tool_name
+    _tool = tools_mapping.get(tool_name)
+    metadata = getattr(_tool, "metadata", None) if _tool is not None else None
+    if not metadata:
+        return tool_name
+    return metadata.get("display_name") or tool_name
+
+
 DEFAULT_SCHEMA_KEYS = ["tools"]
 
 logger = logging.getLogger(__name__)
@@ -713,7 +730,7 @@ def langchain_messages_to_streaming_events(
                 tools_mapping=tools_mapping,
             )
         elif isinstance(message, ToolMessage):
-            yield _tool_message_to_event(message)
+            yield _tool_message_to_event(message, tools_mapping=tools_mapping)
 
 
 def _ai_message_to_events(
@@ -778,7 +795,7 @@ def _ai_message_to_events(
         yield ExtendToolCallStartEvent(
             type=EventType.TOOL_CALL_START,
             tool_call_id=tc_id,
-            tool_call_name=tc.get("name", ""),
+            tool_call_name=resolve_display_name(tc.get("name", ""), tools_mapping),
             parent_message_id=message_id,
         )
         yield ToolCallArgsEvent(
@@ -792,10 +809,14 @@ def _ai_message_to_events(
         )
 
 
-def _tool_message_to_event(message: ToolMessage) -> BaseEvent:
-    """把单条 ToolMessage 展开为一条 TOOL_CALL_RESULT 事件"""
+def _tool_message_to_event(message: ToolMessage, tools_mapping: dict[str, Any] | None = None) -> BaseEvent:
+    """把单条 ToolMessage 展开为一条 TOOL_CALL_RESULT 事件。
+
+    ``ToolMessage.name`` 是模型名；传 ``tools_mapping`` 时事件展示名回落为原始工具名。
+    """
     content = stringify_if_needed(resolve_message_content(message.content))
     is_error = getattr(message, "status", None) == "error"
+    name = getattr(message, "name", None)
     return ExtendToolCallResultEvent(
         type=EventType.TOOL_CALL_RESULT,
         tool_call_id=message.tool_call_id,
@@ -804,5 +825,5 @@ def _tool_message_to_event(message: ToolMessage) -> BaseEvent:
         role="tool",
         is_error=is_error or None,
         duration=(message.additional_kwargs or {}).get("duration"),
-        tool_call_name=getattr(message, "name", None),
+        tool_call_name=resolve_display_name(name, tools_mapping) if name else name,
     )

@@ -116,6 +116,8 @@ class ExtendFunctionCall(FunctionCall):
     description: str | None = None
     mcp_name: str | None = None
     function_type: str | None = None
+    # 模型名：仅在展示名与模型名不同（MCP 工具因重名被改名）时写入，供历史装配还原
+    model_name: str | None = None
 
 
 class ExtendToolCall(ToolCall):

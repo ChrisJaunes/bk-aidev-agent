@@ -69,10 +69,14 @@ def _extract_tool_calls(builtin_property: dict) -> list[dict]:
     """从 builtin_property 中提取 tool_calls 列表。
 
     注意：arguments 在数据库中存储为 JSON 字符串，需要解析为字典。
+
+    账本中的 ``function.name`` 是展示名（MCP 工具因跨服务重名被改名时回落原始名），
+    而下一轮模型历史必须使用模型调用时的名字，故优先取 ``function.model_name``。
     """
     tool_calls = []
     for tc in builtin_property.get("tool_calls", []):
-        args_str = tc.get("function", {}).get("arguments", "{}")
+        function = tc.get("function") or {}
+        args_str = function.get("arguments", "{}")
         try:
             args = json.loads(args_str) if isinstance(args_str, str) else args_str
         except json.JSONDecodeError:
@@ -81,7 +85,7 @@ def _extract_tool_calls(builtin_property: dict) -> list[dict]:
         tool_calls.append(
             {
                 "id": tc.get("id", ""),
-                "name": tc.get("function", {}).get("name", ""),
+                "name": function.get("model_name") or function.get("name", ""),
                 "args": args,
                 "type": "tool_call",
             }

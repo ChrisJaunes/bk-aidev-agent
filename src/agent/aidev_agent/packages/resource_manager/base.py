@@ -42,6 +42,7 @@ from aidev_agent.packages.langchain_core.tools.base import (
 from aidev_agent.pydantic_models import AgentConfig, SecuritySettings
 from aidev_agent.utils.executor_identity import approver_authorization
 from aidev_agent.utils.loop import run_coro_sync
+from aidev_agent.utils.tool_naming import dedupe_mcp_tools
 from aidev_agent.utils.tracing import CLIENT_SPAN_KIND, recording_span, trace_headers
 
 try:
@@ -139,6 +140,52 @@ def _get_access_token_by_user(username: str) -> str | None:
     except Exception as e:
         _logger.warning(f"Failed to get access_token by username {username}: {e}")
         return None
+
+
+def _dedupe_mcp_tool_names(
+    tools: List[StructuredTool],
+    approval_matcher: Callable[[str, str], bool] | None = None,
+) -> List[StructuredTool]:
+    """消除 MCP 工具重名，并把原始名/展示名写回 metadata、记录变更日志。
+
+    未发生重名时原样返回，不写 metadata 也不产生日志（保持既有装配结果逐项不变）。
+    """
+    result = dedupe_mcp_tools(tools, approval_matcher)
+    if not result.changes:
+        return result.tools
+
+    change_by_final = {each.final: each for each in result.changes}
+    for tool in result.tools:
+        change = change_by_final.get(tool.name)
+        if change is None:
+            continue
+        if not tool.metadata:
+            tool.metadata = {}
+        if tool.metadata.get("mcp_name") != change.server:
+            continue
+        tool.metadata["original_name"] = change.original
+        tool.metadata["display_name"] = change.original
+        if change.kind == "merge":
+            tool.metadata["mcp_merged_servers"] = list(change.merged_servers)
+
+    for change in result.changes:
+        if change.kind == "merge":
+            _logger.info(
+                f"[MCP] tool merged: original={change.original}, kept_server={change.server}, "
+                f"merged_servers={list(change.merged_servers)}"
+            )
+            if change.schema_mismatch:
+                _logger.warning(
+                    f"[MCP] tool merged with different args_schema: original={change.original}, "
+                    f"kept_server={change.server}, merged_servers={list(change.merged_servers)}"
+                )
+        else:
+            _logger.info(
+                f"[MCP] tool renamed: original={change.original}, final={change.final}, "
+                f"server={change.server}"
+                + (f", skip_merge_reason={change.skip_merge_reason}" if change.skip_merge_reason else "")
+            )
+    return result.tools
 
 
 class BaseResourceManager(abc.ABC):
@@ -607,18 +654,21 @@ class BaseResourceManager(abc.ABC):
         username: str = None,
         executor_info: dict | None = None,
         ssl_verify: bool = True,
+        approval_matcher: Callable[[str, str], bool] | None = None,
         **kwargs,
     ) -> Any:
         """按 MCP 配置装配 LangChain ``StructuredTool`` 列表。
 
         使用 ``langchain_mcp_adapters`` 连接 MCP 服务器并获取工具列表。
-        支持凭证处理、selected_tools 过滤、异常处理等功能。
+        支持凭证处理、selected_tools 过滤、工具重名去重、异常处理等功能。
 
         :param mcp_config: MCP 客户端配置字典，格式为 ``{"server_name": {"url": ..., "transport": ...}}``
         :param agent_options: Agent 选项，用于异常处理
         :param username: 用户名，用于 BLUEAPPS 认证
         :param executor_info: 执行用户信息（含 app_code/app_secret/access_token），
             优先用于 MCP 凭证注入，与 skill sandbox 保持一致
+        :param approval_matcher: 可选的审批匹配函数 ``(mcp_name, tool_name) -> bool``；
+            命中时该重名组放弃合并（改为改名保留），避免被丢弃端点的审批绑定失效
         :return: McpToolsResult 对象，包含 tools 和 fetch_failures
         """
         new_server_config = deepcopy(mcp_config)
@@ -746,7 +796,7 @@ class BaseResourceManager(abc.ABC):
             tools_list.extend(tlist)
             if fail is not None:
                 failures.append(fail)
-        return McpToolsResult(tools=tools_list, fetch_failures=failures)
+        return McpToolsResult(tools=_dedupe_mcp_tool_names(tools_list, approval_matcher), fetch_failures=failures)
 
     def knowledge_query(self, data: dict[str, Any]) -> dict:
         client = self.get_client()
