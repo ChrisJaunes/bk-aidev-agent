@@ -72,9 +72,9 @@
 
 ## 决策
 
-### 1. 新增纯函数模块 `packages/resource_manager/tool_naming.py`
+### 1. 新增纯函数模块 `utils/tool_naming.py`
 
-无 I/O、无日志、无全局状态，全部函数可独立单测。
+无 I/O、无日志、无全局状态，全部函数可独立单测；不放在 `packages/resource_manager/` 下，避免与资源装配实现耦合。
 
 ```python
 SEP = "__"
@@ -85,7 +85,7 @@ def split_service(server_name: str) -> str | None      # 恰好一个 -prod- 时
 def is_same_service(a: str, b: str) -> bool            # a != b 且 split_service(a) == split_service(b) != None
 def sanitize(segment: str) -> str                      # 非法字符替换为 "_"
 def compose_tool_name(mcp_name: str, tool_name: str) -> str
-def dedupe_mcp_tools(tools: list) -> tuple[list, list[ToolNameChange]]
+def dedupe_mcp_tools(tools: list, approval_matcher: Callable[[str, str], bool] | None = None) -> tuple[list, list[ToolNameChange]]
 ```
 
 `compose_tool_name` 规则：
@@ -98,17 +98,22 @@ def dedupe_mcp_tools(tools: list) -> tuple[list, list[ToolNameChange]]
 `dedupe_mcp_tools` 规则（输入为按配置顺序排好的工具列表，`metadata["mcp_name"]` 为来源 Server）：
 
 1. 按 `tool.name` 分组，保持首次出现位置；组内第一个为 keeper。
-2. 组内其余成员：与 keeper 同服务 → 丢弃，记入 `ToolNameChange.merged_servers`；不同服务 → 重命名 `compose_tool_name(mcp_name, name)`。
-3. keeper 永不改名（REQ-2 / 验收「同时存在 `get_task_list` 与 `<MCP>__get_task_list`」）。
-4. 输出列表保持输入顺序，被丢弃项直接移除（重命名不改变相对位置）。
-5. `ToolNameChange` 为 dataclass：`original` / `final` / `server` / `merged_servers` / `kind ∈ {rename, merge}`。
+2. **审批豁免（用户确认）**：组内任一成员 `approval_matcher(mcp_name, 原始工具名)` 为真时，整组放弃合并——成员全部保留，非 keeper 成员走改名。理由：合并会丢弃某一端点的实例，而审批绑定是「MCP 名 + 工具名」维度的，被丢弃端点的审批工具一旦消失，调用会落到未绑定审批的同名工具上，等于绕过审批。
+3. 组内其余成员（仅当整组未命审批豁免）：与 keeper 同服务 → 丢弃，记入 `ToolNameChange.merged_servers`；不同服务 → 重命名 `compose_tool_name(mcp_name, name)`。
+4. keeper 永不改名（REQ-2 / 验收「同时存在 `get_task_list` 与 `<MCP>__get_task_list`」）。
+5. 输出列表保持输入顺序，被丢弃项直接移除（重命名不改变相对位置）。
+6. `ToolNameChange` 为 dataclass：`original` / `final` / `server` / `merged_servers` / `kind ∈ {rename, merge}`。
 
 ### 2. `construct_mcp()` 接线
 
-在 `base.py:742-749` 汇总 `tools_list` 之后、`return McpToolsResult(...)` 之前调用 `dedupe_mcp_tools(tools_list)`：
+在 `base.py:742-749` 汇总 `tools_list` 之后、`return McpToolsResult(...)` 之前调用 `dedupe_mcp_tools(tools_list, approval_matcher)`：
 
-- 对每个返回的工具写 `metadata["original_name"]` 与 `metadata["display_name"]`（均等于改名前名字）；keeper 额外写 `metadata["mcp_merged_servers"]`。
-- 仅对 `ToolNameChange` 记日志：`rename` 记 INFO（原始名、最终名、来源 Server），`merge` 记 INFO（原始名、保留 Server、被丢弃 Server 列表）；同一服务的合并若两侧 `args_schema` 不一致，额外记 WARNING 并在文案中提示 schema 差异。未发生重名时不产生任何新增日志。
+- **审批豁免的上下文注入**：`construct_mcp()` 新增可选参数 `approval_matcher: Callable[[str, str], bool] | None = None`。`ChatAgentBuilder.build_tools()`（`chat.py:1973`）在调用前先算 `approval_items = self._normalize_tool_approval_bindings()`，并传入
+  `lambda mcp_name, tool_name: bool(self._match_approval_item({"mcp_name": mcp_name}, tool_name, approval_items))`，
+  即**复用同一套审批匹配逻辑**，不新增第二套判定。`_apply_tool_approval_settings()` 改为接收同一份 `approval_items`，避免重复计算（行为不变）。
+- `make_mcp_tools()` 兼容层没有审批上下文，`approval_matcher` 为 `None`，此时按「可合并」处理；去重实现仍是同一份代码，仅输入不同。
+- 对每个返回的工具写 `metadata["original_name"]` 与 `metadata["display_name"]`（均等于改名前名字）；keeper 额外写 `metadata["mcp_merged_servers"]`；被审批豁免而未合并的组不写该键。
+- 仅对 `ToolNameChange` 记日志：`rename` 记 INFO（原始名、最终名、来源 Server），`merge` 记 INFO（原始名、保留 Server、被丢弃 Server 列表）；同服务判定命中但因审批豁免而未合并时记一条 INFO（含 `skip_merge_reason=approval`）；同一服务的合并若两侧 `args_schema` 不一致，额外记 WARNING 并在文案中提示 schema 差异。未发生重名时不产生任何新增日志。
 - 不触碰 `selected_tools` 过滤位置、并发拉取方式、span 属性与 `McpToolFetchFailure` 语义。
 
 ### 3. 展示名下沉（REQ-5）
@@ -131,7 +136,8 @@ def dedupe_mcp_tools(tools: list) -> tuple[list, list[ToolNameChange]]
 ### 5. 审批（REQ-10）
 
 - `services/agent/chat.py:2131` `_match_approval_item()`：命中集合由 `{tool_name, tool_code}` 扩为 `{tool_name, tool_code, metadata.get("original_name")}`，覆盖 `resource_type` 为 `tool` / `mcp_tool` / `mcp` 的所有分支。
-- `services/agent/chat.py:2007` `_apply_tool_approval_settings()`：`target.display_name` 取 `metadata.get("display_name") or metadata.get("tool_name") or tool_name`，使审批单标题（`packages/interrupt_manager/approval.py:841` 的 `ticket_title`）显示原始名；`target.name` / `target.code` 仍是模型名，作为执行身份不参与展示。
+- `services/agent/chat.py:2007` `_apply_tool_approval_settings()`：`target.display_name` 取 `metadata.get("display_name") or metadata.get("tool_name") or tool_name`，使审批单标题（`packages/interrupt_manager/approval.py:841` 的 `ticket_title`）显示原始名；`target.name` / `target.code` 仍是模型名，作为执行身份不参与展示。该方法复用 `build_tools()` 已算出的 `approval_items`（见决策 2），不再自行调用 `_normalize_tool_approval_bindings()`。
+- 审批工具不参与同服务合并（见决策 1 第 2 条）：合并会丢弃端点实例，而被丢弃端点的审批绑定随之失效，调用会落到未绑定审批的同名工具上。
 - 未改名的工具：`display_name == name`，审批 metadata 逐字不变。
 
 ### 6. 错误语义
@@ -147,6 +153,7 @@ def dedupe_mcp_tools(tools: list) -> tuple[list, list[ToolNameChange]]
 | `ExtendFunctionCall` | 新增可选 `model_name` | 仅改名时写入，未改名无该键 |
 | DB `builtin_property.tool_calls[].function` | 同上 | 旧会话无该键，走 `or function.name` 回退 |
 | `construct_mcp()` 返回 | 类型不变（`McpToolsResult`），工具数量可能减少（同服务合并） | `make_mcp_tools()` 自动一致 |
+| `construct_mcp()` 签名 | 新增可选 `approval_matcher` | 缺省 `None` 时保持既有调用可用 |
 
 执行路由契约：模型调用 `<MCP_NAME>__<TOOL_NAME>` → `StructuredTool.coroutine` → 闭包内 `session.call_tool(<原始 TOOL_NAME>)` → 返回原样透传。不需新代码，但需用例锁定（T-6）。
 
@@ -160,12 +167,13 @@ def dedupe_mcp_tools(tools: list) -> tuple[list, list[ToolNameChange]]
 2. **展示名与模型名分离**：旧会话（本次上线前写入的 DB 记录）没有 `function.model_name`，历史装配按 `function.name` 回退；由于旧记录名字本就唯一，行为不变。上线后若回滚代码，新会话的 `function.name` 是原始名，可能出现两个同名历史 tool_call —— 功能不坏（按 `tool_call_id` 配对），但可读性下降。
 3. **`_tools_mapping` 按名建索引**：同名工具在映射中已互相覆盖（存量行为，非本次引入）。改名后模型名唯一，映射反而更准确；但若同一 assistant 消息里同时出现两个原始名相同的调用，续流回填按名字查 `function_type` 可能取不到，仅影响 `function_type`（MCP 工具恒为 `None`），不影响审批与执行。
 4. **hash 截断边界**：工具名 + Server 名合计超过 64 字符时依赖 `sha1` 前 8 位保证唯一，碰撞概率可忽略；真碰撞时按 T-1 的 `_2`/`_3` 兜底，仍保证确定性。
-5. **未确认项**：`tools` 顺序稳定性对提示词缓存的影响未做量化，本方案只保证「重命名不改变相对位置」，不保证跨版本稳定。
+5. **审批豁免导致两条入口行为不同**：`ChatAgentBuilder` 路径带审批上下文，同服务重名组命中审批时不合并；`make_mcp_tools()` 路径无审批上下文，仍会合并。同一个配置经两条入口装配出的工具数量可能不同（差集恰为被审批保护的端点），但都不会 400、都不会绕过审批。
+6. **未确认项**：`tools` 顺序稳定性对提示词缓存的影响未做量化，本方案只保证「重命名不改变相对位置」，不保证跨版本稳定。
 
 ## 测试策略
 
-- 纯函数层：`tool_naming` 单测覆盖 `-prod-` 判定（含多 `prod`、无 `prod`、非对称名字）、卫生化、超长截断与确定性（同一输入重复调用结果相同）。
-- 装配层：`tests/packages/langchain_core/tools/test_base.py` 增加 `construct_mcp` 多 Server 同名用例——同服务合并（保留配置顺序首个）、跨服务改名、`selected_tools` 先过滤、无重名时名字/顺序/metadata 逐项不变、日志条数与级别。
+- 纯函数层：`tests/utils/test_tool_naming.py` 覆盖 `-prod-` 判定（含多 `prod`、无 `prod`、非对称名字）、卫生化、超长截断与确定性（同一输入重复调用结果相同）、审批豁免（`approval_matcher` 命中时不合并、改为改名）。
+- 装配层：`tests/packages/langchain_core/tools/test_base.py` 增加 `construct_mcp` 多 Server 同名用例——同服务合并（保留配置顺序首个）、跨服务改名、审批工具不合并、`selected_tools` 先过滤、无重名时名字/顺序/metadata 逐项不变、日志条数与级别。
 - 事件层：`tests/core/ag_ui/test_event_builders.py` 断言 `function.name` 为原始名、`function.model_name` 为模型名；`build_tool_result_event` 传 mapping 后返回原始名。
 - 审批层：`tests/services/agent`（或现有审批用例）断言改名工具仍命中审批配置、`target.display_name` 为原始名。
 - 历史层：`_extract_tool_calls` 断言优先取 `model_name`。
