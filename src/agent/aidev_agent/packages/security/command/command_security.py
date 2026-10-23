@@ -1100,6 +1100,8 @@ def enforce_command_security(
     target_runtime: str,
     security_settings: SecurityCommandSettings,
     risk_assessor: Any | None = None,
+    *,
+    command_approval_enabled: bool = True,
 ) -> None:
     """执行命令前进行统一安全防护（AST 全量判定 → 风险/审批）。
 
@@ -1124,6 +1126,10 @@ def enforce_command_security(
         security_settings: 命令防护配置（**必填**，无 None fallback）
         risk_assessor: 命令风险评估器（`enable_command_review_auto` 预分流用）。
             None 时跳过预分流，直接走处置档。
+        command_approval_enabled: 是否允许发起命令级审批（工具加载模式
+            ``dontInterrupt`` 时为 ``False``）。关闭时 ``approval`` 档 fail-closed
+            直接拒绝：不调用 :func:`require_command_approval`、不创建 ITSM 审批单；
+            ``allow`` / ``block`` 两档不受影响。缺省 ``True``，行为与未引入该参数时一致。
 
     Raises:
         AttributeError: ``security_settings`` 为 ``None``（必填契约，不做静默兜底）。
@@ -1166,6 +1172,11 @@ def enforce_command_security(
     if disposition == "allow":
         return
     if disposition == "block":
+        raise ValueError(f"命令执行被拒绝：{_format_report_details(report)}")
+
+    # approval 档在审批被关闭时 fail-closed 直接拒绝（dontInterrupt）：
+    # 不触发 interrupt、不创建 ITSM 单，措辞与 block 档一致，理由不丢失。
+    if not command_approval_enabled:
         raise ValueError(f"命令执行被拒绝：{_format_report_details(report)}")
 
     # disposition == "approval"：整条命令一次审批（无审批人 / interrupt 异常由

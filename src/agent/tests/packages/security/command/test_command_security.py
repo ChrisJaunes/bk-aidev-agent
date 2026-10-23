@@ -467,6 +467,65 @@ class TestApprovalBranch:
         assert calls == []
 
 
+class TestCommandApprovalDisabled:
+    """``command_approval_enabled=False``（工具加载模式 dontInterrupt）的 fail-closed 分支。
+
+    关闭只影响 ``approval`` 档：不调用 ``require_command_approval``、不创建审批单，
+    直接抛与 block 档同措辞的拒绝；``allow`` / ``block`` 两档不受该参数影响。
+    """
+
+    @staticmethod
+    def _approval_settings(**kwargs) -> SecurityCommandSettings:
+        merged = dict(command_review_disposition="approval", command_approval_approvers="u1")
+        merged.update(kwargs)
+        return SecurityCommandSettings(**merged)
+
+    def test_approval_disposition_rejected_without_calling_approval(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(cs, "require_command_approval", lambda *a, **kw: calls.append("hit") or True)
+        with pytest.raises(ValueError, match="命令执行被拒绝"):
+            enforce_command_security(
+                "touch /tmp/x", "local", self._approval_settings(), command_approval_enabled=False
+            )
+        assert calls == []
+
+    def test_smart_approval_also_rejected(self, monkeypatch):
+        """预分流结论为 approval 时同样 fail-closed，不退化为放行。"""
+        calls: list[str] = []
+        monkeypatch.setattr(cs, "require_command_approval", lambda *a, **kw: calls.append("hit") or True)
+        ss = self._approval_settings(enable_command_review_auto=True)
+        assessor = type("R", (), {"assess": lambda self, c: "approval"})()
+        with pytest.raises(ValueError, match="命令执行被拒绝"):
+            enforce_command_security("touch /tmp/x", "local", ss, assessor, command_approval_enabled=False)
+        assert calls == []
+
+    def test_smart_allow_still_passes(self):
+        """预分流结论 allow 仍放行：关闭的是审批中断，不是自动放行能力。"""
+        ss = self._approval_settings(enable_command_review_auto=True)
+        assessor = type("R", (), {"assess": lambda self, c: "allow"})()
+        enforce_command_security("touch /tmp/x", "local", ss, assessor, command_approval_enabled=False)
+
+    def test_disposition_allow_still_passes(self, monkeypatch):
+        """部署侧显式 allow 档不产生中断，dontInterrupt 不改变它。"""
+        calls: list[str] = []
+        monkeypatch.setattr(cs, "require_command_approval", lambda *a, **kw: calls.append("hit") or True)
+        ss = SecurityCommandSettings(command_review_disposition="allow")
+        enforce_command_security("touch /tmp/x", "local", ss, command_approval_enabled=False)
+        assert calls == []
+
+    def test_disposition_block_still_rejects(self):
+        ss = SecurityCommandSettings(command_review_disposition="block")
+        with pytest.raises(ValueError, match="命令执行被拒绝"):
+            enforce_command_security("touch /tmp/x", "local", ss, command_approval_enabled=False)
+
+    def test_default_keeps_existing_approval_behavior(self, monkeypatch):
+        """参数缺省（True）时审批照旧发起，既有链路零改动。"""
+        calls: list[str] = []
+        monkeypatch.setattr(cs, "require_command_approval", lambda *a, **kw: calls.append("hit") or True)
+        enforce_command_security("touch /tmp/x", "local", self._approval_settings())
+        assert calls == ["hit"]
+
+
 class TestValidateHasNoApprovalSideEffect:
     """``validate_command`` 不触发审批——合并组 #1 的唯一归属地。
 
