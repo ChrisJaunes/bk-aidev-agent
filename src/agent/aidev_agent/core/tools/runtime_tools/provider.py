@@ -799,6 +799,7 @@ def get_execute_tool(
     custom_description: str | None = None,
     enable_security: bool | None = None,
     risk_assessor: CommandRiskAssessor | None = None,
+    command_approval_enabled: bool = True,
 ) -> BaseTool:
     """生成 execute 工具用于执行 shell 命令。
 
@@ -811,6 +812,9 @@ def get_execute_tool(
             执行期抛 ``ValueError``（fail-closed）；显式 ``False`` 仍表示三层全跳（逃生门）。
         risk_assessor: 命令风险评估器（``enable_command_review_auto`` 预分流用）。
             None 时跳过预分流，直接按 ``command_review_disposition`` 处置 review。
+        command_approval_enabled: 是否允许发起命令级审批（工具加载模式
+            ``dontInterrupt`` 时为 ``False``，灰名单命令直接拒绝且不创建审批单）。
+            缺省 ``True``，与未引入该参数时行为一致。
 
     安全配置（命令黑名单 / 审批开关）取自 ``resolver.security_settings``。
     """
@@ -840,7 +844,13 @@ def get_execute_tool(
                     "请经 AgentConfig.security_settings 或 set_bkai_options 注入配置；"
                     "确需跳过校验请显式调用 enable_security_runtime(False)。"
                 )
-            enforce_command_security(command, target_runtime, settings.command, risk_assessor)
+            enforce_command_security(
+                command,
+                target_runtime,
+                settings.command,
+                risk_assessor,
+                command_approval_enabled=command_approval_enabled,
+            )
 
         result = resolved_backend.execute(command, config=config, state=state)
 
@@ -869,7 +879,13 @@ def get_execute_tool(
                     "请经 AgentConfig.security_settings 或 set_bkai_options 注入配置；"
                     "确需跳过校验请显式调用 enable_security_runtime(False)。"
                 )
-            enforce_command_security(command, target_runtime, settings.command, risk_assessor)
+            enforce_command_security(
+                command,
+                target_runtime,
+                settings.command,
+                risk_assessor,
+                command_approval_enabled=command_approval_enabled,
+            )
 
         result = await resolved_backend.aexecute(command, config=config, state=state)
 
@@ -899,6 +915,7 @@ def get_client_tools_with_runtime(
     custom_tool_descriptions: dict[str, str] | None = None,
     enable_security: bool | None = None,
     risk_assessor: CommandRiskAssessor | None = None,
+    command_approval_enabled: bool = True,
 ) -> list[BaseTool]:
     """构造客户端工具集合。
 
@@ -910,6 +927,8 @@ def get_client_tools_with_runtime(
         enable_security: 是否启用 execute 工具的命令安全校验。
             默认为 None 时启用校验（True）。设为 False 可跳过校验。
         risk_assessor: 命令风险评估器（review 预分流），透传给 execute 工具。
+        command_approval_enabled: 是否允许发起命令级审批，透传给 execute 工具；
+            ``False`` 时灰名单命令直接拒绝（不创建审批单）。缺省 ``True``。
 
     Returns:
         LangChain 工具列表。
@@ -930,5 +949,6 @@ def get_client_tools_with_runtime(
             custom_tool_descriptions.get("execute"),
             enable_security=enable_security,
             risk_assessor=risk_assessor,
+            command_approval_enabled=command_approval_enabled,
         ),
     ]
