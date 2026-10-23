@@ -49,6 +49,7 @@ from aidev_agent.core.graphs.react.skill_middleware import (
     _extract_paas_params,
 )
 from aidev_agent.core.graphs.react.team_middleware import TeamInfo, TeamPromptMiddleware, ToolFilterMiddleware
+from aidev_agent.core.graphs.react.tool_loading_mode import command_approval_allowed, filter_tools_by_loading_mode
 from aidev_agent.core.nodes.knowledge import make_knowledge_node
 from aidev_agent.core.nodes.model import ModelNodeSettings
 from aidev_agent.core.nodes.model import build_model_node as std_make_model_node
@@ -75,7 +76,13 @@ from aidev_agent.packages.langchain_core.models.utils import is_model_without_fu
 from aidev_agent.packages.langchain_core.retrievers.bk_retriever import BkRetriever
 from aidev_agent.packages.langgraph.streaming.streaming_protocol import AgentStreamAdapter
 from aidev_agent.packages.security.command import CommandRiskAssessor
-from aidev_agent.pydantic_models import AgentExecutorKwargs, KnowledgeSettings, ModelContextSettings, SecuritySettings
+from aidev_agent.pydantic_models import (
+    AgentExecutorKwargs,
+    ExecuteKwargs,
+    KnowledgeSettings,
+    ModelContextSettings,
+    SecuritySettings,
+)
 
 if TYPE_CHECKING:
     from langchain_core.runnables import Runnable
@@ -220,6 +227,8 @@ class ReActAgentBuilder:
         self._langchain_middleware: Sequence[AgentMiddleware] = ()
         self._tool_node_options: ToolNodeSettings | None = None
         self._security_settings: SecuritySettings | None = None
+        # 请求级执行参数（工具加载模式 mode 的来源）；未注入时为默认 ExecuteKwargs
+        self._execute_kwargs: ExecuteKwargs = ExecuteKwargs()
         self._resource_manager = None
 
     # ====================================================================================================
@@ -616,6 +625,9 @@ class ReActAgentBuilder:
             self._enable_agentic_rag_tool = options.knowledge_query_options.enable_agentic_rag_tool
         if options.model_context_options is not None:
             self._model_context_options = options.model_context_options
+        # 请求级执行参数：工具加载模式（mode）在装配期用于裁剪会中断的工具
+        if options.execute_kwargs is not None:
+            self._execute_kwargs = options.execute_kwargs
 
         # RuntimeBackendResolver（由调用方构造并注入）——必须先于 skills 块内
         # enable_runtime_paas/local（新方案下这些调用要求 resolver 已存在）
@@ -870,6 +882,8 @@ class ReActAgentBuilder:
         langchain_middleware: Sequence[AgentMiddleware],
     ) -> List[BaseTool]:
         tools: List[BaseTool] = []
+        # 工具加载模式：装配期裁剪 + 命令级审批开关的唯一决策点
+        mode = self._execute_kwargs.mode
         # 加载所有传入的工具
         if extra_tools:
             tools.extend(extra_tools or [])
@@ -894,6 +908,7 @@ class ReActAgentBuilder:
                     self._runtime_backend_resolver,
                     enable_security=self._enable_security_runtime,
                     risk_assessor=risk_assessor,
+                    command_approval_enabled=command_approval_allowed(mode),
                 )
             )
             # 仅在配置了视觉模型时注册图片识别工具，避免模型调用必然失败的工具
@@ -929,7 +944,10 @@ class ReActAgentBuilder:
             for i in range(len(tools)):
                 tools[i].handle_validation_error = True
                 tools[i].handle_tool_error = True
-        return tools
+
+        # 按工具加载模式裁剪（default 原样返回，保证与变更前一致）；
+        # 过滤后的列表在 build() 中同时交给 model 节点与 ToolNode。
+        return filter_tools_by_loading_mode(tools, mode)
 
     def _prepare_skills(self) -> None:
         """准备 skills 系统。
