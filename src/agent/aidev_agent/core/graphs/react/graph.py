@@ -19,7 +19,7 @@ to the current version of the project delivered to anyone in the future.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Annotated, Callable, List, Optional, Sequence, Tuple, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, Callable, List, Optional, Sequence, Tuple, get_type_hints
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -42,6 +42,7 @@ from langgraph.types import Send
 from typing_extensions import Literal, TypedDict, TypeVar
 
 from aidev_agent.config import settings
+from aidev_agent.core.hooks import HookContextMiddleware
 from aidev_agent.core.graphs.react.skill_middleware import (
     SkillsPromptMiddleware,
     _extract_e2b_params,
@@ -221,6 +222,9 @@ class ReActAgentBuilder:
         self._tool_node_options: ToolNodeSettings | None = None
         self._security_settings: SecuritySettings | None = None
         self._resource_manager = None
+        # hook 相关（agent-hook 第二期）：缺省 None → 不插 tool wrapper、不注入上下文
+        self._hooks: Any = None
+        self._hook_context: str | None = None
 
     # ====================================================================================================
     # 模型设置
@@ -581,6 +585,16 @@ class ReActAgentBuilder:
         self._langchain_middleware = middleware or ()
         return self
 
+    def set_hooks(self, hooks: Any) -> "ReActAgentBuilder":
+        """注入 hook 总线（``HookBusProtocol`` 鸭子类型）；``None`` 表示不启用（REQ-13 / REQ-19）。"""
+        self._hooks = hooks
+        return self
+
+    def set_hook_context(self, context: str | None) -> "ReActAgentBuilder":
+        """注入 ``session_start`` 下发的上下文文本（空值表示不注入，REQ-14）。"""
+        self._hook_context = context or None
+        return self
+
     def set_bkai_options(self, options: AgentExecutorKwargs) -> "ReActAgentBuilder":
         """将 BkAi 平台通用配置（AgentExecutorKwargs）映射到 builder 内部状态。"""
         if options.resource_manager is not None:
@@ -851,6 +865,10 @@ class ReActAgentBuilder:
             node_options.extra_template_middlewares.append(TeamPromptMiddleware(specs=self._a2a_specs))
             node_options.extra_tool_middlewares.append(ToolFilterMiddleware())
 
+        # hook 的 session_start context：追加到 system prompt（位于用户输入之前），不改账本
+        if self._hook_context:
+            node_options.extra_template_middlewares.append(HookContextMiddleware(context=self._hook_context))
+
         # 创建模型节点
         model_node = std_make_model_node(
             llm=llm,
@@ -1107,6 +1125,7 @@ class ReActAgentBuilder:
                 async_wrappers=middleware_w_awrap_tool_call,
                 node_options=node_options,
                 security_settings=security_settings,
+                hooks=self._hooks,
             )
         return None
 

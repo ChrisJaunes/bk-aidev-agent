@@ -1072,6 +1072,16 @@ class AgentExecutorKwargs(BaseModel):
         description="安全防护配置实例；由 ChatCompletionAgent 从 AgentConfig.security_settings 传入。",
     )
 
+    # hook 相关（agent-hook 第二期）：声明只为可发现性，缺省 None 表示不启用
+    hooks: Optional[Any] = Field(
+        default=None,
+        description="hook 总线（HookBusProtocol 鸭子类型）；仅 headless create 下发，平台路径不传。",
+    )
+    hook_context: Optional[str] = Field(
+        default=None,
+        description="session_start 下发的上下文文本，由模型节点模板中间件追加到 system prompt。",
+    )
+
 
 class AgentConfig(BaseModel):
     """智能体配置"""
