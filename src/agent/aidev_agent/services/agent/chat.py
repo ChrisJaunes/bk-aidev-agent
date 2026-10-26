@@ -307,6 +307,13 @@ class ChatCompletionAgent(BaseModel):
             self.agent_cls = chat.agent_cls
         if chat.hook_handlers is not None:
             self.hook_handlers = chat.hook_handlers
+        if chat.interrupt_processor is not None:
+            # execute() 的惰性构造只在 None 时生效，因此注入实现不会被覆盖
+            self.interrupt_processor = chat.interrupt_processor
+        injected_tools = ctx.extra.get("injected_tools") or []
+        if injected_tools:
+            # 进程内注入工具（headless create.params.tools 的测试 / 嵌入式接缝）
+            self.tools = list(self.tools or []) + list(injected_tools)
         if ctx.session_code is not None:
             self.thread_id = ctx.session_code
         if ctx.event_handler is not None:

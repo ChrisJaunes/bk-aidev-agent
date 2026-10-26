@@ -1,12 +1,13 @@
 import logging
 import uuid
-from typing import Any, Callable, List, Optional, cast
+from typing import Any, Callable, List, Optional, Protocol, cast
 
 from ag_ui.core import BaseEvent
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from aidev_agent.config import settings
 from aidev_agent.enums import AgentBuildType, AgentType
+from aidev_agent.exceptions import AgentFactoryError
 from aidev_agent.packages.resource_manager.registry import ResourceManagerProtocol
 from aidev_agent.packages.resource_manager.registry import resource_manager as resource_manager_factory
 from aidev_agent.pydantic_models import AgentConfig
@@ -18,6 +19,7 @@ from aidev_agent.services.agent.registry import (
 )
 from aidev_agent.services.common_agent import CommonAgentProtocol, common_agent_factory
 from aidev_agent.services.token_usage import BKAidevTokenUsageSink, TokenUsageCallbackHandler
+from aidev_agent.utils.factory import SingletonFactory
 from aidev_agent.utils.migrations import migration_chat_session_context_from_chat_session_contents_v1
 
 logger = logging.getLogger("aidev-agent")
@@ -400,6 +402,8 @@ class AgentInstanceFactory:
                 retry_strategy=self.retry_strategy,
                 checkpointer=self.checkpointer,
                 hook_handlers=self.hook_handlers,
+                interrupt_processor=remaining_extra.pop("interrupt_processor", None),
+                injected_tools=remaining_extra.pop("injected_tools", None),
             )
         elif self.agent_type == AgentType.FLOW:
             # FLOW 路径不依赖 agent 配置（与原行为保持一致），跳过预读
@@ -427,3 +431,76 @@ class AgentInstanceFactory:
             flow=flow_extras,
             extra=remaining_extra,
         )
+
+
+# ============================== 注入点：协议 / 默认实现 / 注册中心 ==============================
+#
+# 「Agent 实例从哪来、由谁恢复」的唯一可替换点。注册范式与 ``agent_registry`` /
+# ``common_agent_factory`` / ``resource_manager`` 一致：进程级 ``SingletonFactory`` +
+# ``replace_defaults(impl)``；未替换时 ``agent_factory()`` 返回 ``DefaultAgentFactory``。
+
+
+class AgentFactoryProtocol(Protocol):
+    """Agent 实例工厂注入点协议（创建 + 恢复）。"""
+
+    def create(self, **build_params: Any) -> Any:
+        """新建实例；关键字参数语义与 :meth:`AgentInstanceFactory.build_agent` 一致。"""
+        ...
+
+    def resume(self, *, session_code: str, resume: Any, **build_params: Any) -> Any:
+        """恢复既有会话 / 中断；``resume`` 为恢复负载，其余参数同 ``create``。"""
+        ...
+
+
+def normalize_resume_payload(resume: Any) -> list[dict]:
+    """把恢复负载归一化为恢复项列表，形状不符时抛 :class:`AgentFactoryError`。"""
+    payload = [resume] if isinstance(resume, dict) else resume
+    if not payload:
+        raise AgentFactoryError(
+            code="resume_payload_missing",
+            reason="恢复负载为空：resume 必须提供中断恢复项或续轮描述",
+        )
+    if not isinstance(payload, list):
+        raise AgentFactoryError(
+            code="resume_payload_unsupported",
+            reason=f"恢复负载形状不支持：resume 期望 dict 或 list，实际为 {type(resume).__name__}",
+        )
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise AgentFactoryError(
+                code="resume_payload_unsupported",
+                reason=f"恢复负载形状不支持：resume[{index}] 期望 dict，实际为 {type(item).__name__}",
+            )
+        if "interruptId" in item:
+            continue
+        if isinstance(item.get("input"), str):
+            continue
+        raise AgentFactoryError(
+            code="resume_payload_unsupported",
+            reason=(
+                "恢复负载形状不支持：resume[{}] 缺少 interruptId 或 input 字段（现有字段：{}）".format(
+                    index, sorted(item.keys()) or "无"
+                )
+            ),
+        )
+    return payload
+
+
+class DefaultAgentFactory:
+    """默认实现：直接委派 :meth:`AgentInstanceFactory.build_agent`。
+
+    不复制装配链路，develop 新增的构建参数（如 ``hook_handlers`` / ``reasoning_effort``）
+    对注入点自动可见；``resume`` 只做负载校验后走同一装配。
+    """
+
+    def create(self, **build_params: Any) -> Any:
+        return AgentInstanceFactory.build_agent(**build_params)
+
+    def resume(self, *, session_code: str, resume: Any, **build_params: Any) -> Any:
+        normalize_resume_payload(resume)
+        return AgentInstanceFactory.build_agent(session_code=session_code, **build_params)
+
+
+agent_factory: SingletonFactory[str, AgentFactoryProtocol] = SingletonFactory(
+    "agent_factory", DefaultAgentFactory()
+)

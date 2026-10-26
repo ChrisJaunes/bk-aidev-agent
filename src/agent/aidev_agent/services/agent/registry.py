@@ -47,6 +47,10 @@ class ChatBuildExtras:
     checkpointer: Optional["BaseCheckpointSaver"] = None
     hook_handlers: Any = None
     """进程内 hook 处理器集合（HookSet）；None 表示未注入，全链路保持基线行为。"""
+    interrupt_processor: Any = None
+    """中断编排器实现（headless 用去平台化实现）；None 时 execute() 惰性构造平台实现。"""
+    injected_tools: Any = None
+    """进程内注入的工具（headless 测试 / 嵌入式接缝）；None 表示不追加。"""
 
 
 @dataclass

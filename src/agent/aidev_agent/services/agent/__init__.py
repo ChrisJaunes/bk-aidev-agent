@@ -12,7 +12,12 @@
 """
 
 from aidev_agent.services.agent.chat import ChatCompletionAgent
-from aidev_agent.services.agent.factory import AgentInstanceFactory
+from aidev_agent.services.agent.factory import (
+    AgentFactoryProtocol,
+    AgentInstanceFactory,
+    DefaultAgentFactory,
+    agent_factory,
+)
 from aidev_agent.services.agent.flow import FlowAgentCompletionAgent
 from aidev_agent.services.agent.registry import (
     AgentBuildContext,
@@ -27,11 +32,14 @@ agent_registry.register(FlowAgentCompletionAgent.agent_type, FlowAgentCompletion
 
 __all__ = [
     "AgentBuildContext",
+    "AgentFactoryProtocol",
     "AgentInstanceFactory",
     "AgentProtocol",
     "ChatBuildExtras",
     "ChatCompletionAgent",
+    "DefaultAgentFactory",
     "FlowAgentCompletionAgent",
     "FlowBuildExtras",
+    "agent_factory",
     "agent_registry",
 ]
