@@ -133,6 +133,15 @@ cruft update
 - 完整开发示例（SRE 助手）
 - 调试技巧与常见问题
 
+📖 **[以 aidev-agent 作为宿主核心 Agent（headless 接入指南）](./HEADLESS_HOST.md)**
+
+该文档涵盖：
+- 宿主如何以组合 / profile 配置停用默认 Agent 实现并接入 `python -m aidev_agent.headless`
+- NDJSON 五方法（`create` / `turn` / `resume` / `cancel` / `close`）映射与报文样例
+- 支持面与不支持面（不支持能力必须显式报错）
+- 用本机 fake 模型离线验收一轮的步骤
+- 日志与凭据约束
+
 
 ## 四、获取帮助
 

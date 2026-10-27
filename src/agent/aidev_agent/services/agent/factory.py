@@ -1,23 +1,26 @@
 import logging
 import uuid
-from typing import Any, Callable, List, Optional, cast
+from typing import Any, Callable, List, Optional, Protocol, cast
 
 from ag_ui.core import BaseEvent
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from aidev_agent.config import settings
 from aidev_agent.enums import AgentBuildType, AgentType
+from aidev_agent.exceptions import AgentFactoryError
 from aidev_agent.packages.resource_manager.registry import ResourceManagerProtocol
 from aidev_agent.packages.resource_manager.registry import resource_manager as resource_manager_factory
 from aidev_agent.pydantic_models import AgentConfig
 from aidev_agent.services.agent.registry import (
     AgentBuildContext,
+    AgentProtocol,
     ChatBuildExtras,
     FlowBuildExtras,
     agent_registry,
 )
 from aidev_agent.services.common_agent import CommonAgentProtocol, common_agent_factory
 from aidev_agent.services.token_usage import BKAidevTokenUsageSink, TokenUsageCallbackHandler
+from aidev_agent.utils.factory import SingletonFactory
 from aidev_agent.utils.migrations import migration_chat_session_context_from_chat_session_contents_v1
 
 logger = logging.getLogger("aidev-agent")
@@ -163,12 +166,17 @@ class AgentInstanceFactory:
             （如 FlowAgent 的 ``task_id`` / ``flow_start_params`` / ``poll_interval`` /
             ``poll_timeout`` / ``flow_resource_manager`` 等）
         :return: 构建好的Agent实例
+
+        实现说明（agent-hook）：签名与默认值保持不变，方法体只做一次委派——实例来源
+        统一收敛到进程级注册中心 ``agent_factory()`` 的 ``create``。默认实现
+        ``DefaultAgentFactory`` 逐字承载原有装配链路，因此对外行为与基线一致。
         """
-        factory = cls(
+        return agent_factory().create(
             agent_code=agent_code,
             agent_type=agent_type,
             build_type=build_type,
             session_code=session_code,
+            session_context_data=session_context_data,
             agent_cls=agent_cls,
             callbacks=callbacks,
             auth_headers=auth_headers,
@@ -179,24 +187,12 @@ class AgentInstanceFactory:
             switch_agent_by_scene=switch_agent_by_scene,
             resource_manager=resource_manager,
             is_temporary=is_temporary,
+            event_handler=event_handler,
             checkpointer=checkpointer,
             username=username,
             version=version,
-            _token=_FACTORY_TOKEN,
+            **extra,
         )
-
-        factory._validate_params()
-
-        if build_type == AgentBuildType.SESSION:
-            base_args = factory._build_from_session()
-        elif build_type == AgentBuildType.DIRECT:
-            base_args = factory._build_direct(session_context_data or [])
-        else:
-            raise ValueError(f"Unsupported build_type: {build_type}")
-
-        agent_instance = agent_registry.must_get(factory.agent_type)()
-        ctx = factory._make_build_context(base_args, event_handler, extra)
-        return agent_instance.build(ctx)
 
     def get_agent_config(self, agent_code: str) -> AgentConfig:
         """统一的 agent 配置取回出口。
@@ -410,3 +406,162 @@ class AgentInstanceFactory:
             flow=flow_extras,
             extra=remaining_extra,
         )
+
+
+# ============================== 注入点：协议 / 默认实现 / 注册中心 ==============================
+#
+# 「Agent 实例从哪来、由谁恢复」的唯一可替换点。注册范式与 ``agent_registry`` /
+# ``common_agent_factory`` / ``resource_manager`` 一致：进程级 ``SingletonFactory`` +
+# ``replace_defaults(impl)``；未替换时 ``agent_factory()`` 返回 ``DefaultAgentFactory``。
+
+
+class AgentFactoryProtocol(Protocol):
+    """Agent 实例工厂注入点协议（创建 + 恢复）
+
+    注入点被进程级注册中心 ``agent_factory`` 持有：默认值是 :class:`DefaultAgentFactory`
+    （现状能力），替换用法 ``agent_factory.replace_defaults(my_impl)``，与仓内
+    ``replace_defaults`` 约定一致。
+    """
+
+    def create(self, **build_params: Any) -> AgentProtocol:
+        """新建实例
+
+        关键字参数语义与 :meth:`AgentInstanceFactory.build_agent` 完全一致
+        （agent 身份、构建类型、会话码、构建上下文、事件处理器、资源管理器、
+        checkpointer、额外参数）。
+        """
+        ...
+
+    def resume(self, *, session_code: str, resume: Any, **build_params: Any) -> AgentProtocol:
+        """恢复既有会话 / 中断
+
+        :param session_code: 既有会话标识（同时作为图的 ``thread_id``）
+        :param resume: 恢复负载（审批结果 / ``ask_user_question`` 回答 / 续轮输入）
+        :param build_params: 与 :meth:`create` 相同的运行期依赖
+        """
+        ...
+
+
+def normalize_resume_payload(resume: Any) -> list[dict]:
+    """把恢复负载归一化为恢复项列表，形状不符时抛 :class:`AgentFactoryError`。
+
+    接受两类形状（``dict`` 自动归一为单元素列表）：
+
+    - **中断恢复项**：元素为 ``dict`` 且含 ``interruptId``（可选 ``status`` / ``payload``），
+      供审批 / ``ask_user_question`` 续流使用；
+    - **续轮描述**：元素为 ``dict`` 且含 ``input``（``str``），供 headless 运行面
+      「同一会话续轮」入口使用（headless 不驱动中断恢复）。
+
+    其余形状一律 ``resume_payload_unsupported``。错误信息只带字段名与收到的类型，
+    不含负载取值（REQ-11 凭据约束）。
+    """
+    payload = [resume] if isinstance(resume, dict) else resume
+    if not payload:
+        raise AgentFactoryError(
+            code="resume_payload_missing",
+            reason="恢复负载为空：resume 必须提供中断恢复项或续轮描述",
+        )
+    if not isinstance(payload, list):
+        raise AgentFactoryError(
+            code="resume_payload_unsupported",
+            reason=f"恢复负载形状不支持：resume 期望 dict 或 list，实际为 {type(resume).__name__}",
+        )
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise AgentFactoryError(
+                code="resume_payload_unsupported",
+                reason=f"恢复负载形状不支持：resume[{index}] 期望 dict，实际为 {type(item).__name__}",
+            )
+        if "interruptId" in item:
+            continue
+        if isinstance(item.get("input"), str):
+            continue
+        raise AgentFactoryError(
+            code="resume_payload_unsupported",
+            reason=(
+                "恢复负载形状不支持：resume[{}] 缺少 interruptId 或 input 字段（现有字段：{}）".format(
+                    index, sorted(item.keys()) or "无"
+                )
+            ),
+        )
+    return payload
+
+
+class DefaultAgentFactory:
+    """默认实现：逐项复现 agent-hook 之前的实例装配与续流能力。
+
+    ``create`` 承载原 ``AgentInstanceFactory.build_agent`` 的方法体，装配链路
+    （``_validate_params`` → ``_build_from_session`` / ``_build_direct`` →
+    ``_make_build_context`` → ``agent_registry.must_get(...)()`` → ``build(ctx)``）
+    与异常语义保持逐字不变；``resume`` 只做负载校验后走同一 ``_build``。
+    """
+
+    def create(self, **build_params: Any) -> AgentProtocol:
+        return self._build(**build_params)
+
+    def resume(self, *, session_code: str, resume: Any, **build_params: Any) -> AgentProtocol:
+        normalize_resume_payload(resume)
+        return self._build(session_code=session_code, **build_params)
+
+    def _build(
+        self,
+        *,
+        agent_code: str = settings.APP_CODE,
+        agent_type: AgentType = AgentType.CHAT,
+        build_type: AgentBuildType = AgentBuildType.SESSION,
+        session_code: Optional[str] = None,
+        session_context_data: Optional[List[dict]] = None,
+        agent_cls: CommonAgentProtocol | None = None,
+        callbacks: List[Any] | None = None,
+        auth_headers: dict[str, str] | None = None,
+        default_headers: dict[str, str] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = settings.MAX_TOKENS,
+        retry_strategy: str | None = None,
+        switch_agent_by_scene: bool = False,
+        resource_manager: Optional[ResourceManagerProtocol] = None,
+        is_temporary: bool = False,
+        event_handler: Callable[[BaseEvent], None] | None = None,
+        checkpointer: BaseCheckpointSaver | None = None,
+        username: str | None = None,
+        version: Optional[str] = None,
+        **extra: Any,
+    ) -> AgentProtocol:
+        factory = AgentInstanceFactory(
+            agent_code=agent_code,
+            agent_type=agent_type,
+            build_type=build_type,
+            session_code=session_code,
+            agent_cls=agent_cls,
+            callbacks=callbacks,
+            auth_headers=auth_headers,
+            default_headers=default_headers,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            retry_strategy=retry_strategy,
+            switch_agent_by_scene=switch_agent_by_scene,
+            resource_manager=resource_manager,
+            is_temporary=is_temporary,
+            checkpointer=checkpointer,
+            username=username,
+            version=version,
+            _token=_FACTORY_TOKEN,
+        )
+
+        factory._validate_params()
+
+        if build_type == AgentBuildType.SESSION:
+            base_args = factory._build_from_session()
+        elif build_type == AgentBuildType.DIRECT:
+            base_args = factory._build_direct(session_context_data or [])
+        else:
+            raise ValueError(f"Unsupported build_type: {build_type}")
+
+        agent_instance = agent_registry.must_get(factory.agent_type)()
+        ctx = factory._make_build_context(base_args, event_handler, extra)
+        return agent_instance.build(ctx)
+
+
+agent_factory: SingletonFactory[str, AgentFactoryProtocol] = SingletonFactory(
+    "agent_factory", DefaultAgentFactory()
+)
