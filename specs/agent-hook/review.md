@@ -2,47 +2,20 @@
 
 ## 最新结论
 
-- 结论: 需要返工
-- 评审版本: 4c1d0381338ab4c5d80088ff9a6c5551c9935c0c
+- 结论: 通过，但有改进建议
+- 评审版本: 550fe122ace6ebe98a06f37bdf97a14198ec1c96
 - 变更名: agent-hook（`specs/agent-hook/`）
+- 轮次: 第 2 轮（第 1 轮 F-1 已修复）
 
 ### 阻塞项
 
-#### F-1 执行期错误只以事件形式出现时，headless 把失败轮当成功返回（空回复）
-
-- 严重级别: correctness
-- 对应需求: REQ-5（不得返回空回复）、REQ-7（终止态必须可区分「正常结束 / 用户取消 / 内部错误」）
-- 证据:
-  - `src/agent/aidev_agent/headless/session.py:189-193` 只把 `_finish_turn()` 的 `status` 放进结果，
-    未携带 `error` 字段；`_fail_turn`（同文件 `:350-352`）只在抛出异常的分支被调用。
-  - `src/agent/aidev_agent/headless/cli.py:172-176` 仅当 `result["status"] == "error"` **且** `result["error"]`
-    存在时才写 `ok=false`；缺 `error` 字段时落到 `encode_result`，写成 `ok=true`。
-  - 实测（模型端点不可用 / 返回 500，执行链内部吞掉异常、只产出 `RUN_ERROR` 事件，未向 headless 抛异常）：
-    ```text
-    {"id":"t1","type":"event","event":{"type":"RUN_STARTED", ...}}
-    {"id":"t1","type":"event","event":{"type":"STEP_STARTED","stepName":"model"}}
-    {"id":"t1","type":"event","event":{"type":"RUN_ERROR","message":"模型调用异常: upstream exploded"}}
-    {"id":"t1","type":"event","event":{"type":"RUN_FINISHED","runId":"01a17b5e-...","outcome":{"type":"success"}}}
-    {"id":"t1","ok":true,"result":{"session_code":"s1","turn_id":"...","status":"error"}}
-    ```
-    同一现象在 `Connection error`（端点不可达）下完全复现。`status` 是 `error`，响应却是 `ok=true`，
-    且没有任何错误码/原因；本轮 assistant 文本为空，账本也不写 assistant 记录。
-  - 下游影响可判定：仓外验收入口插件 `acceptance/dsh-plugin/agent-hook.ts:199-204` 只用
-    `reply.error !== undefined` 判定失败，随后无条件 `session.append('turn/end', {reason:{kind:'completed'}})`
-    ——模型 5xx 会被宿主投影成「成功 + 空回复」。
-  - 与仓内文档冲突：`docs/agent/HEADLESS_HOST.md:77` 与 `:90` 承诺「内部错误 → 响应 `ok=false` 带同一 `code`」。
-  - 现有用例 `tests/headless/test_error_recovery.py:127-168` 只覆盖「`execute` 直接抛异常」，
-    未覆盖「异常在图内被吞、仅产出 `RUN_ERROR` 事件」这条真实主路径，因此回归全绿并未覆盖此缺陷。
-- 修复后可判定的标准:
-  1. 当模型端点返回 5xx 或不可达、执行链只产出 `RUN_ERROR` 而不抛异常时，`turn` / `resume` 响应必须是
-     `ok=false`，`error.code` 为稳定错误码（建议 `agent.internal_error`），`error.message` 至少包含该轮
-     `RUN_ERROR` 的 message；不得再出现 `ok=true` + `status:"error"` 的组合。
-  2. 修复不得改变基线事件序列：仍为 `RUN_ERROR` + 平台补发的 `RUN_FINISHED`，且不得重复追加额外
-     `RUN_ERROR`；新增用例以 fake 端点固定返回 500，断言「事件类型序列与基线一致 + 响应 `ok=false` + `code` 稳定」。
-  3. `docs/agent/HEADLESS_HOST.md` §2.3 / §2.5 与实现一致；若保留平台补发的 `RUN_FINISHED(success)`，
-     须在文档中写明宿主应以响应 `ok=false`（而非终止事件类型）判定本轮失败。
+无。第 1 轮 F-1 已解除：执行期只产出 `RUN_ERROR` 事件时，`turn` / `resume` 现在返回
+`ok=false` + `error.code=agent.internal_error` + 该 `RUN_ERROR` 文案，事件序列仍为基线
+（`RUN_ERROR` + 平台补发的 `RUN_FINISHED`），且同一条 `RUN_ERROR` 只写一次。
 
 ### 改进建议
+
+以下均为一般改进建议，不构成返工理由（与第 1 轮相同，本轮未要求处理）。
 
 - W-1 `DefaultAgentFactory.resume` 接受 `{"input": str}` 续轮形状后直接丢弃负载
   （`services/agent/factory.py:502-504`），headless 侧 `session.py:164` 也用 `payload` 只做校验、
@@ -61,32 +34,28 @@
   还可能继续写出事件，破坏「以终止事件收尾」。建议超时后标记本轮为已终止并丢弃后续事件。
 - W-6 REQ-4 / ACC-3（续流入口收敛）按技术方案「规格偏差与待修订」整体延后，本轮不作为返工项；
   但 `spec.md` 仍保留 REQ-4 / ACC-3 原文，建议后续变更同步修订规格，避免规格与实现长期不一致。
+- W-7 `tests/headless` 在返工后首次运行出现过 1 例未捕获用例名的失败（`verification.md` 已如实记录）。
+  本轮复跑 3 次全量（55 passed）与 5 次并发用例（5 passed）均未复现，暂不视为缺陷；建议后续若再现时保留
+  `-p no:cacheprovider --tb=long` 完整输出，以便定位是否为时序相关用例。
 
 <details>
 <summary>自动校验信息</summary>
 
 ```spec_verdict
 {
-  "verdict": "REWORK",
+  "verdict": "PASS_WITH_WARNING",
   "change_name": "agent-hook",
-  "iteration": 1,
-  "reviewed_sha": "4c1d0381338ab4c5d80088ff9a6c5551c9935c0c",
-  "blocking": [
-    {
-      "id": "F-1",
-      "severity": "correctness",
-      "requirement_ids": ["REQ-5", "REQ-7"],
-      "evidence": "headless/session.py:189-193 只返回 status 不带 error；headless/cli.py:172-176 因缺 error 字段写成 ok=true。模型端点 500/不可达时事件为 RUN_ERROR + RUN_FINISHED(success)，响应为 {\"ok\":true,\"result\":{\"status\":\"error\"}}，本轮 assistant 文本为空；docs/agent/HEADLESS_HOST.md:77 要求该场景 ok=false 带 code；acceptance/dsh-plugin/agent-hook.ts:199-204 只认 reply.error，会把该轮投影为 completed。",
-      "acceptance": "模型 5xx/不可达且执行链只产出 RUN_ERROR 时，turn/resume 响应必须 ok=false，error.code 稳定（建议 agent.internal_error），error.message 含该轮 RUN_ERROR 文案；事件序列保持基线（RUN_ERROR + 平台补发的 RUN_FINISHED）且不重复写 RUN_ERROR；新增 fake 端点固定 500 的用例同时断言事件类型序列与 ok=false；文档 §2.3/§2.5 与实现一致，并写明宿主以响应 ok=false 判定失败。"
-    }
-  ],
+  "iteration": 2,
+  "reviewed_sha": "550fe122ace6ebe98a06f37bdf97a14198ec1c96",
+  "blocking": [],
   "warnings": [
     {"id": "W-1", "evidence": "factory.py:502-504 与 session.py:164：resume 负载 {\"input\": str} 被校验后丢弃，执行输入取 params.input", "suggestion": "统一语义，或在 normalize_resume_payload 文档写明该形状仅供内部校验"},
     {"id": "W-2", "evidence": "session.py:126-132 prepare() 装配实例后不 stop；session.py:308 allow_pending 为死参数", "suggestion": "prepare 结束即 stop，或移除 allow_pending"},
     {"id": "W-3", "evidence": "session.py:204-211/305-306、cli.py:138-143 直接把上游异常串写入 RUN_ERROR 与响应，实测回显 upstream exploded", "suggestion": "对上游错误做归一化与脱敏，只保留错误类与摘要"},
     {"id": "W-4", "evidence": "cli.py:231-238 使 close 的 already_closed 不可达；session.py:406-415 同 session_code 覆盖旧会话不关闭", "suggestion": "收敛重复 close / 重复 create 的语义"},
     {"id": "W-5", "evidence": "session.py:239-243 cancel 超时补发终止事件后，运行中的轮次仍可继续写事件", "suggestion": "超时后标记终止并丢弃后续事件"},
-    {"id": "W-6", "evidence": "spec.md 仍保留 REQ-4/ACC-3，plan.md 第 294-299 行登记为已批准偏差", "suggestion": "后续变更同步修订规格，避免长期不一致"}
+    {"id": "W-6", "evidence": "spec.md 仍保留 REQ-4/ACC-3，plan.md 第 294-299 行登记为已批准偏差", "suggestion": "后续变更同步修订规格，避免长期不一致"},
+    {"id": "W-7", "evidence": "verification.md:95-96 记录一次未捕获用例名的偶发失败；本轮 3 次全量 + 5 次并发用例未复现", "suggestion": "再现时保留完整输出以定位是否为时序用例"}
   ]
 }
 ```
@@ -149,3 +118,62 @@
 唯一阻塞项是错误路径的对外语义：执行期错误只以事件出现时，headless 以 `ok=true` + 空回复结束本轮，
 既违反 REQ-5 的「不得返回空回复」，也使 REQ-7 的三态在响应侧不可判定，并被仓外验收入口插件投影为成功。
 按固定验收规则「任一项不满足即打回代码实现」，本轮判 `REWORK`，返回代码实现节点。
+
+## 第 2 轮
+
+### 评审范围
+
+- 业务仓 `bk-aidev-agent`，工作分支 `feature/agent-hook`，评审起点
+  `550fe122ace6ebe98a06f37bdf97a14198ec1c96`（与 `git ls-remote` 远端一致，工作区 clean）。
+- 本轮性质：第 1 轮 F-1 返工复核；同时按累计差异重新核对全部已审批需求。
+- 返工提交范围：`git diff 4c1d0381..550fe122` 共 6 文件（含第 1 轮 `review.md`），
+  改动集中在 `headless/session.py`（+14/-1）、`docs/agent/HEADLESS_HOST.md`、
+  `tests/headless/{_fake_llm,test_error_recovery}.py`、`specs/agent-hook/tasks.md`（仅勾选与返工记录）。
+
+### F-1 复核
+
+修复位置 `src/agent/aidev_agent/headless/session.py:190-204`：`_finish_turn()` 返回 `error` 时构造
+`HeadlessError(AGENT_INTERNAL_ERROR, writer.error_message or 兜底文案)` 作为结果返回，`Dispatcher`
+既有「`status=error` 且带 `error` 载荷」分支因此改写为 `ok=false`，且不补写事件。
+
+本轮实测（独立探测，非沿用其记录）：
+
+| 场景 | 事件序列 | 响应 |
+| --- | --- | --- |
+| 端点返回 500（`turn`） | `RUN_STARTED → STEP_STARTED → RUN_ERROR(模型调用异常: upstream exploded) → RUN_FINISHED(success)` | `ok=false`，`code=agent.internal_error`，message 含上游文案 |
+| 端点返回 500（`resume`） | 同上，`RUN_ERROR` 仅 1 次 | `ok=false`，`code=agent.internal_error` |
+| 端点不可达（`turn`） | `... RUN_ERROR(模型调用异常: Connection error.) → RUN_FINISHED(success)` | `ok=false`，`code=agent.internal_error` |
+
+对照第 1 轮的三条验收标准：
+
+1. 「该场景响应必须 `ok=false` 且带稳定 `error.code` / `error.message`」→ **满足**（`agent.internal_error`）。
+2. 「事件序列保持基线、不重复写 `RUN_ERROR`，并以 fake 端点固定 500 的用例断言」→ **满足**；
+   新增 `test_model_5xx_returns_structured_failure_without_duplicate_run_error` 同时覆盖 `turn` 与 `resume`，
+   断言首事件 `RUN_STARTED`、末两条 `RUN_ERROR + RUN_FINISHED`、`RUN_ERROR` 计数为 1、`outcome.type=success`。
+3. 「文档与实现一致，写明宿主以响应 `ok` 判定失败」→ **满足**；`HEADLESS_HOST.md` §2.3 增「响应」列并明确
+   「判定本轮成败只看响应 `ok`」「同一条 `RUN_ERROR` 只出现一次」，§2.5 说明 `agent.internal_error` 的两类来源。
+
+附带核对：取消路径未被误判为错误——`SessionEventWriter._observe` 先按 `RunId.CANCELLED_MESSAGE` 归入
+`cancelled`（`events.py:172-179`），`_finish_turn` 再按 `_cancel_requested` 覆盖状态，`test_concurrency.py`
+的取消用例 5 次复跑均以 `status=cancelled` + `RUN_ERROR(用户已取消) + RUN_FINISHED(runId=cancelled)` 收尾。
+
+### 全量复核
+
+- 冻结文档：`spec.md`、`plan.md` 与审批版本逐字一致；`tasks.md` 仅新增勾选与两条返工记录，定义未改。
+- 5 处创建调用方（`services/agent_bkplugin.py` ×2、`services/agent_builder.py`、`views/chat.py`、
+  `aidev_wxbot/wxaibot/strategies.py`）与依赖声明（`pyproject.toml`、`uv.lock`）累计 diff 仍为空。
+- 验证记录复核（本轮抽样重跑，结果一致）：
+  - `pytest tests/headless`：55 passed，连续 3 次全绿；
+  - `pytest tests/headless/test_concurrency.py`：5 passed，连续 5 次全绿；
+  - `pytest tests/services/agent`：30 passed。
+- `verification.md` 记录的「首次运行 1 例未捕获用例名失败」本轮未复现（3 次全量 + 5 次并发用例），
+  按记录如实保留为 W-7，不作为阻塞项。
+- 仓外验收证据 `acceptance/` 与第 1 轮逐字一致（`diff -r` 无差异），本轮能力层未变，未重跑 dsh。
+
+### 结论
+
+F-1 已按第 1 轮给出的三条验收标准闭环，且未引入事件侧回归（事件序列与基线一致、无重复 `RUN_ERROR`、
+取消态不受影响）。累计差异复核后，REQ-1/2/3/5/6/7/8/9/10/11/12 均满足，REQ-4/ACC-3 为技术方案已登记的
+偏差延后。剩余问题均为一般改进建议（W-1 ~ W-7），不构成返工理由。
+
+本轮判 `PASS_WITH_WARNING`，循环结束。
