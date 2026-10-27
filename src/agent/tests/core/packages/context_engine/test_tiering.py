@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 
@@ -175,6 +176,43 @@ def test_offload_is_skipped_when_cold_unavailable(make_store, clock, toggle_cold
     assert report.failed == 1
     assert store._entries["s1"][entry.id].status is EntryStatus.ACTIVE
     assert store._entries["s1"][entry.id].payload == {"n": 1}
+
+
+def test_offload_uses_hot_payload_when_cold_backup_is_stale(make_store, clock, toggle_cold):
+    """F-1：冷层写失败期间提交的更新，不得在下一次卸载-回捞后回滚为旧版本。"""
+
+    store = make_store(cold=toggle_cold, idle_seconds=60)
+    entry = store.write(scope="s1", category="Conversation History", payload={"v": 1}, source="chat_summary")
+    assert json.loads(toggle_cold.inner.get("s1", entry.id)[1]) == {"v": 1}
+
+    # 冷层写失败下更新成功：热层已是最新版本，冷层备份仍是旧版本
+    toggle_cold.fail_writes = True
+    updated = store.update(scope="s1", entry_id=entry.id, version=1, payload={"v": 2})
+    assert updated.version == 2
+    assert json.loads(toggle_cold.inner.get("s1", entry.id)[1]) == {"v": 1}
+
+    # 冷层恢复后越过闲置阈值卸载：offloaded 记录必须是热层的最新 payload
+    toggle_cold.fail_writes = False
+    clock.advance(120)
+    report = store.sweep()
+    assert (report.offloaded, report.failed) == (1, 0)
+
+    offloaded_kind, offloaded_blob = toggle_cold.inner.get("s1", entry.id)
+    assert offloaded_kind == KIND_OFFLOADED
+    assert json.loads(offloaded_blob) == {"v": 2}
+
+    # 回捞返回最新 payload，且无降级信号；冷层翻回的备份同为最新 payload
+    result = store.load(scope="s1")
+    assert result.degraded is False
+    assert result.skipped_ids == ()
+    loaded = result.entries[0]
+    assert loaded.payload == {"v": 2}
+    assert loaded.status is EntryStatus.ACTIVE
+    assert loaded.version == 2
+
+    backup_kind, backup_blob = toggle_cold.inner.get("s1", entry.id)
+    assert backup_kind == KIND_BACKUP
+    assert json.loads(backup_blob) == {"v": 2}
 
 
 # ----------------------------------------------------------- 容量淘汰（T-7）

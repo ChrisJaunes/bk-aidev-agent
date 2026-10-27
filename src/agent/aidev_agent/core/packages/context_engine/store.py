@@ -478,14 +478,22 @@ class ContextStore:
     # ------------------------------------------------------------ 内部：分层
 
     def _offload(self, scope: str, entry: ContextEntry) -> bool:
-        """把条目 payload 迁至冷层并清空热层内容；冷层不可用时保持原样并返回 False。"""
+        """把条目 payload 迁至冷层并清空热层内容；冷层不可用时保持原样并返回 False。
 
+        写冷层的内容**一律以热层 payload 重新序列化为准**，不复用冷层已有记录：
+        REQ-7 允许「冷层不可用时写入/更新仍成功（仅热层生效）」，此时冷层备份可能
+        停留在旧版本；若卸载直接复用该记录，一次已提交的更新就会在卸载-回捞后
+        静默回滚为旧 payload（评审 F-1）。
+        """
+
+        if entry.payload is None:
+            logger.warning("%s 卸载失败（热层无 payload） id=%s category=%s", _LOG_PREFIX, entry.id, entry.category)
+            return False
         try:
-            record = self._cold.get(scope, entry.id)
-            blob = record[1] if record is not None else _serialize(entry.payload)
-        except Exception as exc:
+            blob = _serialize(entry.payload)
+        except PayloadSerializationError as exc:
             logger.warning(
-                "%s 卸载失败（冷层不可用） id=%s category=%s: %s", _LOG_PREFIX, entry.id, entry.category, exc
+                "%s 卸载失败（payload 不可序列化） id=%s category=%s: %s", _LOG_PREFIX, entry.id, entry.category, exc
             )
             return False
 

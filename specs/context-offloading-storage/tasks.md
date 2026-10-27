@@ -79,6 +79,7 @@
 - 依赖: T-4、T-5
 - 验证: `make test path=src/agent/tests/core/packages/context_engine/test_tiering.py`
 - [x] 完成标准：注入时钟推进超过 `idle_seconds` 后调用 `sweep()`，条目 `status=offloaded`、热层 `payload is None`、热层计数下降、冷层 `offloaded` 计数上升（AC-5）；随后 `load` 自动回捞，返回完整 payload、`status=active`、`last_accessed_at` 刷新，调用方无需额外操作；冷层读异常时 `load` 正常返回热层条目并置 `degraded=True`、失败条目进 `skipped_ids`；冷层写异常时 `write`/`update` 仍成功且仅热层生效（AC-6）；卸载与回捞各写一条含 id、类别、原因的日志。
+- 返工记录（第 1 轮评审 F-1）：`_offload` 改为**以热层 payload 重新序列化**写入冷层，不再复用可能过期的冷层备份；新增用例 `test_offload_uses_hot_payload_when_cold_backup_is_stale` 覆盖「write v1 → 冷层写失败下 update v2 → 冷层恢复 → 越过 `idle_seconds` 的 `sweep()` → `load()`」。
 
 ## T-7 容量淘汰与永不淘汰约束
 
@@ -151,13 +152,13 @@
 | T-3 | `make test path=tests/core/packages/context_engine/test_tiering.py args="-k cold_backend"` | 通过，5 passed / 11 deselected |
 | T-4 | `make test path=tests/core/packages/context_engine/test_write_path.py`、`... test_invalidate.py` | 通过，23 passed、7 passed |
 | T-5 | `make test path=tests/core/packages/context_engine/test_load_filter.py` | 通过，11 passed |
-| T-6 | `make test path=tests/core/packages/context_engine/test_tiering.py` | 通过，16 passed |
+| T-6 | `make test path=tests/core/packages/context_engine/test_tiering.py` | 通过，17 passed |
 | T-7 | `make test path=tests/core/packages/context_engine/test_tiering.py args="-k eviction"` | 通过，4 passed / 12 deselected |
 | T-8 | `make test path=tests/core/packages/context_engine/test_expiry.py` | 通过，10 passed |
 | T-9 | `make test path=tests/core/packages/context_engine/test_observability.py` | 通过，6 passed |
 | T-10 | `make test path=tests/core/packages/context_engine/test_concurrency.py` | 通过，4 passed；实测写入 200 条约 0.005s，约 38118 条/秒 |
 | T-11 | `make test path=tests/core/packages/context_engine/test_builtin_categories_e2e.py` | 通过，3 passed |
-| T-1 ~ T-11 | `make test path=tests/core/packages/context_engine/` | 通过，117 passed |
+| T-1 ~ T-11 | `make test path=tests/core/packages/context_engine/` | 通过，118 passed |
 
 ### 零回归验证（T-12 / AC-17，全部通过）
 
@@ -179,3 +180,13 @@
 - 未运行：全仓/整目录测试（按 Skill 要求只做任务声明的定向验证）；性能目标（热层 <50ms、回捞 <500ms）为参考值，未设断言，仅记录并发用例实测吞吐
 - 失败：无
 - 人工预览: 无可预览（本变更为 SDK 内部存储底座，无 UI、无 HTTP 接口，当前无已部署的真实预览环境）
+
+### 返工记录（第 1 轮评审 F-1）
+
+- 阻塞项：`_offload` 在冷层已有记录时直接复用其 blob，叠加 `_write_backup` 写失败只告警，使「冷层写失败下 update 成功」后再卸载会静默回滚为旧 payload（`load` 返回旧内容且 `degraded=False`）。
+- 修复：`store.py` 的 `_offload` 改为**以热层 payload 重新序列化**后写入冷层，不再读取/复用冷层已有 blob；热层无 payload 或序列化失败时跳过卸载并保持热层数据（告警），冷层写入异常仍返回失败并保留热层内容，降级语义不变。
+- 新增用例：`test_tiering.py::test_offload_uses_hot_payload_when_cold_backup_is_stale`，序列为「write `{"v": 1}` → 冷层写失败下 update 到 `{"v": 2}` → 冷层恢复 → `clock +120s` → `sweep()` → `load()`」。
+- 断言：`load` 返回 `{"v": 2}`、`status=active`、`degraded=False`、`skipped_ids` 为空、`version=2`；冷层 `offloaded` 记录与回捞后翻回的 `backup` 记录均为 `{"v": 2}`。
+- 修复前复现：同一用例在返工前代码上失败于 `assert json.loads(offloaded_blob) == {"v": 2}`（实际 `{'v': 1}`），与评审证据一致。
+- 返工后复跑：`context_engine` 目录 118 passed（较上轮 +1）；零回归 7 组 234 passed / 1 xfailed 不变；`git diff develop -- src/agent/aidev_agent/core/nodes src/agent/aidev_agent/core/graphs` 仍为空。
+- 本轮未处理 W-1 ~ W-4（评审明示不作为打回理由），复核范围与冻结文档未变化。
