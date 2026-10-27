@@ -36,7 +36,7 @@ from .errors import (
     SESSION_NOT_FOUND,
     HeadlessError,
 )
-from .events import SessionEventWriter
+from .events import STATUS_ERROR, SessionEventWriter
 from .resource_manager import HeadlessLedger, HeadlessResourceManager
 
 logger = logging.getLogger("aidev-agent.headless")
@@ -190,6 +190,18 @@ class HeadlessSession:
                 status = self._finish_turn()
                 if not stateless:
                     self._append_assistant_record(turn_id)
+                if status == STATUS_ERROR:
+                    # 执行链只产出 RUN_ERROR 事件、未抛异常（如模型 5xx / 端点不可达）：
+                    # 该轮本身是失败轮，响应必须 ok=false 并带稳定错误码（REQ-5 / REQ-7）。
+                    # 事件侧不再补写 RUN_ERROR —— 基线序列（RUN_ERROR + 平台补发的 RUN_FINISHED）保持不变。
+                    return self._result(
+                        turn_id,
+                        status,
+                        HeadlessError(
+                            AGENT_INTERNAL_ERROR,
+                            self.writer.error_message or "本轮执行失败：执行链返回 RUN_ERROR",
+                        ),
+                    )
                 return {"session_code": self.session_code, "turn_id": turn_id, "status": status}
             except HeadlessError as exc:
                 if user_message_id:

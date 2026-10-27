@@ -154,6 +154,52 @@ def test_runtime_exception_maps_to_internal_error_and_process_stays_usable(llm):
         agent_factory.replace_defaults(legacy)
 
 
+def test_model_5xx_returns_structured_failure_without_duplicate_run_error():
+    """执行链只产出 RUN_ERROR 事件（不抛异常）时，响应必须 ok=false 且带稳定错误码。
+
+    F-1 回归：模型端点 5xx / 不可达时，平台侧只发 RUN_ERROR + 补发 RUN_FINISHED(success)，
+    不抛出到 headless。修复前该轮以 ``ok=true`` + ``status=error`` + 空回复结束，
+    违反 REQ-5（不得返回空回复）与 REQ-7（三态可区分）。
+    """
+    with FakeLLMServer(["不会用到"], error_status=500, error_message="upstream model is unavailable") as broken:
+        harness = Harness()
+        harness.send_obj(
+            "c1",
+            "create",
+            {
+                "session_code": "s1",
+                "agent": {"agent_code": "agent-hook"},
+                "llm": {"base_url": broken.base_url, "model": "fake-model"},
+            },
+        )
+        harness.result("c1")
+
+        harness.send("t1", "turn", session_code="s1", input="hi")
+        harness.wait()
+
+        error = harness.error("t1")
+        assert error["code"] == "agent.internal_error"
+        assert "upstream model is unavailable" in error["message"]
+
+        # 基线事件序列不变：RUN_ERROR 后由平台补发 RUN_FINISHED(success)，且只写一条 RUN_ERROR
+        types = harness.event_types("t1")
+        assert types[0] == EventType.RUN_STARTED.value
+        assert types[-2:] == [EventType.RUN_ERROR.value, EventType.RUN_FINISHED.value]
+        assert types.count(EventType.RUN_ERROR.value) == 1, types
+        terminal = harness.events("t1")[-1]
+        assert terminal["outcome"]["type"] == "success"
+
+        # resume 同形：同一会话续轮遇到同样的执行期错误，同样是 ok=false + 稳定错误码
+        harness.send("r1", "resume", session_code="s1", input="again")
+        harness.wait()
+        resume_error = harness.error("r1")
+        assert resume_error["code"] == "agent.internal_error"
+        assert "upstream model is unavailable" in resume_error["message"]
+        resume_types = harness.event_types("r1")
+        assert resume_types.count(EventType.RUN_ERROR.value) == 1, resume_types
+        assert resume_types[-2:] == [EventType.RUN_ERROR.value, EventType.RUN_FINISHED.value]
+
+
 def test_build_error_at_create_does_not_leave_a_broken_session(llm):
     harness = Harness()
     harness.send_obj(

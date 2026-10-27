@@ -70,11 +70,18 @@
 事件是 `ag_ui.core.events` 的原对象（`model_dump(mode="json", by_alias=True)`），不新增类型、
 不裁剪字段。每轮必须收尾于终止类事件，三态可区分：
 
-| 结束原因 | 终止事件 |
-| --- | --- |
-| 正常结束 | `RUN_FINISHED`（`runId` 为本轮 run） |
-| 用户取消 | `RUN_ERROR`（`message` = 用户已取消）+ `RUN_FINISHED`（`runId` = `cancelled`） |
-| 内部错误 / 不支持 | `RUN_ERROR`（`message` 为结构化原因），响应 `ok=false` 带同一 `code` |
+| 结束原因 | 终止事件 | 响应 |
+| --- | --- | --- |
+| 正常结束 | `RUN_FINISHED`（`runId` 为本轮 run，`outcome.type=success`） | `ok=true`，`result.status=finished` |
+| 用户取消 | `RUN_ERROR`（`message` = 用户已取消）+ `RUN_FINISHED`（`runId` = `cancelled`） | `ok=true`，`result.status=cancelled` |
+| 执行期错误（模型 5xx / 端点不可达等） | `RUN_ERROR`（`message` 为错误原因）+ 平台补发的 `RUN_FINISHED`（`outcome.type=success`） | **`ok=false`**，`error.code=agent.internal_error`，`error.message` 含该 `RUN_ERROR` 文案 |
+| 不支持 / 协议或会话错误 | `RUN_ERROR`（`message` 为结构化原因） | `ok=false`，`error.code` 为对应错误码 |
+
+> **判定本轮成败只看响应 `ok`**。执行期错误路径上，平台会在 `RUN_ERROR` 之后补发一条
+> `RUN_FINISHED(outcome.type=success)`（与平台基线 SSE 序列一致，headless 不裁事件、
+> 也不重复补 `RUN_ERROR`）。因此**不能**用「收到 `RUN_FINISHED`」判定成功：该轮响应必为
+> `ok=false`，宿主应据此把本轮投影为失败（例如 dsh 的 `turn_end` 用 `error` 而非 `completed`）。
+> 同一条 `RUN_ERROR` 只出现一次。
 
 ### 2.4 会话语义与并发
 
@@ -89,6 +96,10 @@
 `session.closed`、`session.busy_cancelled`、`agent.build_failed`、`agent.unsupported`、
 `agent.internal_error`、`resume_payload_missing`、`resume_payload_unsupported`、
 `platform_api_unsupported`。
+
+`agent.internal_error` 覆盖两类执行期失败：headless 捕获到的未归类异常，以及执行链只发
+`RUN_ERROR` 事件、由平台补发 `RUN_FINISHED` 的错误轮（模型 5xx、端点不可达）。后者的
+`error.message` 直接取该 `RUN_ERROR` 的文案，便于宿主定位上游原因。
 
 ---
 

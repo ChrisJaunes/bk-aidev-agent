@@ -79,6 +79,19 @@ class _FakeHandler(BaseHTTPRequestHandler):
 
         if self.path.endswith("/chat/completions"):
             owner.requests.append(body)
+            if owner.error_status is not None:
+                # 固定错误响应：模拟模型端点 5xx / 不可达上游
+                self._json(
+                    {
+                        "error": {
+                            "message": owner.error_message,
+                            "type": "server_error",
+                            "code": owner.error_status,
+                        }
+                    },
+                    status=owner.error_status,
+                )
+                return
             text = owner.next_reply()
             if body.get("stream"):
                 with owner.concurrency_lock:
@@ -110,12 +123,21 @@ class _FakeHandler(BaseHTTPRequestHandler):
 class FakeLLMServer:
     """回环地址上的 fake OpenAI 兼容端点。"""
 
-    def __init__(self, replies: list[str] | None = None, *, chunk_delay: float = 0.0):
+    def __init__(
+        self,
+        replies: list[str] | None = None,
+        *,
+        chunk_delay: float = 0.0,
+        error_status: int | None = None,
+        error_message: str = "upstream model is unavailable",
+    ):
         self._replies = list(replies or ["你好"])
         self._cursor = 0
         self._lock = threading.Lock()
         self.requests: list[dict] = []
         self.chunk_delay = chunk_delay
+        self.error_status = error_status
+        self.error_message = error_message
         self.concurrency_lock = threading.Lock()
         self.in_flight = 0
         self.max_concurrency = 0

@@ -95,6 +95,7 @@
 - 验证: `make -C src/agent test path=tests/headless/test_lifecycle.py`
 - [x] 完成标准：`resume` 经 `agent_factory().resume(...)` 在同一 `session_code` 与 `thread_id` 续轮并返回本轮响应；审批 / `ask_user_question` 形状的负载返回 `ok=false` + `resume_payload_unsupported`，并在事件流末尾补发 `RUN_ERROR`；`close` 释放实例、checkpointer、账本与线程句柄，之后同会话任意请求返回 `session_closed`，其他会话不受影响；`session_code` 在所有响应中原样回传。
 - 验证记录：`make -C src/agent test path=tests/headless/test_lifecycle.py` → **通过**，6 passed。`resume` 经注入点在同一 `session_code` / `thread_id` 续轮，第二次模型请求体含第一轮问答；审批 / `ask_user_question` 形状负载返回 `ok=false` + `resume_payload_unsupported` 并在事件流末尾补发 `RUN_ERROR`；`close` 后该会话任意请求返回已关闭错误（错误码按方案 D-8 写作 `session.closed`，任务正文简称 `session_closed`），其他会话不受影响；`session_code` 在所有响应原样回传。
+- 返工记录（第 1 轮 F-1）：`turn` / `resume` 在「执行链只产出 `RUN_ERROR` 事件、不抛异常」时（模型 5xx / 端点不可达）改为返回 `ok=false` + `error.code=agent.internal_error` + `error.message` 取该 `RUN_ERROR` 文案；事件侧不变（仍为 `RUN_ERROR` + 平台补发的 `RUN_FINISHED(success)`，不重复写 `RUN_ERROR`）。验证：`make -C src/agent test path=tests/headless/test_error_recovery.py` → **通过**，4 passed（新增 `test_model_5xx_returns_structured_failure_without_duplicate_run_error`，覆盖 turn 与 resume 两条路径）。
 
 ## T-8 并发、串行与取消
 
@@ -115,6 +116,7 @@
 - 验证: `make -C src/agent test path=tests/headless/test_error_recovery.py`
 - [x] 完成标准：非法 JSON、未知方法、未知会话、`close` 后请求、装配异常（`agent.build_failed`）、执行期未归类异常（`agent.internal_error`）六类输入均返回结构化错误并写出 `RUN_ERROR`，进程在同一条连接上继续服务后续合法请求；错误响应不含完整请求体与凭据；用例以单进程连续发 6 类坏请求 + 1 条合法 `turn`，断言末尾合法请求正常完成。
 - 验证记录：`make -C src/agent test path=tests/headless/test_error_recovery.py` → **通过**，3 passed。单条连接连发 6 类坏请求（非法 JSON、未知方法、未知会话、`close` 后请求、装配异常、执行期未归类异常）+ 一条合法 `turn`：各自返回结构化错误码（`protocol.invalid_json` / `protocol.unknown_method` / `session.not_found` / `session.closed` / `agent.build_failed` / `agent.internal_error`）并写出 `RUN_ERROR`，末尾合法请求正常 `finished`；注入的 `auth_headers` 值不出现在 stdout / stderr。
+- 返工记录（第 1 轮 F-1）：`agent.internal_error` 新增覆盖「事件型执行期错误」（只有 `RUN_ERROR`、无异常抛出），错误响应不再与 `ok=true` 并存；`agent.internal_error` 的 `message` 直接复用该 `RUN_ERROR` 文案。
 
 ## T-10 无平台依赖与隔离验证
 
@@ -136,6 +138,7 @@
 - 验证: 手工评审依据：文档章节自检清单（组合配置步骤 / 方法映射 / 不支持面 / fake 模型验收步骤 / 日志与安全 五节齐备），且全文无 dsh 源码片段
 - [x] 完成标准：说明宿主如何以组合 / profile 配置停用 `@deepseek-ai/dsh-agent-loop` 并启用仓外插件（含「重复注册会抛 `an agent factory is already registered`」的原因）、五方法映射与 NDJSON 报文样例、支持面（`create` / `turn` / `resume` / `cancel` / `close`）与不支持面（`inbox` 多队列、`steer` / `inject` / `followup` 逐步语义、`runMaintenance`、compaction、子 Agent，且必须抛错不得降级）、用本机 fake 模型（含 `/v1/api/token_check`）完成验收的步骤、日志与凭据约束；索引条目指向新文档。
 - 验证记录：手工评审（依据任务定义的五节自检清单）→ **通过**。`docs/agent/HEADLESS_HOST.md`：组合/profile 配置步骤（含「重复注册会抛 `an agent factory is already registered`」的原因）、五方法映射与 NDJSON 报文样例、支持面与不支持面（明确必须抛错、不得降级）、本机 fake 模型验收步骤（含 `/v1/api/token_check`）、日志与凭据约束；`docs/agent/readme.md` 已新增索引条目；全文无 dsh 源码片段。
+- 返工记录（第 1 轮 F-1）：`docs/agent/HEADLESS_HOST.md` §2.3 事件契约表补「响应 `ok` 列」并写明「平台补发 `RUN_FINISHED(outcome=success)` 时宿主必须按响应 `ok=false` 判定本轮失败、同一条 `RUN_ERROR` 只出现一次」；§2.5 说明 `agent.internal_error` 覆盖事件型错误轮。
 
 ## T-12 仓外集成验收证据（dsh 插件 + fake LLM）
 
