@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 import enum
+import logging
 import os
 from typing import Optional
 
 import environs
+
+logger = logging.getLogger(__name__)
 
 
 class SettingEnvVariables(enum.Enum):
@@ -110,6 +113,32 @@ env = environs.Env()
 env.read_env()
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    """读取正整数环境变量，非法取值回落默认值并告警。
+
+    与 ``env.int`` 的区别：``env.int`` 在导入期对非法值抛 ``EnvValidationError``，
+    会把部署配置错误升级为进程启动失败。上下文存储的容量/阈值类配置不满足该约束，
+    要求「回落默认 + 告警、不阻断导入」，故单独实现。
+    未设置（变量不存在）直接取默认值；已设置但为空串、非整数或小于 1 时告警并回落默认。
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if not raw.strip():
+        logger.warning("[ContextOffloading] 配置项 %s 为空串，回落默认值 %s", name, default)
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning("[ContextOffloading] 配置项 %s=%r 不是整数，回落默认值 %s", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("[ContextOffloading] 配置项 %s=%r 必须为正整数，回落默认值 %s", name, raw, default)
+        return default
+    return value
+
+
 existed_keys = list(locals().keys())
 existed_keys.append("existed_keys")
 
@@ -157,6 +186,13 @@ BKAI_RUNTIME_SANDBOX_RECORD_MAX_AGE = env.int("BKAI_RUNTIME_SANDBOX_RECORD_MAX_A
 # 功能开关：启用延迟销毁 RuntimeBackendResolver（RuntimeBackendDeferManager 装配 + 会话级复用）
 # 关闭时 resolver 为纯路由，release 立即销毁。原 RUNTIME_SANDBOX_REUSE_ENABLED 已由本开关取代
 BKAI_RUNTIME_SANDBOX_DEFERRED_DESTROY_ENABLED = env.bool("BKAI_RUNTIME_SANDBOX_DEFERRED_DESTROY_ENABLED", True)
+
+# 上下文分层存储（Offloading）配置：容量与闲置/节流阈值
+# 非法取值（非整数、<1、空串）回落默认值并告警，不阻断导入（见 ``_env_positive_int``）
+BKAI_CONTEXT_STORE_HOT_CAPACITY = _env_positive_int("BKAI_CONTEXT_STORE_HOT_CAPACITY", 1000)
+BKAI_CONTEXT_STORE_COLD_CAPACITY = _env_positive_int("BKAI_CONTEXT_STORE_COLD_CAPACITY", 5000)
+BKAI_CONTEXT_STORE_IDLE_SECONDS = _env_positive_int("BKAI_CONTEXT_STORE_IDLE_SECONDS", 900)
+BKAI_CONTEXT_STORE_SWEEP_INTERVAL = _env_positive_int("BKAI_CONTEXT_STORE_SWEEP_INTERVAL", 60)
 
 # SSM相关配置
 BK_SSM_ENDPOINT = env.str("BK_SSM_ENDPOINT", "https://bkssm.service.consul")  # noqa
