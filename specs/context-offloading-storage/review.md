@@ -2,30 +2,16 @@
 
 ## 最新结论
 
-- 结论: 需要返工
-- 评审版本: 96c0d2cfeb2fb968705c38becc8a1889e3c34a70
+- 结论: 通过，但有改进建议
+- 评审版本: e909522fd69e5ce0da944afbb6dfaaba8d36700b
 
 ### 阻塞项
 
-- **F-1 冷层备份过期会导致「更新已提交、之后被静默回滚」（数据正确性）**
-  - 证据：
-    - `src/agent/aidev_agent/core/packages/context_engine/store.py:480-504` 的 `_offload` 在冷层已有记录时**直接复用该记录的 blob**（`record[1] if record is not None else _serialize(entry.payload)`），不再以热层 payload 为准。
-    - `store.py:548-552` 的 `_write_backup` 对冷层写入异常只记 warning：既不重试，也不把该条目标记为「备份不可信」。
-    - 二者组合后，REQ-7 允许的「冷层写入异常下 update 仍成功」会留下「热层 = 新版本 / 冷层 = 旧版本」的不一致；冷层恢复后的下一次卸载把旧 blob 翻为 `offloaded` 并清空热层 payload（`store.py:500-501`），此后 `load` 回捞返回旧内容，最新已提交 payload 无告警丢失。
-  - 复现（2026-10-27 在本轮 `reviewed_sha` 上实跑，注入「可关闭写失败」的内存冷层）：
-    ```
-    write  Conversation History {"v": 1}          -> cold 备份 {"v": 1}
-    冷层 fail_writes=True；update 到 {"v": 2}      -> 热层 v2、version 2；冷层仍为 {"v": 1}（只有一条 warning）
-    冷层恢复；clock +120s；sweep()                 -> MaintenanceReport(offloaded=1, failed=0)
-    load()                                        -> payload {'v': 1}，status=active
-    ```
-    即一次成功提交的更新在 120 秒后变成旧值，且 `degraded=False`、无任何失败信号。
-  - 影响范围：默认 `InMemoryColdBackend` 不会写失败，故现网内存形态不触发；但 REQ-7 明确要求「写入与更新路径在冷层不可用时仍成功」，且规格要求冷层后端可替换（REQ-8/plan D-3），换成外置后端后这是可达路径。违反规格「边界与非功能」中「正确性优先于吞吐：卸载/淘汰/回捞不得丢失 `active` 条目的 payload」，并使 AC-5「加载请求仍必须取回完整内容」在降级-恢复序列下失真。
-  - 修复后可判定的验收标准：
-    1. 新增一条用例覆盖「write v1 → 冷层写失败下 update 到 v2 → 冷层恢复 → 越过闲置阈值 `sweep()` → `load()`」，断言返回 payload 为 `{"v": 2}`、`status=active`、`degraded=False`；
-    2. 同一条用例断言冷层中该条目的记录内容为最新 payload（`offloaded` 与恢复后的 `backup` 均不得为旧版本）；
-    3. 可选但推荐：`_offload` 以热层 payload 重新序列化为准（或校验冷层 blob 与热层一致后才翻转），使「冷层备份过期」不再能污染卸载路径；
-    4. 定向用例 `tests/core/packages/context_engine/` 仍全部通过（当前 117 条），零回归 7 组用例仍全部通过。
+无。
+
+第 1 轮唯一阻塞项 F-1 已修复并通过本轮复核：`store.py:480-509` 的 `_offload` 改为**以热层 payload 重新序列化**后写入冷层，不再读取或复用可能过期的冷层备份；不变量「`offloaded` 记录内容 == 热层最后提交的 payload」由此成立。本轮独立复跑返工前失败的同一条序列（`write {"v":1}` → 冷层 `fail_writes` 下 `update {"v":2}` → 冷层恢复 → `+120s sweep()` → `load()`），结果为 `cold=("offloaded", '{"v": 2}')`、`load().payload == {"v": 2}`，与第 1 轮证据相反；降级语义未退化（冷层整体不可用时 `sweep()` 报 `failed=1`，条目仍为 `active` 且保留 payload）。
+
+其余 16 条 REQ / 17 条 AC 的对照结论沿用第 1 轮（见「第 1 轮」小节），累计改动仍为「新增包 + `config.py` 4 个变量」，装配链路 diff 为空。4 条改进建议 W-1 ~ W-4 本轮仍未处理，均属非阻塞项，不影响本轮验收。
 
 ### 改进建议
 
@@ -36,7 +22,7 @@
   `store.py:337` 的 `overflow` 取全实例 `active` 数减 `hot_capacity`，但 `store.py:339-344` 的候选只从该 `scope` 内挑；多会话共享实例时按 scope 调用会少卸载，或误报「无法完全卸载」。`_maybe_maintain` 走的是全局 `sweep()`，故不阻塞；建议按 scope 子集计算 overflow，或在 docstring 中明确该参数只做「范围限定 + 全局容量判定」。
 
 - **W-3 热层超限用「卸载」而非 REQ-8 字面的「淘汰（彻底移除）」**
-  `store.py:345-349` 对热层溢出执行 `_offload`（可回捞），只有冷层溢出才 `_evict`。这与已审批的 `plan.md` D-4「热层 → 卸载；冷层 → 淘汰」及 AC-11 的判定口径一致，本轮不判阻塞；但 REQ-8 原文写的是「热层或冷层超出容量上限时……淘汰为彻底移除（不可还原）」，按原文复验会得出不同结论。建议在规格或 plan 的偏差表登记该口径，避免后续评估侧按字面取数。
+  `store.py:346` 起对热层溢出执行 `_offload`（可回捞），只有冷层溢出才 `_evict`。这与已审批的 `plan.md` D-4「热层 → 卸载；冷层 → 淘汰」及 AC-11 的判定口径一致，本轮不判阻塞；但 REQ-8 原文写的是「热层或冷层超出容量上限时……淘汰为彻底移除（不可还原）」，按原文复验会得出不同结论。建议在规格或 plan 的偏差表登记该口径，避免后续评估侧按字面取数。
 
 - **W-4 失效条目只留空壳且不计入容量**
   `store.py:237-240` 的 `invalidate` 置 `evicted` 并清 payload，但条目仍留在 `_entries`；`stats()` 与容量计数都跳过 `evicted`，长生命周期实例（会话级 scope 反复失效 `Execution Trace`）会累积元数据空壳。REQ-4 要求「逻辑删除」，故不阻塞；建议在 plan 风险表登记该增长形态，或另立变更提供显式物理清理入口。
@@ -46,19 +32,11 @@
 
 ```spec_verdict
 {
-  "verdict": "REWORK",
+  "verdict": "PASS_WITH_WARNING",
   "change_name": "context-offloading-storage",
-  "iteration": 1,
-  "reviewed_sha": "96c0d2cfeb2fb968705c38becc8a1889e3c34a70",
-  "blocking": [
-    {
-      "id": "F-1",
-      "severity": "data",
-      "requirement_ids": ["REQ-3", "REQ-6", "REQ-7", "REQ-8", "AC-5"],
-      "evidence": "store.py:480-504 _offload 复用冷层已有记录 blob（record[1] if record is not None）而非热层 payload；store.py:548-552 _write_backup 对冷层写失败只 warning、不回写不降级。实测：write v1 → 冷层 fail_writes 下 update 到 v2（热层 v2、冷层 v1）→ 冷层恢复 → +120s sweep（offloaded=1）→ load 返回 {'v': 1}、degraded=False；已提交的最新 payload 静默丢失",
-      "acceptance": "新增用例覆盖 write v1 → 冷层写失败下 update v2 → 冷层恢复 → 越过 idle_seconds 的 sweep → load 的序列，断言返回 payload 为 {'v': 2}、status=active、degraded=False，且冷层该条目记录内容为最新 payload；_offload 以热层 payload 为准或校验一致后再翻转；context_engine 目录 117 条与零回归 7 组用例仍全通过"
-    }
-  ],
+  "iteration": 2,
+  "reviewed_sha": "e909522fd69e5ce0da944afbb6dfaaba8d36700b",
+  "blocking": [],
   "warnings": [
     {
       "id": "W-1",
@@ -72,7 +50,7 @@
     },
     {
       "id": "W-3",
-      "evidence": "store.py:345-349 热层超限执行 _offload（可回捞），REQ-8 原文要求「淘汰为彻底移除」；plan D-4 与 AC-11 支持当前实现",
+      "evidence": "store.py:346 起热层超限执行 _offload（可回捞），REQ-8 原文要求「淘汰为彻底移除」；plan D-4 与 AC-11 支持当前实现",
       "suggestion": "在规格或 plan 的偏差表登记该口径差异，避免按 REQ-8 原文复验判失败"
     },
     {
@@ -137,6 +115,80 @@
 - 到期语义：`end_turn` 只处理 `turn`，`platform`/`agent`/`user` 无入口，符合 REQ-10 与 AC-10。
 - 规格偏差：仅 W-3（热层超限用卸载而非彻底淘汰），与已审批 `plan.md` D-4 一致，按本轮规则不判阻塞。
 
+### 阻塞项 F-1（已在第 2 轮修复）
+
+- **F-1 冷层备份过期会导致「更新已提交、之后被静默回滚」（数据正确性）**
+  - 证据：
+    - `store.py:480-504`（第 1 轮时的代码）的 `_offload` 在冷层已有记录时**直接复用该记录的 blob**（`record[1] if record is not None else _serialize(entry.payload)`），不再以热层 payload 为准。
+    - `store.py:548-552` 的 `_write_backup` 对冷层写入异常只记 warning：既不重试，也不把该条目标记为「备份不可信」。
+    - 二者组合后，REQ-7 允许的「冷层写入异常下 update 仍成功」会留下「热层 = 新版本 / 冷层 = 旧版本」的不一致；冷层恢复后的下一次卸载把旧 blob 翻为 `offloaded` 并清空热层 payload，此后 `load` 回捞返回旧内容，最新已提交 payload 无告警丢失。
+  - 复现（2026-10-27 在 `96c0d2cf` 上实跑，注入「可关闭写失败」的内存冷层）：
+    ```
+    write  Conversation History {"v": 1}          -> cold 备份 {"v": 1}
+    冷层 fail_writes=True；update 到 {"v": 2}      -> 热层 v2、version 2；冷层仍为 {"v": 1}（只有一条 warning）
+    冷层恢复；clock +120s；sweep()                 -> MaintenanceReport(offloaded=1, failed=0)
+    load()                                        -> payload {'v': 1}，status=active
+    ```
+    即一次成功提交的更新在 120 秒后变成旧值，且 `degraded=False`、无任何失败信号。
+  - 影响范围：默认 `InMemoryColdBackend` 不会写失败，故现网内存形态不触发；但 REQ-7 明确要求「写入与更新路径在冷层不可用时仍成功」，且规格要求冷层后端可替换（REQ-8/plan D-3），换成外置后端后这是可达路径。违反规格「边界与非功能」中「正确性优先于吞吐：卸载/淘汰/回捞不得丢失 `active` 条目的 payload」，并使 AC-5「加载请求仍必须取回完整内容」在降级-恢复序列下失真。
+  - 修复后可判定的验收标准：
+    1. 新增一条用例覆盖「write v1 → 冷层写失败下 update 到 v2 → 冷层恢复 → 越过闲置阈值 `sweep()` → `load()`」，断言返回 payload 为 `{"v": 2}`、`status=active`、`degraded=False`；
+    2. 同一条用例断言冷层中该条目的记录内容为最新 payload（`offloaded` 与恢复后的 `backup` 均不得为旧版本）；
+    3. 可选但推荐：`_offload` 以热层 payload 重新序列化为准（或校验冷层 blob 与热层一致后才翻转），使「冷层备份过期」不再能污染卸载路径；
+    4. 定向用例 `tests/core/packages/context_engine/` 仍全部通过（当轮 117 条），零回归 7 组用例仍全部通过。
+
 ### 结论
 
 存在 1 项数据正确性阻塞项（F-1：更新后冷层备份过期会导致 `load` 返回旧 payload 且无任何降级信号）。按固定验收规则「没有正确性、安全或数据方面的阻塞项」未满足，本轮判定 **需要返工**，返回「代码实现」节点（`790e2dbb-4758-4407-b48e-15bf27b341ca`）。四个改进建议 W-1 ~ W-4 不作为打回理由。
+
+## 第 2 轮
+
+### 评审范围
+
+- 仓库: `bk-aidev-agent`（单仓）
+- 工作分支: `feature/context-offloading-storage`，评审开始 HEAD `e909522fd69e5ce0da944afbb6dfaaba8d36700b`（`git ls-remote --heads` 与本地一致，评审 worktree 工作区 clean）
+- 基线: `develop` `7a171a8af285c24733d75a16428ef31edfcbbd05`；上一轮评审提交 `5956336d`
+- 本轮返工差异（`git diff 5956336d e909522f`）：3 个文件、+64 / −7 —— `store.py`（+18 / −7，`_offload` 修复）、`test_tiering.py`（+38，新增 F-1 用例）、`tasks.md`（+15，返工与验证记录）
+- 累计差异（`git diff 7a171a8a e909522f -- src/agent/aidev_agent`）：仍为「`config.py`（+36）+ 9 个新增文件」，无新增既有文件改动
+- 冻结文档：`spec.md`、`plan.md` 自审批起未改动（`git diff 6610296f e909522f -- spec.md plan.md` 为空）；`tasks.md` 仅追加返工与验证记录，无需求或任务定义改写
+
+### F-1 修复核对
+
+| 验收标准（第 1 轮） | 本轮核对 | 结论 |
+| --- | --- | --- |
+| 新增「write v1 → 冷层写失败下 update v2 → 冷层恢复 → 越过 idle 的 sweep → load」用例 | `test_tiering.py:181-216` `test_offload_uses_hot_payload_when_cold_backup_is_stale`，序列完整 | 满足 |
+| 断言 load 返回 v2、`status=active`、`degraded=False` | 用例断言 `payload == {"v": 2}`、`status is ACTIVE`、`degraded is False`、`skipped_ids == ()`、`version == 2` | 满足 |
+| 断言冷层记录（offloaded 与回捞后的 backup）为最新 payload | 用例断言 `kind == KIND_OFFLOADED` 且 `json.loads(blob) == {"v": 2}`；回捞后断言 `kind == KIND_BACKUP` 且同为 `{"v": 2}` | 满足 |
+| 卸载路径以热层 payload 为准 | `store.py:480-509`：`blob = _serialize(entry.payload)`，不再 `cold.get` 复用旧记录 | 满足 |
+| 降级语义不退化 | `store.py` 仍保留「热层无 payload 跳过卸载」「序列化失败跳过卸载」「冷层写入异常返回 False 且保留热层」三条分支；实跑冷层写失败时 `sweep()` 报 `failed=1`、条目保持 `active` + payload | 满足 |
+| 117 条定向 + 零回归 7 组仍通过 | 本轮实跑 118 passed；零回归 234 passed / 1 xfailed | 满足 |
+
+独立复现（本轮 HEAD 实跑，与返工前同一脚本）：
+
+```
+write  Conversation History {"v": 1}          -> cold 备份 {"v": 1}
+冷层 fail_writes=True；update 到 {"v": 2}      -> 热层 v2、version 2；冷层仍为 {"v": 1}（warning 如实记录）
+冷层恢复；clock +120s；sweep()                 -> MaintenanceReport(offloaded=1, failed=0)
+cold 记录                                      -> ("offloaded", '{"v": 2}')
+load()                                        -> payload {'v': 2}，status=active
+```
+
+### 验证复核
+
+| 复跑范围 | 结果 | 与记录对比 |
+| --- | --- | --- |
+| `tests/core/packages/context_engine/` | 118 passed | 与记录（较上轮 +1）一致 |
+| `tests/test_config.py` + `tests/core/nodes/model` + 三个 context_processor 用例 + `test_token_compression.py` + `test_model.py` | 234 passed / 1 xfailed | 与记录一致，无退化 |
+
+验证方式与第 1 轮相同（既有 venv 直跑本轮 SHA 代码，`PYTHONPATH` 指向评审 worktree），未扩大验证范围。
+
+### 代码走查
+
+- 修复未引入新分支面：`_offload` 的失败分支从「冷层 get/put 异常」收敛为「热层无 payload / 序列化失败 / 冷层 put 异常」，三者都保持热层数据并返回 `False`，调用方（`sweep` / `_expire`）据此计入 `failed`，不影响其它条目。
+- 序列化成本：每次卸载重新 `json.dumps` 一次（原实现命中冷层记录时跳过），对 900s 闲置阈值的路径可忽略，未触及 REQ-14 的性能参考口径。
+- 并发与锁：改动只在既有 `RLock` 临界区内，无新增锁、无锁序变化。
+- 其余 REQ / AC 的实现与第 1 轮一致，未受本轮改动影响；REQ-9「`store.py` 无类别名」仍成立。
+
+### 结论
+
+第 1 轮阻塞项 F-1 已按要求修复，并有可复现的回归用例覆盖；约定验证（定向 118 条 + 零回归 7 组）复跑全部通过，无新增正确性、安全或数据阻塞项。按固定验收规则判定 **通过，但有改进建议**（W-1 ~ W-4 为非阻塞项，本轮不处理）。
