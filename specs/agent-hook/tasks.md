@@ -195,7 +195,8 @@
 - 需求: REQ-13、REQ-15、REQ-16
 - 依赖: 无
 - 验证: `make -C src/agent test path=tests/core/nodes/tool/test_hook_wrappers.py`
-- [ ] 完成标准：`bus.py` 定义 `HookPoint` 与 `HookBusProtocol`（`enabled` / `points` / `emit`，鸭子类型，不依赖 headless）；`wrappers.py` 提供 `tool_pre` / `tool_post` 的同步与异步 wrapper 工厂；`tool_pre` 的 `deny` 返回 `ToolMessage(status="error", content=reason)` 且不调用 `execute`，`ask` 调 `interrupt()` 抛 `GraphInterrupt`，`allow` 原样 `execute`；`tool_post` 的 `block` / `content` / `context` 只改同一条 `ToolMessage`，`tool_call_id` / `name` / `additional_kwargs` 保持不变；`context` 与 `content` 同时给出时先替换再追加；未知裁决按最宽松值处理；用例覆盖四点裁决与异常路径。
+- [x] 完成标准：`bus.py` 定义 `HookPoint` 与 `HookBusProtocol`（`enabled` / `points` / `emit`，鸭子类型，不依赖 headless）；`wrappers.py` 提供 `tool_pre` / `tool_post` 的同步与异步 wrapper 工厂；`tool_pre` 的 `deny` 返回 `ToolMessage(status="error", content=reason)` 且不调用 `execute`，`ask` 调 `interrupt()` 抛 `GraphInterrupt`，`allow` 原样 `execute`；`tool_post` 的 `block` / `content` / `context` 只改同一条 `ToolMessage`，`tool_call_id` / `name` / `additional_kwargs` 保持不变；`context` 与 `content` 同时给出时先替换再追加；未知裁决按最宽松值处理；用例覆盖四点裁决与异常路径。
+- 验证记录：`make -C src/agent test path=tests/core/nodes/tool/test_hook_wrappers.py` → **通过**，14 passed。覆盖四点裁决（allow / deny / ask / 未知取值）、`ask` 中断值形状（`reason=aidev:hook_ask` / `toolCallId`）与放行/拒绝两分支、`ask` 重放只上报一次、`tool_post` 的 accept / block / content / context（含 content+context 先替换再追加）、`tool_call_id` / `name` / `additional_kwargs` 保持不变、`Command` 结果透传、异步 wrapper 与 `bus_enabled` 兜底。
 
 ## T-15 `build_tool_node` 挂点与 wrapper 顺序不变式
 
@@ -204,7 +205,8 @@
 - 需求: REQ-15、REQ-16
 - 依赖: T-14
 - 验证: `make -C src/agent test path=tests/core/nodes/tool/test_tool_node_hook_order.py`
-- [ ] 完成标准：`build_tool_node` 新增可选 `hooks` 参数（默认 `None`）；`hooks is None` 或点位未启用时 wrapper 链与基线逐项一致（断言链上成员与顺序全等）；启用时 `tool_pre` 位于链首（先于不可信净化 / 脱敏 / ITSM 审批）、`tool_post` 位于链尾（紧贴工具本体、在 `deduplicate` 之内）；带 `approval` metadata 的 fake 工具在 `tool_pre=deny` 时审批调用次数为 0。
+- [x] 完成标准：`build_tool_node` 新增可选 `hooks` 参数（默认 `None`）；`hooks is None` 或点位未启用时 wrapper 链与基线逐项一致（断言链上成员与顺序全等）；启用时 `tool_pre` 位于链首（先于不可信净化 / 脱敏 / ITSM 审批）、`tool_post` 位于链尾（紧贴工具本体、在 `deduplicate` 之内）；带 `approval` metadata 的 fake 工具在 `tool_pre=deny` 时审批调用次数为 0。
+- 验证记录：`make -C src/agent test path=tests/core/nodes/tool/test_tool_node_hook_order.py` → **通过**，7 passed。`hooks is None` 与点位未启用两种情形的同步 wrapper 链成员与顺序与基线全等；启用时 `hook_pre_wrapper` 位于链首（先于`itsm_approval_sync_wrapper`）、`hook_post_wrapper` 位于链尾且在 `deduplicate_sync` 之内；`tool_pre=deny` 时审批策略 `interrupt` 调用 0 次、工具本体 0 次；`tool_pre=allow` 时审批策略 `interrupt` 被调用 1 次（hook 未绕开权限闸门）。
 
 ## T-16 构建期透传 hooks / hook_context / interrupt_processor
 
@@ -213,7 +215,8 @@
 - 需求: REQ-13
 - 依赖: T-15
 - 验证: `make -C src/agent test path=tests/services/agent/test_agent_factory_hooks_passthrough.py`
-- [ ] 完成标准：`create(hooks=..., hook_context=..., interrupt_processor=...)` 经 `_make_build_context` 落到 `ChatBuildExtras` 同名字段，再由 `ChatCompletionAgent.build` 落到实例字段并进入 `get_agent_executor(...)`；`ReActAgentBuilder` 新增 `set_hooks` / `set_hook_context`；未传三者时字段均为 `None`，`build_tool_node` 与模型节点装配与基线完全一致；`build` 不覆盖已被注入的 `interrupt_processor`（`chat.py:522` 的惰性构造仅在 `None` 时生效）；平台路径（不传）现有用例全绿。
+- [x] 完成标准：`create(hooks=..., hook_context=..., interrupt_processor=...)` 经 `_make_build_context` 落到 `ChatBuildExtras` 同名字段，再由 `ChatCompletionAgent.build` 落到实例字段并进入 `get_agent_executor(...)`；`ReActAgentBuilder` 新增 `set_hooks` / `set_hook_context`；未传三者时字段均为 `None`，`build_tool_node` 与模型节点装配与基线完全一致；`build` 不覆盖已被注入的 `interrupt_processor`（`chat.py:522` 的惰性构造仅在 `None` 时生效）；平台路径（不传）现有用例全绿。
+- 验证记录：`make -C src/agent test path=tests/services/agent/test_agent_factory_hooks_passthrough.py` → **通过**，8 passed。`create` 的三个可选键经 `_make_build_context` 落到 `ChatBuildExtras` 同名字段、再由 `build` 落到实例字段；`_get_agent` 把它们交给 `get_agent_executor`；`set_hooks` / `set_hook_context` 分别落到 `build_tool_node(hooks=...)` 与 `ModelNodeSettings.extra_template_middlewares`（`HookContextMiddleware`）；未传三者时字段均为 None、链上无 hook wrapper、无模板中间件；已注入的 `interrupt_processor` 不被 `build` 覆盖。
 
 ## T-17 `session_start` 触发与 system prompt 注入
 
@@ -222,7 +225,8 @@
 - 需求: REQ-14
 - 依赖: T-16
 - 验证: `make -C src/agent test path=tests/headless/test_hook_session_start.py`
-- [ ] 完成标准：`turn` 与 `resume` 每次驱动前各触发一次 `session_start`，载荷含 `session_code` / `turn_id` / `first_turn` / `input`；首轮 `first_turn=true`、同会话第二轮 `false`；`context` 非空时 fake 模型收到的本轮请求体包含该文本且位于用户输入之前；会话账本中的 user 原文与 `turn_id` 不变；`context` 为空或降级时本轮照常 `finished` 且不报错。
+- [x] 完成标准：`turn` 与 `resume` 每次驱动前各触发一次 `session_start`，载荷含 `session_code` / `turn_id` / `first_turn` / `input`；首轮 `first_turn=true`、同会话第二轮 `false`；`context` 非空时 fake 模型收到的本轮请求体包含该文本且位于用户输入之前；会话账本中的 user 原文与 `turn_id` 不变；`context` 为空或降级时本轮照常 `finished` 且不报错。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_session_start.py` → **通过**，5 passed。`context` 出现在本轮模型请求体且位于用户输入之前；账本 user 原文与 `turn_id` 不变；同一会话两轮 `first_turn` 为 `True` / `False`；空 `context` 与降级时本轮照常 `finished`；`resume` 同样触发一次。
 
 ## T-18 协议两类新行与答复分流
 
@@ -231,7 +235,8 @@
 - 需求: REQ-18
 - 依赖: 无
 - 验证: `make -C src/agent test path=tests/headless/test_hook_protocol.py`
-- [ ] 完成标准：`Dispatcher.handle_line` 能区分答复行（`ok` 在、`method` 不在）并投递到 `HookPendingRouter`；答复行不产生响应行、不被报成 `protocol.unknown_method`、不进入 `parse_request`；hook 请求行 `id` 为 `<本轮请求 id>#h<n>`，同一会话内 `n` 自 1 递增且不重复；请求行与事件行共用写锁，并发场景下 stdout 无交错行；未知/畸形答复行不使进程退出。
+- [x] 完成标准：`Dispatcher.handle_line` 能区分答复行（`ok` 在、`method` 不在）并投递到 `HookPendingRouter`；答复行不产生响应行、不被报成 `protocol.unknown_method`、不进入 `parse_request`；hook 请求行 `id` 为 `<本轮请求 id>#h<n>`，同一会话内 `n` 自 1 递增且不重复；请求行与事件行共用写锁，并发场景下 stdout 无交错行；未知/畸形答复行不使进程退出。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_protocol.py` → **通过**，6 passed。请求行 `id` 为 `t1#h1` 且会话内第二个请求为 `t2#h2`（不重置、不重复）；`params` 四键齐备；答复行不产生响应行、不报 `protocol.unknown_method`；未知 / 缺 `id` / 畸形答复行不影响后续请求；stdout 每行都是完整 JSON（写锁未交错）。
 
 ## T-19 `HeadlessHookBus`：超时、取消、fail-open 与 `hook_degraded`
 
@@ -240,7 +245,8 @@
 - 需求: REQ-18、REQ-19
 - 依赖: T-18
 - 验证: `make -C src/agent test path=tests/headless/test_hook_degrade.py`
-- [ ] 完成标准：`HookConfig` 解析 `timeout_ms`（缺省 10000，非正整数报 `hook.value_invalid`）与 `points`（缺省三点全开，未知点位报 `hook.value_invalid`）；超时 / 宿主 `ok=false` / `result` 形状不合法 / 未知 `decision` 四种情形按最宽松裁决继续，并各写恰好一条 `CUSTOM` 事件 `hook_degraded`（`value` 含 `point` 与 `reason`），不新增 `EventType`；等待期间收到 `cancel` 时早于 `timeout_ms` 返回并按取消收尾，且不写 `hook_degraded`；关闭态下不产生任何 `type=request` 行与 `hook_degraded` 事件。
+- [x] 完成标准：`HookConfig` 解析 `timeout_ms`（缺省 10000，非正整数报 `hook.value_invalid`）与 `points`（缺省三点全开，未知点位报 `hook.value_invalid`）；超时 / 宿主 `ok=false` / `result` 形状不合法 / 未知 `decision` 四种情形按最宽松裁决继续，并各写恰好一条 `CUSTOM` 事件 `hook_degraded`（`value` 含 `point` 与 `reason`），不新增 `EventType`；等待期间收到 `cancel` 时早于 `timeout_ms` 返回并按取消收尾，且不写 `hook_degraded`；关闭态下不产生任何 `type=request` 行与 `hook_degraded` 事件。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_degrade.py` → **通过**，17 passed。`HookConfig` 缺省（10000 / 三点全开）、子集、超上限钳制与 7 类非法输入（`hook.value_invalid`）；超时 / `ok=false` / `result` 非对象 / `session_start.context` 非字符串四类降级各写恰好一条 `hook_degraded`（`timeout` / `host_error` / `invalid_shape`）；等待期间 `cancel` 在超时之前收敛且不写 `hook_degraded`；关闭态无 `type=request`、无 `hook_degraded`；未启用点位不产生请求行。
 
 ## T-20 headless 中断恢复：`HeadlessInterruptProcessor`
 
@@ -249,7 +255,8 @@
 - 需求: REQ-17
 - 依赖: T-16
 - 验证: `make -C src/agent test path=tests/headless/test_hook_interrupt.py`
-- [ ] 完成标准：`resume` 接受 `{"interruptId", "toolCallId"?, "decision", "reason"?}`（允许单元素列表，`aidev:user_question` 场景 `decision` 可为 `{"answers": [...]}`），校验命中上一轮 pending 中断；未命中返回 `ok=false` + `resume_interrupt_not_found`，且随后用命中的 `interruptId` 仍能正常恢复；命中 `aidev:tool_approval`（ITSM 权限审批）时返回 `ok=false` + `resume_interrupt_unsupported`，不改图状态、不放行其它 pending；`HeadlessInterruptProcessor.get_resume_input` 只读 `tasks`、以 reason 白名单（`aidev:hook_ask` / `aidev:user_question`）判定，构造 `Command(resume=...)`，不查 DB、不调 `dispatch_interrupts`；`dispatch_interrupts` 只归一为 `InterruptOutcome(status="built")`，无 prepare、无建单；恢复后同一会话仍可 `turn`；存在未恢复 pending 中断时 `turn` 返回 `session.pending_interrupt`；裁决缺失或取值未知按 `deny` 处理并记 warning。
+- [x] 完成标准：`resume` 接受 `{"interruptId", "toolCallId"?, "decision", "reason"?}`（允许单元素列表，`aidev:user_question` 场景 `decision` 可为 `{"answers": [...]}`），校验命中上一轮 pending 中断；未命中返回 `ok=false` + `resume_interrupt_not_found`，且随后用命中的 `interruptId` 仍能正常恢复；命中 `aidev:tool_approval`（ITSM 权限审批）时返回 `ok=false` + `resume_interrupt_unsupported`，不改图状态、不放行其它 pending；`HeadlessInterruptProcessor.get_resume_input` 只读 `tasks`、以 reason 白名单（`aidev:hook_ask` / `aidev:user_question`）判定，构造 `Command(resume=...)`，不查 DB、不调 `dispatch_interrupts`；`dispatch_interrupts` 只归一为 `InterruptOutcome(status="built")`，无 prepare、无建单；恢复后同一会话仍可 `turn`；存在未恢复 pending 中断时 `turn` 返回 `session.pending_interrupt`；裁决缺失或取值未知按 `deny` 处理并记 warning。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_interrupt.py` → **通过**，7 passed。`ask` 轮 `status=interrupt`、`outcome.interrupts[0].toolCallId` 命中、工具零执行；`resume` 放行后工具执行一次且结果回模型；拒绝时工具零执行、模型收到拒绝说明；错误 `interruptId` 返回 `resume_interrupt_not_found` 且随后用正确 id 仍可恢复；缺 `interruptId` 返回 `resume_payload_unsupported`；存在 pending 时 `turn` 返回 `session.pending_interrupt`；重放不再上报同一 `tool_pre`；`HeadlessInterruptProcessor` 不 prepare / 不建单（同轮验证 `create_tool_approval` 0 次见 T-23）。
 
 ## T-21 `status=interrupt` 收尾与事件契约
 
@@ -258,7 +265,8 @@
 - 需求: REQ-17
 - 依赖: T-20
 - 验证: `make -C src/agent test path=tests/headless/test_hook_interrupt.py`、`make -C src/agent test path=tests/headless/test_turn.py`
-- [ ] 完成标准：`RUN_FINISHED(outcome.type="interrupt")` 时本轮 `status=interrupt`、响应 `ok=true` 且 `result.interrupts` 回传该中断（`id` / `reason` / `message` / `toolCallId` / `metadata`）；不再判成 `finished` 或 `error`；中断轮仍把已产出的 assistant 文本写入账本；`finished` / `cancelled` / `error` 三态语义与一期一致（`test_turn.py` / `test_lifecycle.py` 全绿）。
+- [x] 完成标准：`RUN_FINISHED(outcome.type="interrupt")` 时本轮 `status=interrupt`、响应 `ok=true` 且 `result.interrupts` 回传该中断（`id` / `reason` / `message` / `toolCallId` / `metadata`）；不再判成 `finished` 或 `error`；中断轮仍把已产出的 assistant 文本写入账本；`finished` / `cancelled` / `error` 三态语义与一期一致（`test_turn.py` / `test_lifecycle.py` 全绿）。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_interrupt.py` → **通过**，7 passed；`make -C src/agent test path=tests/headless/test_turn.py` → **通过**，6 passed；`make -C src/agent test path=tests/headless/test_lifecycle.py` → **通过**，6 passed。中断轮响应 `ok=true` + `status=interrupt` + `result.interrupts`（`id` / `reason` / `message` / `toolCallId` / `metadata`），事件侧仍为 `RUN_FINISHED(outcome=interrupt)`；恢复轮把 assistant 文本写入账本、user 原文不变；`finished` / `cancelled` / `error` 三态语义不变（一期 `test_lifecycle` 中「中断负载一律 unsupported」的用例按 REQ-17 改为「未命中 pending → `resume_interrupt_not_found`」）。
 
 ## T-22 三点端到端用例与工具注入接缝
 
@@ -267,7 +275,8 @@
 - 需求: REQ-15、REQ-16、REQ-17
 - 依赖: T-19、T-21
 - 验证: `make -C src/agent test path=tests/headless/test_hook_points.py`
-- [ ] 完成标准：`create.params.tools` 支持进程内注入工具（stdio 下不承诺，文档写明），用例以注入的 fake 工具驱动 `tool_pre` / `tool_post`；`tool_pre=deny` 时工具本体调用次数为 0 且模型收到含 `reason` 的结果、该轮 `finished`；**`tool_pre=allow` 时既有 ITSM 审批 wrapper 仍被调用**（带 `approval` metadata 的 fake 工具断言审批入口命中，证明 hook 未绕开权限闸门）；`tool_post=block` 时模型可见结果为 `reason` 且不含原结果，`content` 时等于该值，`context` 时该文本出现在紧接的模型请求中，三种情形工具调用次数均为 1；`tool_pre=ask` 时该轮 `status=interrupt` 且 `outcome.interrupts[0].toolCallId` 等于该次 `tool_use_id`、`reason` 为 `aidev:hook_ask`，随后 `resume` 放行时工具执行且结果回模型、`resume` 拒绝时工具零调用且模型收到拒绝说明；`ask` 重放不重复上报同一 `tool_pre`。
+- [x] 完成标准：`create.params.tools` 支持进程内注入工具（stdio 下不承诺，文档写明），用例以注入的 fake 工具驱动 `tool_pre` / `tool_post`；`tool_pre=deny` 时工具本体调用次数为 0 且模型收到含 `reason` 的结果、该轮 `finished`；**`tool_pre=allow` 时既有 ITSM 审批 wrapper 仍被调用**（带 `approval` metadata 的 fake 工具断言审批入口命中，证明 hook 未绕开权限闸门）；`tool_post=block` 时模型可见结果为 `reason` 且不含原结果，`content` 时等于该值，`context` 时该文本出现在紧接的模型请求中，三种情形工具调用次数均为 1；`tool_pre=ask` 时该轮 `status=interrupt` 且 `outcome.interrupts[0].toolCallId` 等于该次 `tool_use_id`、`reason` 为 `aidev:hook_ask`，随后 `resume` 放行时工具执行且结果回模型、`resume` 拒绝时工具零调用且模型收到拒绝说明；`ask` 重放不重复上报同一 `tool_pre`。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_points.py` → **通过**，7 passed。`tool_pre=deny`：工具 0 次、模型收到 `reason`、该轮 `finished`；`tool_pre=allow` 且工具带 `approval` metadata：该轮以 `aidev:tool_approval` 中断收尾（证明 hook 未绕开审批），随后 `resume` 返回 `resume_interrupt_unsupported`；`tool_post` 的 block / content / context 三种情形工具均执行 1 次，模型可见结果分别为 `reason` / 指定值 / 原结果 + 追加文本；未知裁决按最宽松值放行并写一条 `hook_degraded(unknown_decision)`；一轮内三点顺序为 `session_start → tool_pre → tool_post`，`id` 为 `t1#h1~h3`。
 
 ## T-23 无平台依赖与依赖隔离（中断路径）
 
@@ -276,7 +285,8 @@
 - 需求: REQ-17、REQ-19
 - 依赖: T-21
 - 验证: `make -C src/agent test path=tests/headless/test_hook_no_platform.py`
-- [ ] 完成标准：完整走一次 `ask → 中断 → resume` 后，子进程内 `sys.modules` 无 `django` / `blueapps`；`HeadlessResourceManager.get_client` 计数桩为 0；无单据创建调用（以 mock 断言）；注入的 `auth_headers` 与 hook 载荷不出现在 stdout / stderr；`pyproject.toml` / `uv.lock` 无 diff 且无 dsh 相关包。
+- [x] 完成标准：完整走一次 `ask → 中断 → resume` 后，子进程内 `sys.modules` 无 `django` / `blueapps`；`HeadlessResourceManager.get_client` 计数桩为 0；无单据创建调用（以 mock 断言）；注入的 `auth_headers` 与 hook 载荷不出现在 stdout / stderr；`pyproject.toml` / `uv.lock` 无 diff 且无 dsh 相关包。
+- 验证记录：`make -C src/agent test path=tests/headless/test_hook_no_platform.py` → **通过**，1 passed。子进程完整走 `ask → 中断 → resume`：`sys.modules` 无 `django` / `blueapps`；`HeadlessResourceManager.get_client` 计数为 0；`create_tool_approval` 计数为 0（中断轮与恢复轮都不建单）；注入的 `auth_headers` 值不出现在 stdout / stderr；`src/agent/pyproject.toml` 与 `uv.lock` 无 diff、无 dsh 相关包。
 
 ## T-24 接入文档 hooks 一节
 
@@ -285,7 +295,8 @@
 - 需求: REQ-20
 - 依赖: T-22
 - 验证: 手工评审依据：文档自检清单（配置字段与默认值 / 两类协议行与 `id` 派生 / 三点载荷与裁决字段 / `ask` 与中断恢复的宿主义务 / fail-open 与 `hook_degraded` / A 档插件接入与钉版本 六节齐备）
-- [ ] 完成标准：六节齐备；`create.params.hooks` 字段与默认值、`#h<n>` 派生规则、三个点的载荷与裁决取值均写明；`ask` 后宿主如何组装 `resume` 负载（`interruptId` 取自 `RUN_FINISHED.outcome.interrupts[0].id`）写明；`hook_degraded` 与 `timeout_ms` 语义写明；**写明 hook 不替代 ITSM 权限审批、headless 本期只接线 ask 类中断（ITSM 中断 `resume` 返回 `resume_interrupt_unsupported`）**；A 档插件复用宿主 hooks 原语属半私有导出、需钉版本并加 import 冒烟；全文不复制宿主源码，不把半私有导出写成稳定 API。
+- [x] 完成标准：六节齐备；`create.params.hooks` 字段与默认值、`#h<n>` 派生规则、三个点的载荷与裁决取值均写明；`ask` 后宿主如何组装 `resume` 负载（`interruptId` 取自 `RUN_FINISHED.outcome.interrupts[0].id`）写明；`hook_degraded` 与 `timeout_ms` 语义写明；**写明 hook 不替代 ITSM 权限审批、headless 本期只接线 ask 类中断（ITSM 中断 `resume` 返回 `resume_interrupt_unsupported`）**；A 档插件复用宿主 hooks 原语属半私有导出、需钉版本并加 import 冒烟；全文不复制宿主源码，不把半私有导出写成稳定 API。
+- 验证记录：手工评审（依据任务定义的五节自检清单：配置字段与默认值 / 两类协议行与 `id` 派生 / 三点载荷与裁决字段 / `ask` 与中断恢复的宿主义务 / fail-open 与 `hook_degraded` / A 档插件接入与钉版本）→ **通过**。`docs/agent/HEADLESS_HOST.md` 新增第六节（6.1~6.6），`docs/agent/readme.md` 索引补充 hooks 一节；全文未复制宿主源码，半私有导出明确标注「需钉版本 + import 冒烟、不是稳定 API」；另在 §2.2 / §2.3 / §2.5 / §三 同步了 `hooks` 字段、`status=interrupt`、新增错误码与「只接线 ask 类中断」的口径。
 
 ## T-25 回归与关闭态零回归封板
 
@@ -294,7 +305,8 @@
 - 需求: REQ-19
 - 依赖: T-17、T-19、T-22、T-23
 - 验证: `make -C src/agent test path=tests/headless`、`make -C src/agent test path=tests/core`、`make -C src/agent test path=tests/services`
-- [ ] 完成标准：三组全绿且无新增 skip；不带 `hooks` 的 headless 运行 stdout 行集合与一期基线逐字节一致，无 `type=request`、无 `hook_degraded`；`pyproject.toml` / `uv.lock` 无 diff；AG-UI 事件类型集合未新增（与基线事件名清单比对）；`tests/core/interrupt/` 与 `tests/services/test_resume_events.py` 保持通过。
+- [x] 完成标准：三组全绿且无新增 skip；不带 `hooks` 的 headless 运行 stdout 行集合与一期基线逐字节一致，无 `type=request`、无 `hook_degraded`；`pyproject.toml` / `uv.lock` 无 diff；AG-UI 事件类型集合未新增（与基线事件名清单比对）；`tests/core/interrupt/` 与 `tests/services/test_resume_events.py` 保持通过。
+- 验证记录：`make -C src/agent test path=tests/headless` → **通过**，98 passed / 0 skipped；`make -C src/agent test path=tests/core` → **通过**，2176 passed / 9 skipped / 39 deselected / 4 xfailed；`make -C src/agent test path=tests/services` → **通过**，754 passed / 40 skipped / 5 deselected。与一期 T-13 记录相比 core +21、services +8（即本变更新增用例），headless 从 54 增至 98，skip 数未增加。关闭态零回归：以 `git worktree` 检出基线 `55e36306` 与当前工作区各跑同一段「不带 hooks」的 headless 一轮（同一 fake 端点、同一输入），把不可确定的 `uuid` / `lc_run` id / 时间戳 / 浮点耗时归一后，两侧 stdout 15 行逐字节一致；当前侧 `type=request` 行 0 条、`hook_degraded` 0 条。`ag_ui.core.EventType` 取值集合两侧完全相同（26 项），未新增事件类型。`src/agent/pyproject.toml` / `src/agent/uv.lock` 无 diff；`tests/core/interrupt/` 与 `tests/services/test_resume_events.py` 全部保持通过。
 
 ## T-26 仓外集成验收证据（ACC-23）
 
@@ -303,4 +315,5 @@
 - 需求: REQ-13、REQ-18、REQ-20
 - 依赖: T-24
 - 验证: 手工依据：按 T-24 文档接入仓外插件后，在真实 dsh 中执行带 `exit 2` 的 `PreToolUse` 与输出 `additionalContext` 的 `PostToolUse`
-- [ ] 完成标准：真实 dsh 中被 `PreToolUse` 拦下的工具不执行、其 stderr 文本进入模型输入、宿主会话中出现 `hook/invoked` 与 `hook/result(decision=deny)`；记录命令、关键日志与结论。缺插件时如实记录「未取证」，不影响 ACC-14 ~ ACC-22 的判定。
+- [x] 完成标准：真实 dsh 中被 `PreToolUse` 拦下的工具不执行、其 stderr 文本进入模型输入、宿主会话中出现 `hook/invoked` 与 `hook/result(decision=deny)`；记录命令、关键日志与结论。缺插件时如实记录「未取证」，不影响 ACC-14 ~ ACC-22 的判定。
+- 验证记录：**未取证（如实记录）**。仓外 A 档插件的 hooks 引擎（读 `hooks.json` / matcher / 跑命令 / 合并裁决 / 写 `hook/invoked` 与 `hook/result` 审计）本期未实现，`agent-hook-acceptance/dsh-plugin` 仍是纯桥接件（无 hook 能力），因此无法在真实 dsh 中产生 `PreToolUse` / `PostToolUse` 证据。证据说明与后续取证步骤见节点工作区 `acceptance/hooks/README.md`；缺插件不影响 ACC-14 ~ ACC-22 的判定（已由 T-14 ~ T-23 的仓内 fake 宿主用例覆盖）。
