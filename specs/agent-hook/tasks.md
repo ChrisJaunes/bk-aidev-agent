@@ -162,3 +162,145 @@
 - 验证: `make -C src/agent test path=tests/services`、`make -C src/agent test path=tests/core`、`make -C src/agent test path=tests/headless`
 - [x] 完成标准：`tests/services`、`tests/core`、`tests/headless` 三组全绿且无新增 skip；`src/agent/pyproject.toml` 与 `uv.lock` 无 diff；AG-UI 事件类型集合未新增（以基线事件名清单比对）；会话落库相关用例（`tests/core/interrupt/`、`tests/services/test_resume_events.py`）保持通过，证明未启用 headless 时进程行为不变。
 - 验证记录：`make -C src/agent test path=tests/services` → **通过**，746 passed / 40 skipped / 5 deselected；`make -C src/agent test path=tests/core` → **通过**，2155 passed / 9 skipped / 39 deselected / 4 xfailed；`make -C src/agent test path=tests/headless` → **通过**，54 passed / 0 skipped。本变更新增用例未使用 `skip` / `xfail`；`src/agent/pyproject.toml` 与 `src/agent/uv.lock` 无 diff；未新增 AG-UI 事件类型（headless 复用 `ag_ui.core` 原对象）；`tests/core/interrupt/` 与 `tests/services/test_resume_events.py` 全部保持通过。
+
+---
+
+# 第二期追加：Agent Hook 点 任务清单
+
+- 变更名: agent-hook（沿用）
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 规格: specs/agent-hook/spec.md（「第二期追加」章节）
+- 方案: specs/agent-hook/plan.md（「第二期追加」章节，决策 D-10 ~ D-18）
+- 人工预览: 无可预览（hook 只在宿主显式下发配置时启用；未部署可预览环境）
+
+## 需求覆盖
+
+| 需求 | 任务 |
+| --- | --- |
+| REQ-13 hook 点启用方式与执行归属 | T-14、T-16 |
+| REQ-14 `session_start` | T-17 |
+| REQ-15 `tool_pre` | T-14、T-15、T-22 |
+| REQ-16 `tool_post` | T-14、T-15、T-22 |
+| REQ-17 `ask` 与 headless 中断恢复 | T-20、T-21、T-23 |
+| REQ-18 协议 hook 往返 | T-18、T-19 |
+| REQ-19 关闭态零回归与凭据约束 | T-19、T-23、T-25 |
+| REQ-20 接入文档 hooks 一节 | T-24 |
+
+验收对应：ACC-14→T-25，ACC-15→T-17，ACC-16→T-22，ACC-17→T-22，ACC-18→T-21/T-22，ACC-19→T-18，ACC-20→T-19，ACC-21→T-20，ACC-22→T-23，ACC-23→T-26。
+
+## T-14 core hook 协议与四类工具 wrapper
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/core/hooks/__init__.py`、`bus.py`、`wrappers.py`、`src/agent/tests/core/nodes/tool/test_hook_wrappers.py`
+- 需求: REQ-13、REQ-15、REQ-16
+- 依赖: 无
+- 验证: `make -C src/agent test path=tests/core/nodes/tool/test_hook_wrappers.py`
+- [ ] 完成标准：`bus.py` 定义 `HookPoint` 与 `HookBusProtocol`（`enabled` / `points` / `emit`，鸭子类型，不依赖 headless）；`wrappers.py` 提供 `tool_pre` / `tool_post` 的同步与异步 wrapper 工厂；`tool_pre` 的 `deny` 返回 `ToolMessage(status="error", content=reason)` 且不调用 `execute`，`ask` 调 `interrupt()` 抛 `GraphInterrupt`，`allow` 原样 `execute`；`tool_post` 的 `block` / `content` / `context` 只改同一条 `ToolMessage`，`tool_call_id` / `name` / `additional_kwargs` 保持不变；`context` 与 `content` 同时给出时先替换再追加；未知裁决按最宽松值处理；用例覆盖四点裁决与异常路径。
+
+## T-15 `build_tool_node` 挂点与 wrapper 顺序不变式
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/core/nodes/tool/node.py`、`src/agent/tests/core/nodes/tool/test_tool_node_hook_order.py`
+- 需求: REQ-15、REQ-16
+- 依赖: T-14
+- 验证: `make -C src/agent test path=tests/core/nodes/tool/test_tool_node_hook_order.py`
+- [ ] 完成标准：`build_tool_node` 新增可选 `hooks` 参数（默认 `None`）；`hooks is None` 或点位未启用时 wrapper 链与基线逐项一致（断言链上成员与顺序全等）；启用时 `tool_pre` 位于链首（先于不可信净化 / 脱敏 / ITSM 审批）、`tool_post` 位于链尾（紧贴工具本体、在 `deduplicate` 之内）；带 `approval` metadata 的 fake 工具在 `tool_pre=deny` 时审批调用次数为 0。
+
+## T-16 构建期透传 hooks / hook_context / interrupt_processor
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/services/agent/registry.py`、`services/agent/factory.py`、`services/agent/chat.py`、`services/common_agent/agent.py`、`core/graphs/react/graph.py`、`pydantic_models.py`、`src/agent/tests/services/agent/test_agent_factory_hooks_passthrough.py`
+- 需求: REQ-13
+- 依赖: T-15
+- 验证: `make -C src/agent test path=tests/services/agent/test_agent_factory_hooks_passthrough.py`
+- [ ] 完成标准：`create(hooks=..., hook_context=..., interrupt_processor=...)` 经 `_make_build_context` 落到 `ChatBuildExtras` 同名字段，再由 `ChatCompletionAgent.build` 落到实例字段并进入 `get_agent_executor(...)`；`ReActAgentBuilder` 新增 `set_hooks` / `set_hook_context`；未传三者时字段均为 `None`，`build_tool_node` 与模型节点装配与基线完全一致；`build` 不覆盖已被注入的 `interrupt_processor`（`chat.py:522` 的惰性构造仅在 `None` 时生效）；平台路径（不传）现有用例全绿。
+
+## T-17 `session_start` 触发与 system prompt 注入
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/headless/session.py`、`headless/hooks.py`、`core/graphs/react/graph.py`、`src/agent/tests/headless/test_hook_session_start.py`
+- 需求: REQ-14
+- 依赖: T-16
+- 验证: `make -C src/agent test path=tests/headless/test_hook_session_start.py`
+- [ ] 完成标准：`turn` 与 `resume` 每次驱动前各触发一次 `session_start`，载荷含 `session_code` / `turn_id` / `first_turn` / `input`；首轮 `first_turn=true`、同会话第二轮 `false`；`context` 非空时 fake 模型收到的本轮请求体包含该文本且位于用户输入之前；会话账本中的 user 原文与 `turn_id` 不变；`context` 为空或降级时本轮照常 `finished` 且不报错。
+
+## T-18 协议两类新行与答复分流
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/headless/protocol.py`、`headless/cli.py`、`headless/hooks.py`、`src/agent/tests/headless/test_hook_protocol.py`
+- 需求: REQ-18
+- 依赖: 无
+- 验证: `make -C src/agent test path=tests/headless/test_hook_protocol.py`
+- [ ] 完成标准：`Dispatcher.handle_line` 能区分答复行（`ok` 在、`method` 不在）并投递到 `HookPendingRouter`；答复行不产生响应行、不被报成 `protocol.unknown_method`、不进入 `parse_request`；hook 请求行 `id` 为 `<本轮请求 id>#h<n>`，同一会话内 `n` 自 1 递增且不重复；请求行与事件行共用写锁，并发场景下 stdout 无交错行；未知/畸形答复行不使进程退出。
+
+## T-19 `HeadlessHookBus`：超时、取消、fail-open 与 `hook_degraded`
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/headless/hooks.py`、`src/agent/tests/headless/test_hook_degrade.py`
+- 需求: REQ-18、REQ-19
+- 依赖: T-18
+- 验证: `make -C src/agent test path=tests/headless/test_hook_degrade.py`
+- [ ] 完成标准：`HookConfig` 解析 `timeout_ms`（缺省 10000，非正整数报 `hook.value_invalid`）与 `points`（缺省三点全开，未知点位报 `hook.value_invalid`）；超时 / 宿主 `ok=false` / `result` 形状不合法 / 未知 `decision` 四种情形按最宽松裁决继续，并各写恰好一条 `CUSTOM` 事件 `hook_degraded`（`value` 含 `point` 与 `reason`），不新增 `EventType`；等待期间收到 `cancel` 时早于 `timeout_ms` 返回并按取消收尾，且不写 `hook_degraded`；关闭态下不产生任何 `type=request` 行与 `hook_degraded` 事件。
+
+## T-20 headless 中断恢复：`HeadlessInterruptProcessor`
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/headless/interrupts.py`、`headless/session.py`、`headless/cli.py`、`headless/errors.py`、`src/agent/tests/headless/test_hook_interrupt.py`
+- 需求: REQ-17
+- 依赖: T-16
+- 验证: `make -C src/agent test path=tests/headless/test_hook_interrupt.py`
+- [ ] 完成标准：`resume` 接受 `{"interruptId", "toolCallId"?, "decision", "reason"?}`（允许单元素列表），校验命中上一轮 pending 中断；未命中返回 `ok=false` + `resume_interrupt_not_found`，且随后用命中的 `interruptId` 仍能正常恢复；`HeadlessInterruptProcessor.get_resume_input` 只读 `tasks`、构造 `Command(resume=...)`，不查 DB、不调 `dispatch_interrupts`；`dispatch_interrupts` 只归一为 `InterruptOutcome(status="built")`，无 prepare、无建单；恢复后同一会话仍可 `turn`；存在未恢复 pending 中断时 `turn` 返回 `session.pending_interrupt`；裁决缺失或取值未知按 `deny` 处理并记 warning。
+
+## T-21 `status=interrupt` 收尾与事件契约
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/headless/events.py`、`headless/session.py`、`headless/cli.py`、`src/agent/tests/headless/test_hook_interrupt.py`
+- 需求: REQ-17
+- 依赖: T-20
+- 验证: `make -C src/agent test path=tests/headless/test_hook_interrupt.py`、`make -C src/agent test path=tests/headless/test_turn.py`
+- [ ] 完成标准：`RUN_FINISHED(outcome.type="interrupt")` 时本轮 `status=interrupt`、响应 `ok=true` 且 `result.interrupts` 回传该中断（`id` / `reason` / `message` / `toolCallId` / `metadata`）；不再判成 `finished` 或 `error`；中断轮仍把已产出的 assistant 文本写入账本；`finished` / `cancelled` / `error` 三态语义与一期一致（`test_turn.py` / `test_lifecycle.py` 全绿）。
+
+## T-22 三点端到端用例与工具注入接缝
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/aidev_agent/headless/cli.py`、`headless/session.py`、`src/agent/tests/headless/test_hook_points.py`、`src/agent/tests/headless/_fake_host.py`
+- 需求: REQ-15、REQ-16、REQ-17
+- 依赖: T-19、T-21
+- 验证: `make -C src/agent test path=tests/headless/test_hook_points.py`
+- [ ] 完成标准：`create.params.tools` 支持进程内注入工具（stdio 下不承诺，文档写明），用例以注入的 fake 工具驱动 `tool_pre` / `tool_post`；`tool_pre=deny` 时工具本体调用次数为 0 且模型收到含 `reason` 的结果、该轮 `finished`；`tool_post=block` 时模型可见结果为 `reason` 且不含原结果，`content` 时等于该值，`context` 时该文本出现在紧接的模型请求中，三种情形工具调用次数均为 1；`tool_pre=ask` 时该轮 `status=interrupt` 且 `outcome.interrupts[0].toolCallId` 等于该次 `tool_use_id`，随后 `resume` 放行时工具执行且结果回模型、`resume` 拒绝时工具零调用且模型收到拒绝说明；`ask` 重放不重复上报同一 `tool_pre`。
+
+## T-23 无平台依赖与依赖隔离（中断路径）
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `src/agent/tests/headless/test_hook_no_platform.py`
+- 需求: REQ-17、REQ-19
+- 依赖: T-21
+- 验证: `make -C src/agent test path=tests/headless/test_hook_no_platform.py`
+- [ ] 完成标准：完整走一次 `ask → 中断 → resume` 后，子进程内 `sys.modules` 无 `django` / `blueapps`；`HeadlessResourceManager.get_client` 计数桩为 0；无单据创建调用（以 mock 断言）；注入的 `auth_headers` 与 hook 载荷不出现在 stdout / stderr；`pyproject.toml` / `uv.lock` 无 diff 且无 dsh 相关包。
+
+## T-24 接入文档 hooks 一节
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: `docs/agent/HEADLESS_HOST.md`、`docs/agent/readme.md`
+- 需求: REQ-20
+- 依赖: T-22
+- 验证: 手工评审依据：文档自检清单（配置字段与默认值 / 两类协议行与 `id` 派生 / 三点载荷与裁决字段 / `ask` 与中断恢复的宿主义务 / fail-open 与 `hook_degraded` / A 档插件接入与钉版本 六节齐备）
+- [ ] 完成标准：六节齐备；`create.params.hooks` 字段与默认值、`#h<n>` 派生规则、三个点的载荷与裁决取值均写明；`ask` 后宿主如何组装 `resume` 负载（`interruptId` 取自 `RUN_FINISHED.outcome.interrupts[0].id`）写明；`hook_degraded` 与 `timeout_ms` 语义写明；A 档插件复用宿主 hooks 原语属半私有导出、需钉版本并加 import 冒烟；全文不复制宿主源码，不把半私有导出写成稳定 API。
+
+## T-25 回归与关闭态零回归封板
+
+- 仓库: git@github.com:ChrisJaunes/bk-aidev-agent.git
+- 文件: 无新增文件（回归执行与结论记录）
+- 需求: REQ-19
+- 依赖: T-17、T-19、T-22、T-23
+- 验证: `make -C src/agent test path=tests/headless`、`make -C src/agent test path=tests/core`、`make -C src/agent test path=tests/services`
+- [ ] 完成标准：三组全绿且无新增 skip；不带 `hooks` 的 headless 运行 stdout 行集合与一期基线逐字节一致，无 `type=request`、无 `hook_degraded`；`pyproject.toml` / `uv.lock` 无 diff；AG-UI 事件类型集合未新增（与基线事件名清单比对）；`tests/core/interrupt/` 与 `tests/services/test_resume_events.py` 保持通过。
+
+## T-26 仓外集成验收证据（ACC-23）
+
+- 仓库: 本项目（证据留在节点工作区，不提交本仓、不发布）
+- 文件: `acceptance/hooks/`（`hooks.json`、A 档插件、运行日志与结论）
+- 需求: REQ-13、REQ-18、REQ-20
+- 依赖: T-24
+- 验证: 手工依据：按 T-24 文档接入仓外插件后，在真实 dsh 中执行带 `exit 2` 的 `PreToolUse` 与输出 `additionalContext` 的 `PostToolUse`
+- [ ] 完成标准：真实 dsh 中被 `PreToolUse` 拦下的工具不执行、其 stderr 文本进入模型输入、宿主会话中出现 `hook/invoked` 与 `hook/result(decision=deny)`；记录命令、关键日志与结论。缺插件时如实记录「未取证」，不影响 ACC-14 ~ ACC-22 的判定。
