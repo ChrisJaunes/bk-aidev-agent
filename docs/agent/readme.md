@@ -139,6 +139,8 @@ cruft update
 - 宿主如何以组合 / profile 配置停用默认 Agent 实现并接入 `python -m aidev_agent.headless`
 - NDJSON 五方法（`create` / `turn` / `resume` / `cancel` / `close`）映射与报文样例
 - 支持面与不支持面（不支持能力必须显式报错）
+- hooks 一节：`session_start` / `tool_pre` / `tool_post` 三点配置、两类协议行与 `#h<n>` 派生、
+  三点载荷与裁决、`ask` 与中断恢复的宿主义务、fail-open 与 `hook_degraded`、A 档插件接入
 - 用本机 fake 模型离线验收一轮的步骤
 - 日志与凭据约束
 
