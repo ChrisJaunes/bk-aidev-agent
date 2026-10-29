@@ -18,7 +18,7 @@ to the current version of the project delivered to anyone in the future.
 
 import logging
 from collections.abc import Awaitable, Sequence
-from typing import Callable
+from typing import Any, Callable
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
@@ -27,6 +27,14 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import AsyncToolCallWrapper, ToolCallRequest, ToolCallWrapper
 from langgraph.types import Command
 
+from aidev_agent.core.hooks import (
+    HookPoint,
+    bus_enabled,
+    build_hook_post_async_wrapper,
+    build_hook_post_sync_wrapper,
+    build_hook_pre_async_wrapper,
+    build_hook_pre_sync_wrapper,
+)
 from aidev_agent.pydantic_models import SecuritySettings
 
 from .approval_wrapper import itsm_approval_async_wrapper, itsm_approval_sync_wrapper
@@ -189,6 +197,7 @@ def build_tool_node(
     security_settings: SecuritySettings | None = None,
     wrappers: Sequence[ToolCallWrapper] | None = None,
     async_wrappers: Sequence[AsyncToolCallWrapper] | None = None,
+    hooks: Any = None,
 ) -> ToolNode:
     """构造带有中间件支持的 ToolNode。
 
@@ -209,6 +218,10 @@ def build_tool_node(
             （配置缺失不静默降级为默认规则脱敏）。
         wrappers: 可选的自定义同步包装器列表，会在内置包装器之后执行。
         async_wrappers: 可选的自定义异步包装器列表，会在内置包装器之后执行。
+        hooks: 可选的 hook 总线（``HookBusProtocol`` 鸭子类型）；``None`` 或点位未启用时
+            一个 wrapper 都不插，链与基线逐字一致（REQ-19）。启用时 ``tool_pre`` 位于链首
+            （先于不可信净化 / 脱敏 / ITSM 审批），``tool_post`` 位于链尾（紧贴工具本体、
+            在 ``deduplicate`` 之内）。
 
     Returns:
         配置了中间件的 ToolNode 实例。
@@ -233,6 +246,12 @@ def build_tool_node(
     # 组合包装器：内置包装器 + 用户自定义包装器
     sync_wrapper_list: list[ToolCallWrapper] = []
     async_wrapper_list: list[AsyncToolCallWrapper] = []
+
+    # hook 的 tool_pre 位于链首：先于不可信净化 / 脱敏 / ITSM 审批，因此 deny 能在
+    # 审批与净化之前早退（REQ-15）。点位未启用时不插，链与基线逐字一致（REQ-19）。
+    if bus_enabled(hooks, HookPoint.TOOL_PRE):
+        sync_wrapper_list.insert(0, build_hook_pre_sync_wrapper(hooks))
+        async_wrapper_list.insert(0, build_hook_pre_async_wrapper(hooks))
 
     # 安全防护置于结果出口，作为工具结果进入模型前的最后一道净化闸门。
     # 两个维度独立开关：不可信净化在外层、结果脱敏在内层 —— 响应流为「内→外」，
@@ -280,6 +299,11 @@ def build_tool_node(
     # Keep approval and custom wrappers outside result reuse.
     sync_wrapper_list.append(deduplicate_sync)
     async_wrapper_list.append(deduplicate_async)
+    # hook 的 tool_post 位于链尾：紧贴工具本体、在 deduplicate 之内 —— 批内去重命中时
+    # 工具本体未执行，tool_post 不触发（与「工具本体返回后」的定义一致，方案 D-10）。
+    if bus_enabled(hooks, HookPoint.TOOL_POST):
+        sync_wrapper_list.append(build_hook_post_sync_wrapper(hooks))
+        async_wrapper_list.append(build_hook_post_async_wrapper(hooks))
     # 构建wrapper链
     final_sync_wrapper = _chain_tool_call_wrappers(sync_wrapper_list)
     final_async_wrapper = _chain_async_tool_call_wrappers(async_wrapper_list)
