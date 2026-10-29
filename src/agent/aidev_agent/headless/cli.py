@@ -20,6 +20,7 @@ from .errors import (
     HeadlessError,
 )
 from .events import build_error_event
+from .hooks import HookConfig, HookPendingRouter
 from .protocol import (
     METHOD_CANCEL,
     METHOD_CLOSE,
@@ -30,6 +31,7 @@ from .protocol import (
     encode_error,
     encode_event,
     encode_result,
+    is_hook_reply,
     parse_request,
     require_param,
 )
@@ -84,13 +86,24 @@ class Dispatcher:
     def __init__(self, *, stream: TextIO, registry: SessionRegistry | None = None):
         self._stream = stream
         self._write_lock = threading.Lock()
-        self.registry = registry or SessionRegistry(stream=stream, write_lock=self._write_lock)
+        self.hook_router = HookPendingRouter()
+        self.registry = registry or SessionRegistry(
+            stream=stream,
+            write_lock=self._write_lock,
+            hook_router=self.hook_router,
+            write_line=self._write,
+        )
         self._workers: list[threading.Thread] = []
         self._workers_lock = threading.Lock()
 
     # ---------------- 行入口 ----------------
 
     def handle_line(self, line: str) -> None:
+        payload = _try_json(line)
+        if is_hook_reply(payload):
+            # 答复行：投递给等待方，不产生响应行、不进请求解析、不报未知方法（REQ-18）
+            self.hook_router.deliver(payload)
+            return
         try:
             request = parse_request(line)
         except HeadlessError as exc:
@@ -204,6 +217,8 @@ class Dispatcher:
             username=_optional_str(params, "username"),
             checkpointer=params.get("checkpointer"),
             event_sink=params.get("event_sink"),
+            hooks=_optional_hooks(params),
+            tools=_optional_tools(params),
         )
         if config.base_url:
             from aidev_agent.config import settings
@@ -268,13 +283,18 @@ class Dispatcher:
 
 def _lenient_request_id(line: str) -> str:
     """协议解析失败时尽量取回请求 id，便于宿主机按 id 聚合错误。"""
-    try:
-        payload = json.loads(line)
-    except (ValueError, TypeError):
-        return ""
+    payload = _try_json(line)
     if isinstance(payload, dict) and isinstance(payload.get("id"), str):
         return payload["id"]
     return ""
+
+
+def _try_json(line: str) -> Any:
+    """尽量把一行解析成 JSON 对象；失败返回 ``None``（不抛错、不影响进程可用性）。"""
+    try:
+        return json.loads(line)
+    except (ValueError, TypeError):
+        return None
 
 
 def _optional_str(container: dict[str, Any], name: str) -> str | None:
@@ -294,6 +314,24 @@ def _optional_messages(params: dict[str, Any]) -> list[dict] | None:
         raise HeadlessError(
             PROTOCOL_INVALID_PARAMS, "字段 messages 类型不符（期望 dict 列表）", {"fields": ["messages"]}
         )
+    return value
+
+
+def _optional_hooks(params: dict[str, Any]) -> HookConfig | None:
+    """解析 ``create.params.hooks``；不传即完全关闭 hook 层（REQ-19）。"""
+    value = params.get("hooks")
+    if value is None:
+        return None
+    return HookConfig.parse(value)
+
+
+def _optional_tools(params: dict[str, Any]) -> list | None:
+    """``create.params.tools``：进程内注入工具（仅嵌入式 / 测试接缝，不是协议承诺）。"""
+    value = params.get("tools")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise HeadlessError(PROTOCOL_INVALID_PARAMS, "字段 tools 类型不符（期望工具列表）", {"fields": ["tools"]})
     return value
 
 

@@ -19,6 +19,8 @@ class Harness:
         self.out = io.StringIO()
         self.dispatcher = dispatcher or Dispatcher(stream=self.out)
         self._lock = threading.Lock()
+        #: 已被 fake 宿主答复过的 hook 请求 id（跨 FakeHost 实例共享，避免重复处置）
+        self.handled_hook_ids: set[str] = set()
 
     # ---------------- 发送 ----------------
 

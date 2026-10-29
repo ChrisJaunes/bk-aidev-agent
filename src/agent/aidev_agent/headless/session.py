@@ -22,6 +22,7 @@ from typing import Any, Callable, TextIO
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from aidev_agent.core.hooks import HookPoint
 from aidev_agent.enums import AgentBuildType
 from aidev_agent.exceptions import AgentFactoryError
 from aidev_agent.pydantic_models import ExecuteKwargs
@@ -30,13 +31,30 @@ from aidev_agent.services.agent.factory import agent_factory
 from .errors import (
     AGENT_BUILD_FAILED,
     AGENT_INTERNAL_ERROR,
+    RESUME_INTERRUPT_NOT_FOUND,
+    RESUME_INTERRUPT_UNSUPPORTED,
     RESUME_PAYLOAD_UNSUPPORTED,
     SESSION_BUSY_CANCELLED,
     SESSION_CLOSED,
     SESSION_NOT_FOUND,
+    SESSION_PENDING_INTERRUPT,
     HeadlessError,
 )
-from .events import STATUS_ERROR, SessionEventWriter
+from .events import STATUS_ERROR, STATUS_INTERRUPT, SessionEventWriter
+from .hooks import (
+    DEGRADE_INVALID_SHAPE,
+    HookChannel,
+    HookConfig,
+    HookPendingRouter,
+    HeadlessHookBus,
+    apply_session_start,
+)
+from .interrupts import (
+    ITSM_APPROVAL_REASON,
+    RESUMABLE_REASONS,
+    HeadlessInterruptProcessor,
+    match_pending_interrupt,
+)
 from .resource_manager import HeadlessLedger, HeadlessResourceManager
 
 logger = logging.getLogger("aidev-agent.headless")
@@ -65,6 +83,8 @@ class SessionConfig:
         username: str | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
         event_sink: MessageSink | None = None,
+        hooks: HookConfig | None = None,
+        tools: list | None = None,
     ) -> None:
         self.agent_code = agent_code
         self.model = model
@@ -75,6 +95,8 @@ class SessionConfig:
         self.username = username
         self.checkpointer = checkpointer
         self.event_sink = event_sink
+        self.hooks = hooks
+        self.tools = list(tools) if tools else None
 
 
 class HeadlessSession:
@@ -87,6 +109,8 @@ class HeadlessSession:
         config: SessionConfig,
         stream: TextIO | None = None,
         write_lock: threading.Lock | None = None,
+        hook_router: HookPendingRouter | None = None,
+        write_line: Callable[[str], None] | None = None,
     ) -> None:
         self.session_code = session_code
         self.config = config
@@ -109,6 +133,23 @@ class HeadlessSession:
         self._turn_finished = threading.Event()
         self._current_agent: Any = None
         self._pending_agent: Any = None
+        # hook 全关闭态：config.hooks 为 None 时不建总线，不发任何 type=request（REQ-19）
+        self.hook_bus: HeadlessHookBus | None = None
+        if config.hooks is not None:
+            self.hook_bus = HeadlessHookBus(
+                config=config.hooks,
+                session_code=session_code,
+                channel=HookChannel(
+                    write=write_line or self._fallback_write_line,
+                    router=hook_router or HookPendingRouter(),
+                ),
+                writer=self.writer,
+                cancel_check=self._cancel_requested_now,
+            )
+        #: 会话已驱动轮次计数（``session_start.first_turn`` 的数据源）
+        self._turn_count = 0
+        #: 上一轮 ``RUN_FINISHED(outcome=interrupt)`` 缓存下来的 pending 中断
+        self._pending_interrupts: list[dict] = []
 
     # ---------------- 状态查询 ----------------
 
@@ -136,60 +177,114 @@ class HeadlessSession:
     def turn(self, *, request_id: str, input_text: str = "", messages: list[dict] | None = None) -> dict:
         """驱动一轮对话，返回 ``{"session_code", "turn_id", "status"}``。"""
         self.ensure_open()
+        if self._pending_interrupts:
+            raise HeadlessError(
+                SESSION_PENDING_INTERRUPT,
+                "会话存在未恢复的中断，请先 resume 再开启新一轮",
+                {"session_code": self.session_code, "interrupts": self._pending_interrupts[:1]},
+            )
         stateless = bool(messages)
+
+        def _build(hook_context: str | None):
+            return self._take_agent(
+                build_type=AgentBuildType.DIRECT if stateless else AgentBuildType.SESSION,
+                session_context_data=list(messages) if stateless else None,
+                hook_context=hook_context,
+            )
+
         return self._drive_turn(
             request_id=request_id,
             input_text=input_text,
             stateless=stateless,
-            build=lambda: self._take_agent(
-                build_type=AgentBuildType.DIRECT if stateless else AgentBuildType.SESSION,
-                session_context_data=list(messages) if stateless else None,
-                allow_pending=not stateless,
-            ),
+            build=_build,
+            resume_payload=None,
         )
 
     # ---------------- resume ----------------
 
     def resume(self, *, request_id: str, input_text: str = "", resume_payload: Any = None) -> dict:
-        """同一会话续轮（不驱动中断恢复）。"""
+        """同一会话续轮或中断恢复（REQ-17）。
+
+        - 负载为中断恢复形状（含 ``interruptId`` + 裁决）→ 校验命中 pending 后恢复；
+        - 负载为空或 ``{"input": ...}`` → 保持一期「同一会话续轮」语义。
+        """
         self.ensure_open()
 
-        def _build():
-            if _is_interrupt_payload(resume_payload):
-                raise HeadlessError(
-                    RESUME_PAYLOAD_UNSUPPORTED,
-                    "headless 仅支持同一会话续轮，不支持审批 / ask_user_question 中断恢复",
-                    {"fields": ["resume"]},
-                )
-            continuation = resume_payload if resume_payload is not None else {"input": input_text or ""}
-            return self._build_agent_via_resume(continuation)
+        if _is_interrupt_payload(resume_payload):
+            item = self._validate_resume_payload(resume_payload)
+            processor = HeadlessInterruptProcessor(resume_item=item)
 
-        return self._drive_turn(request_id=request_id, input_text=input_text, stateless=False, build=_build)
+            def _build_interrupt(hook_context: str | None):
+                return self._build_agent_via_resume(item, hook_context=hook_context, interrupt_processor=processor)
+
+            return self._drive_turn(
+                request_id=request_id,
+                input_text=input_text,
+                stateless=False,
+                build=_build_interrupt,
+                resume_payload=item,
+            )
+
+        continuation = resume_payload if resume_payload is not None else {"input": input_text or ""}
+
+        def _build_continue(hook_context: str | None):
+            return self._build_agent_via_resume(continuation, hook_context=hook_context)
+
+        return self._drive_turn(
+            request_id=request_id,
+            input_text=input_text,
+            stateless=False,
+            build=_build_continue,
+            resume_payload=None,
+        )
 
     # ---------------- 轮次执行（turn / resume 共用） ----------------
 
-    def _drive_turn(self, *, request_id: str, input_text: str, stateless: bool, build) -> dict:
+    def _drive_turn(
+        self,
+        *,
+        request_id: str,
+        input_text: str,
+        stateless: bool,
+        build: Callable[[str | None], Any],
+        resume_payload: Any = None,
+    ) -> dict:
         """会话锁内串行执行一轮；事件 writer 的请求绑定也在锁内，避免轮次串扰。"""
         turn_id = uuid.uuid4().hex
         user_message_id = ""
+        keep_ask_memo = False
         with self._session_lock:
-            self._begin_turn(request_id)
+            self._begin_turn(request_id, turn_id)
             try:
+                # session_start 在装配之前触发：context 随本轮 create 下发（只作用于本轮）
+                hook_context = self._emit_session_start(turn_id, input_text)
                 if not stateless:
                     # 与平台同序：本轮 user 记录先入账本，SESSION 装配时作为历史的一部分读到
                     user_message_id = self._append_user_record(input_text, turn_id)
-                agent = self._build_guarded(build)
+                agent = self._build_guarded(lambda: build(hook_context))
                 execute_kwargs = ExecuteKwargs(
                     stream=True,
                     session_code=self.session_code,
                     thread_id=self.session_code,
                     turn_id=turn_id,
                     input=input_text or "",
+                    resume=resume_payload,
                 )
                 self._run(agent, execute_kwargs)
                 status = self._finish_turn()
                 if not stateless:
                     self._append_assistant_record(turn_id)
+                if status == STATUS_INTERRUPT:
+                    # 中断轮：ok=true + status=interrupt + 回传 pending 中断（REQ-17 / T-21）
+                    keep_ask_memo = True
+                    self._pending_interrupts = list(self.writer.interrupts)
+                    return {
+                        "session_code": self.session_code,
+                        "turn_id": turn_id,
+                        "status": STATUS_INTERRUPT,
+                        "interrupts": self._pending_interrupts,
+                    }
+                self._pending_interrupts = []
                 if status == STATUS_ERROR:
                     # 执行链只产出 RUN_ERROR 事件、未抛异常（如模型 5xx / 端点不可达）：
                     # 该轮本身是失败轮，响应必须 ok=false 并带稳定错误码（REQ-5 / REQ-7）。
@@ -223,6 +318,9 @@ class HeadlessSession:
                 )
             finally:
                 self._end_turn(request_id)
+                # ask 的重放发生在中断后的 resume 轮：中断轮保留 memo，其余轮末清理（方案 D1）
+                if self.hook_bus is not None and not keep_ask_memo:
+                    self.hook_bus.reset_turn()
 
     # ---------------- cancel ----------------
 
@@ -275,7 +373,7 @@ class HeadlessSession:
 
     # ---------------- 内部：装配 ----------------
 
-    def _build_agent(self, *, build_type: AgentBuildType, session_context_data: list[dict] | None):
+    def _build_agent(self, *, build_type: AgentBuildType, session_context_data: list[dict] | None, hook_context: str | None = None):
         return agent_factory().create(
             agent_code=self.config.agent_code,
             build_type=build_type,
@@ -289,9 +387,20 @@ class HeadlessSession:
             max_tokens=self.config.max_tokens,
             auth_headers=self.config.auth_headers,
             channel_type=HEADLESS_CHANNEL_TYPE,
+            hooks=self.hook_bus,
+            hook_context=hook_context,
+            # 始终注入去平台化的中断编排：中断轮也不得 prepare / 建单（REQ-17 / ACC-22）
+            interrupt_processor=HeadlessInterruptProcessor(),
+            injected_tools=self.config.tools,
         )
 
-    def _build_agent_via_resume(self, payload: Any):
+    def _build_agent_via_resume(
+        self,
+        payload: Any,
+        *,
+        hook_context: str | None = None,
+        interrupt_processor: Any = None,
+    ):
         return agent_factory().resume(
             session_code=self.session_code,
             resume=payload,
@@ -305,6 +414,10 @@ class HeadlessSession:
             max_tokens=self.config.max_tokens,
             auth_headers=self.config.auth_headers,
             channel_type=HEADLESS_CHANNEL_TYPE,
+            hooks=self.hook_bus,
+            hook_context=hook_context,
+            interrupt_processor=interrupt_processor,
+            injected_tools=self.config.tools,
         )
 
     @staticmethod
@@ -317,11 +430,21 @@ class HeadlessSession:
         except Exception as exc:  # pylint: disable=broad-except
             raise HeadlessError(AGENT_BUILD_FAILED, f"{type(exc).__name__}: {exc}") from exc
 
-    def _take_agent(self, *, build_type: AgentBuildType, session_context_data, allow_pending: bool):
+    def _take_agent(
+        self,
+        *,
+        build_type: AgentBuildType,
+        session_context_data,
+        hook_context: str | None = None,
+    ):
         """每轮重新装配（历史在 build 期快照，复用实例会读到过期历史）。"""
         with self._state_lock:
             self._pending_agent = None
-        return self._build_agent(build_type=build_type, session_context_data=session_context_data)
+        return self._build_agent(
+            build_type=build_type,
+            session_context_data=session_context_data,
+            hook_context=hook_context,
+        )
 
     # ---------------- 内部：执行 ----------------
 
@@ -334,12 +457,14 @@ class HeadlessSession:
         for _chunk in result:  # 事件经 event_handler（SessionEventWriter）写出
             pass
 
-    def _begin_turn(self, request_id: str) -> None:
+    def _begin_turn(self, request_id: str, turn_id: str) -> None:
         with self._state_lock:
             self._turn_active = True
             self._cancel_requested = False
             self._turn_finished.clear()
         self.writer.bind(request_id=request_id, thread_id=self.session_code, sink=self.config.event_sink)
+        if self.hook_bus is not None:
+            self.hook_bus.bind(request_id=request_id, turn_id=turn_id)
         if self.config.base_url:
             from aidev_agent.config import settings
 
@@ -350,7 +475,93 @@ class HeadlessSession:
             self._turn_active = False
             self._current_agent = None
             self._cancel_requested = False
+        self._turn_count += 1
         self._turn_finished.set()
+
+    # ---------------- 内部：hook ----------------
+
+    def _emit_session_start(self, turn_id: str, input_text: str) -> str | None:
+        """驱动前触发一次 ``session_start``，返回本轮要注入的 context（REQ-14）。"""
+        bus = self.hook_bus
+        if bus is None or not bus.enabled(HookPoint.SESSION_START):
+            return None
+        result = bus.emit(
+            HookPoint.SESSION_START,
+            {
+                "session_code": self.session_code,
+                "turn_id": turn_id,
+                "first_turn": self._turn_count == 0,
+                "input": input_text or "",
+            },
+        )
+        context = apply_session_start(result)
+        raw_context = result.get("context") if isinstance(result, dict) else None
+        if raw_context is not None and not isinstance(raw_context, str):
+            # context 存在但类型不合法：本点降级为不注入，不影响本轮执行（fail-open）
+            bus.notify_degraded(HookPoint.SESSION_START, DEGRADE_INVALID_SHAPE)
+        return context
+
+    def _cancel_requested_now(self) -> bool:
+        with self._state_lock:
+            return self._cancel_requested
+
+    def _fallback_write_line(self, line: str) -> None:
+        """没有 Dispatcher（如进程内直连会话）时的兜底写出行：与事件共用 writer 的锁。"""
+        self.writer.emit_raw_line(line)
+
+    # ---------------- 内部：resume 负载 ----------------
+
+    def _validate_resume_payload(self, payload: Any) -> dict:
+        """校验中断恢复负载命中该会话 pending 中断（REQ-17 / ACC-21）。"""
+        items = payload if isinstance(payload, list) else [payload]
+        if not items:
+            raise HeadlessError(
+                RESUME_PAYLOAD_UNSUPPORTED,
+                "恢复负载为空：中断恢复需要 interruptId",
+                {"fields": ["resume"]},
+            )
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("interruptId"), str) or not item["interruptId"]:
+                raise HeadlessError(
+                    RESUME_PAYLOAD_UNSUPPORTED,
+                    "恢复负载形状不支持：中断恢复项需包含非空字符串 interruptId",
+                    {"fields": ["resume.interruptId"]},
+                )
+        if len(items) > 1:
+            raise HeadlessError(
+                RESUME_PAYLOAD_UNSUPPORTED,
+                "一次 resume 只能恢复一个中断，请逐次恢复",
+                {"fields": ["resume"], "count": len(items)},
+            )
+
+        item = items[0]
+        if not self._pending_interrupts:
+            raise HeadlessError(
+                RESUME_INTERRUPT_NOT_FOUND,
+                "该会话当前没有待恢复的中断",
+                {"interruptId": item["interruptId"]},
+            )
+        matched = match_pending_interrupt(self._pending_interrupts, item)
+        if matched is None:
+            raise HeadlessError(
+                RESUME_INTERRUPT_NOT_FOUND,
+                "interruptId 未命中该会话的 pending 中断",
+                {"fields": ["resume.interruptId"]},
+            )
+        reason = matched.get("reason")
+        if reason == ITSM_APPROVAL_REASON:
+            raise HeadlessError(
+                RESUME_INTERRUPT_UNSUPPORTED,
+                "headless 本期不接线 ITSM 权限审批中断的恢复，请由平台侧完成审批",
+                {"reason": reason},
+            )
+        if reason not in RESUMABLE_REASONS:
+            raise HeadlessError(
+                RESUME_INTERRUPT_NOT_FOUND,
+                "该中断类型不在 headless 可恢复范围内",
+                {"reason": reason},
+            )
+        return item
 
     def _finish_turn(self) -> str:
         with self._state_lock:
@@ -409,11 +620,20 @@ class HeadlessSession:
 class SessionRegistry:
     """``session_code -> HeadlessSession`` 注册表（会话标识由调用方提供）。"""
 
-    def __init__(self, *, stream: TextIO | None = None, write_lock: threading.Lock | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        write_lock: threading.Lock | None = None,
+        hook_router: HookPendingRouter | None = None,
+        write_line: Callable[[str], None] | None = None,
+    ) -> None:
         self._sessions: dict[str, HeadlessSession] = {}
         self._lock = threading.Lock()
         self._stream = stream
         self._write_lock = write_lock or threading.Lock()
+        self._hook_router = hook_router
+        self._write_line = write_line
 
     def create(self, *, session_code: str, config: SessionConfig) -> HeadlessSession:
         session = HeadlessSession(
@@ -421,6 +641,8 @@ class SessionRegistry:
             config=config,
             stream=self._stream,
             write_lock=self._write_lock,
+            hook_router=self._hook_router,
+            write_line=self._write_line,
         )
         with self._lock:
             self._sessions[session_code] = session

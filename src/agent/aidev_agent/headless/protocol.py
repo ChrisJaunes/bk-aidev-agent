@@ -32,6 +32,9 @@ METHOD_RESUME = "resume"
 METHOD_CANCEL = "cancel"
 METHOD_CLOSE = "close"
 
+#: agent → host 的 hook 请求行方法名（不在 ``SUPPORTED_METHODS`` 内：它不是宿主请求）
+METHOD_HOOK = "hook"
+
 SUPPORTED_METHODS = frozenset(
     {
         METHOD_CREATE,
@@ -112,6 +115,20 @@ def encode_event(request_id: str, event: BaseEvent) -> str:
         {"id": request_id, "type": "event", "event": event.model_dump(mode="json", by_alias=True)},
         ensure_ascii=False,
     )
+
+
+def encode_hook_request(line_id: str, params: dict[str, Any]) -> str:
+    """把一次 hook 请求编码为 agent → host 的请求行（REQ-18）。
+
+    ``params`` 固定四键：``session_code`` / ``turn_id`` / ``point`` / ``payload``；
+    ``line_id`` 形如 ``<本轮请求 id>#h<n>``，宿主据此原样回填答复行的 ``id``。
+    """
+    return json.dumps({"id": line_id, "type": "request", "method": METHOD_HOOK, "params": params}, ensure_ascii=False)
+
+
+def is_hook_reply(payload: Any) -> bool:
+    """判断一行入站 JSON 是否为宿主答复行（``ok`` 在、``method`` 不在，REQ-18）。"""
+    return isinstance(payload, dict) and "ok" in payload and "method" not in payload
 
 
 def encode_result(request_id: str, result: dict[str, Any]) -> str:

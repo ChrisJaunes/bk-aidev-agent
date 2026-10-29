@@ -33,7 +33,7 @@ class _FakeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _stream(self, body: dict[str, Any], text: str) -> None:
+    def _stream(self, body: dict[str, Any], text: str, tool_calls: list[dict] | None = None) -> None:
         owner: FakeLLMServer = self.server.owner  # type: ignore[attr-defined]
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -52,11 +52,30 @@ class _FakeHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         chunk({"role": "assistant", "content": ""})
-        for piece in owner.chunks(text):
-            chunk({"content": piece})
-            if owner.chunk_delay:
-                time.sleep(owner.chunk_delay)
-        chunk({}, "stop")
+        if tool_calls:
+            for index, tool_call in enumerate(tool_calls):
+                chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": tool_call.get("id") or f"call_{index + 1}",
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call["name"],
+                                    "arguments": json.dumps(tool_call.get("args") or {}),
+                                },
+                            }
+                        ]
+                    }
+                )
+            chunk({}, "tool_calls")
+        else:
+            for piece in owner.chunks(text):
+                chunk({"content": piece})
+                if owner.chunk_delay:
+                    time.sleep(owner.chunk_delay)
+            chunk({}, "stop")
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -92,13 +111,13 @@ class _FakeHandler(BaseHTTPRequestHandler):
                     status=owner.error_status,
                 )
                 return
-            text = owner.next_reply()
+            text, tool_calls = owner.next_plan()
             if body.get("stream"):
                 with owner.concurrency_lock:
                     owner.in_flight += 1
                     owner.max_concurrency = max(owner.max_concurrency, owner.in_flight)
                 try:
-                    self._stream(body, text)
+                    self._stream(body, text, tool_calls)
                 finally:
                     with owner.concurrency_lock:
                         owner.in_flight -= 1
@@ -110,7 +129,31 @@ class _FakeHandler(BaseHTTPRequestHandler):
                         "created": int(time.time()),
                         "model": body.get("model", "fake-model"),
                         "choices": [
-                            {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": text if not tool_calls else None,
+                                    **(
+                                        {
+                                            "tool_calls": [
+                                                {
+                                                    "id": tool_call.get("id") or f"call_{index + 1}",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tool_call["name"],
+                                                        "arguments": json.dumps(tool_call.get("args") or {}),
+                                                    },
+                                                }
+                                                for index, tool_call in enumerate(tool_calls)
+                                            ]
+                                        }
+                                        if tool_calls
+                                        else {}
+                                    ),
+                                },
+                                "finish_reason": "tool_calls" if tool_calls else "stop",
+                            }
                         ],
                         "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
                     }
@@ -127,11 +170,14 @@ class FakeLLMServer:
         self,
         replies: list[str] | None = None,
         *,
+        tool_calls: list[list[dict]] | None = None,
         chunk_delay: float = 0.0,
         error_status: int | None = None,
         error_message: str = "upstream model is unavailable",
     ):
         self._replies = list(replies or ["你好"])
+        #: 依次消费的工具调用批次（每批是一次 assistant 回复里的全部 tool_calls）
+        self._tool_calls = list(tool_calls or [])
         self._cursor = 0
         self._lock = threading.Lock()
         self.requests: list[dict] = []
@@ -168,13 +214,19 @@ class FakeLLMServer:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}/v1"
 
-    def next_reply(self) -> str:
+    def next_plan(self) -> tuple[str, list[dict] | None]:
+        """取下一条模型回复：优先消费工具调用批次，其次按顺序取文本回复。"""
         with self._lock:
+            if self._tool_calls:
+                return "", self._tool_calls.pop(0)
             if not self._replies:
-                return "你好"
+                return "你好", None
             reply = self._replies[min(self._cursor, len(self._replies) - 1)]
             self._cursor += 1
-            return reply
+            return reply, None
+
+    def next_reply(self) -> str:
+        return self.next_plan()[0]
 
     @staticmethod
     def chunks(text: str, size: int = 2) -> list[str]:

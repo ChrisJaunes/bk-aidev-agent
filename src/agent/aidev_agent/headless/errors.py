@@ -28,6 +28,14 @@ AGENT_INTERNAL_ERROR = "agent.internal_error"
 # 注入点层
 RESUME_PAYLOAD_MISSING = "resume_payload_missing"
 RESUME_PAYLOAD_UNSUPPORTED = "resume_payload_unsupported"
+RESUME_INTERRUPT_NOT_FOUND = "resume_interrupt_not_found"
+RESUME_INTERRUPT_UNSUPPORTED = "resume_interrupt_unsupported"
+
+# 会话态
+SESSION_PENDING_INTERRUPT = "session.pending_interrupt"
+
+# hook 配置层
+HOOK_VALUE_INVALID = "hook.value_invalid"
 
 # 平台隔离层
 PLATFORM_API_UNSUPPORTED = "platform_api_unsupported"

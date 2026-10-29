@@ -61,14 +61,19 @@ def test_resume_continues_same_session_with_history(llm):
         [{"interruptId": "i-1"}],
     ],
 )
-def test_interrupt_payload_is_explicitly_unsupported(llm, payload):
+def test_interrupt_payload_without_pending_is_rejected(llm, payload):
+    """agent-hook 第二期：中断恢复已接线，但 interruptId 未命中 pending 时显式失败（REQ-17）。
+
+    一期「headless 不支持中断恢复」的约束由 REQ-17 取代；恢复语义的正例见
+    ``test_hook_interrupt.py``。
+    """
     harness = Harness()
     _create(harness, llm)
     harness.send_obj("r1", "resume", {"session_code": "s1", "input": "x", "resume": payload})
     harness.wait()
 
     error = harness.error("r1")
-    assert error["code"] == "resume_payload_unsupported"
+    assert error["code"] == "resume_interrupt_not_found"
     types = harness.event_types("r1")
     assert types[-1] == EventType.RUN_ERROR.value
     # 失败轮不写账本

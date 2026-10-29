@@ -20,6 +20,7 @@ from aidev_agent.utils.event import RunId, stamp_round_end_event
 from .protocol import encode_event
 
 STATUS_FINISHED = "finished"
+STATUS_INTERRUPT = "interrupt"
 STATUS_CANCELLED = "cancelled"
 STATUS_ERROR = "error"
 
@@ -86,6 +87,8 @@ class SessionEventWriter:
         self.terminal_emitted = False
         self.status = STATUS_FINISHED
         self.error_message: str | None = None
+        #: 中断轮回传的 pending 中断（``RUN_FINISHED.outcome.interrupts``）
+        self.interrupts: list[dict] = []
 
     # ---------------- 生命周期 ----------------
 
@@ -102,6 +105,7 @@ class SessionEventWriter:
         self.terminal_emitted = False
         self.status = STATUS_FINISHED
         self.error_message = None
+        self.interrupts = []
 
     def set_session_code(self, session_code: str) -> None:
         self.session_code = session_code
@@ -121,6 +125,13 @@ class SessionEventWriter:
             self._sink(event)
             return
         line = encode_event(self.request_id, event)
+        with self._lock:
+            if self._stream is not None:
+                self._stream.write(line + "\n")
+                self._stream.flush()
+
+    def emit_raw_line(self, line: str) -> None:
+        """写出一条原始协议行（hook 请求行复用同一写锁，避免与事件行交错，REQ-18）。"""
         with self._lock:
             if self._stream is not None:
                 self._stream.write(line + "\n")
@@ -182,6 +193,13 @@ class SessionEventWriter:
             if getattr(event, "run_id", None) == RunId.CANCELLED:
                 self.saw_cancelled_finished = True
                 self.status = STATUS_CANCELLED
+                return
+            outcome = getattr(event, "outcome", None)
+            if isinstance(outcome, dict) and outcome.get("type") == "interrupt":
+                # 中断轮不是 finished / error：单独一态，响应 ok=true 并回传中断（REQ-17）
+                self.status = STATUS_INTERRUPT
+                interrupts = outcome.get("interrupts") or []
+                self.interrupts = [item for item in interrupts if isinstance(item, dict)]
 
     def take_assistant_text(self) -> str:
         return "".join(self.assistant_text)
