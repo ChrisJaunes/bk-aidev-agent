@@ -379,6 +379,10 @@ class AgentInstanceFactory:
                 max_tokens=self.max_tokens,
                 retry_strategy=self.retry_strategy,
                 checkpointer=self.checkpointer,
+                # hook 三件套（agent-hook 第二期）：缺省不传 → 字段均为 None，零行为变化
+                hooks=remaining_extra.pop("hooks", None),
+                hook_context=remaining_extra.pop("hook_context", None),
+                interrupt_processor=remaining_extra.pop("interrupt_processor", None),
             )
         elif self.agent_type == AgentType.FLOW:
             # FLOW 路径不依赖 agent 配置（与原行为保持一致），跳过预读

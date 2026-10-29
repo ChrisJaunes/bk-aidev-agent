@@ -217,7 +217,21 @@ class ChatCompletionAgent(BaseModel):
         description=(
             "InterruptProcessor 统一中断编排器，execute() 入口惰性构造（ItsmTicketCreator "
             "需 execute_kwargs.executor/session_code，build 期拿不到，D-11）。"
+            "可由外层注入替代实现（headless 的 HeadlessInterruptProcessor）；注入后 build 不覆盖。"
         ),
+    )
+    hooks: Any = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "hook 总线（HookBusProtocol 鸭子类型），由 headless create 的 hooks 配置构造；"
+            "缺省 None → 不插任何工具 wrapper、不发 session_start，零行为变化（REQ-19）。"
+        ),
+    )
+    hook_context: str | None = Field(
+        default=None,
+        exclude=True,
+        description="session_start 下发的上下文文本；非空时由模型节点模板中间件追加到 system prompt。",
     )
     agent_info: dict | None = Field(default=None, description="原始配置信息，来自 AgentConfig.agent_info")
     max_spawn_depth: int = Field(default=1, description="最大 Agent 嵌套深度，来自 AgentConfig.max_spawn_depth")
@@ -264,6 +278,10 @@ class ChatCompletionAgent(BaseModel):
             self.security_settings = ctx.agent_config.security_settings
         self.skills = builder.build_skills()
         self.tools = builder.build_tools()
+        # 进程内注入工具（headless create.params.tools 的测试 / 嵌入式接缝；不是协议承诺）
+        injected_tools = ctx.extra.get("injected_tools") or []
+        if injected_tools:
+            self.tools = list(self.tools or []) + list(injected_tools)
         self.mcp_fetch_failures = builder.mcp_fetch_failures
         self.knowledge_bases = builder.build_knowledge_bases()
         self.knowledges = builder.build_knowledge_items()
@@ -289,6 +307,14 @@ class ChatCompletionAgent(BaseModel):
 
         if chat.agent_cls is not None:
             self.agent_cls = chat.agent_cls
+        # hook 三件套：只有显式传入时才落到实例，缺省保持种子默认 None（REQ-19）
+        if chat.hooks is not None:
+            self.hooks = chat.hooks
+        if chat.hook_context:
+            self.hook_context = chat.hook_context
+        if chat.interrupt_processor is not None:
+            # execute() 的惰性构造只在 None 时生效，因此注入实现不会被覆盖
+            self.interrupt_processor = chat.interrupt_processor
         if ctx.session_code is not None:
             self.thread_id = ctx.session_code
         if ctx.event_handler is not None:
@@ -1623,6 +1649,8 @@ class ChatCompletionAgent(BaseModel):
             resource_manager=self.resource_manager,
             security_settings=self.security_settings,
             runtime_backend_resolver=self.runtime_backend_resolver,
+            hooks=self.hooks,
+            hook_context=self.hook_context,
         )
 
     def _refresh_llm_history_image_urls(self, chat_history: list[ChatPrompt]) -> None:

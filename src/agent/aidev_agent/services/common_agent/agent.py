@@ -29,5 +29,10 @@ class CommonQAAgent:
         """
         options = AgentExecutorKwargs.model_validate(kwargs)
         builder = ReActAgentBuilder().set_bkai_options(options)  # .enable_security_runtime(False)
+        # hook 相关（agent-hook 第二期）：只在显式传入时设置，缺省保持 None → 零行为变化
+        if getattr(options, "hooks", None) is not None:
+            builder.set_hooks(options.hooks)
+        if getattr(options, "hook_context", None):
+            builder.set_hook_context(options.hook_context)
         agent, cfg = builder.build()
         return agent, cfg

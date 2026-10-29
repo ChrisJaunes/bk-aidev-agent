@@ -43,6 +43,13 @@ class ChatBuildExtras:
     max_tokens: Optional[int] = None
     retry_strategy: Optional[str] = None
     checkpointer: Optional["BaseCheckpointSaver"] = None
+    # hook 相关可选项（agent-hook 第二期）：缺省均为 None，平台路径不传即零行为变化
+    hooks: Any = None
+    """hook 总线（``HookBusProtocol`` 鸭子类型）；随 headless ``create`` 下发。"""
+    hook_context: Optional[str] = None
+    """``session_start`` 下发的上下文文本，由模型节点模板中间件追加到 system prompt。"""
+    interrupt_processor: Any = None
+    """中断编排器实现；注入后 ``build`` 不覆盖，``execute`` 的惰性构造只在 None 时生效。"""
 
 
 @dataclass
