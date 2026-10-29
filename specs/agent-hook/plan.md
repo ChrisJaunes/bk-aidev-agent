@@ -332,6 +332,8 @@ src/agent/aidev_agent/headless/
 - 不把 hook 的输入输出回写平台 DB / 会话账本；不新增 AG-UI `EventType`（降级复用 `CUSTOM`）。
 - 不改 HTTP 契约、不改平台 `agent_info` 配置键、不改一期已交付的五方法语义。
 - 不改造审批链路：`ask` 只复用 `interrupt()` 与中断对象形状，不新造第二套审批通道、不建单。
+- 不绕开 ITSM 权限审批：hook 的任何裁决都不替代、不短路 `aidev:tool_approval` 中断；配了审批的工具在 hook 放行后仍走 ITSM 审批。
+- 不接线 ITSM 中断的 headless 恢复：本期 headless 只接线 ask 类中断（`aidev:hook_ask` / `aidev:user_question`），遇到 ITSM 中断显式失败（见「规格偏差与待修订（第二期）」）。
 - 不做 B 档代发（把 hook 请求代发成宿主自身事件）。
 - 不给 `hooks` 配置时的行为变化为零（含事件序列、日志、耗时）。
 
@@ -344,6 +346,7 @@ src/agent/aidev_agent/headless/
 | 工具 wrapper 链 | `core/nodes/tool/node.py:246-284` | 顺序即「外层→内层」：不可信净化 → 结果脱敏 → ITSM 审批 → json_repair → timer → result_limit → 外部 wrappers → `deduplicate`（最内层）。`_chain_tool_call_wrappers` 约定「第一个为最外层」（`:99-138`） |
 | 工具节点构建 | `core/graphs/react/graph.py:1063-1104` | `_prepare_agent_tool_node` 把 `langchain_middleware` 的 wrap 方法作为外部 wrappers 传入；自定义 middleware 只能落在内置 wrapper **内侧** |
 | 中断原语 | `core/nodes/tool/approval_wrapper.py:162` | `interrupt(value)` 已用于工具审批，`value` 含 `toolCallId` / `reason` / `message`；`default_tool_call_handler` 对 `GraphBubbleUp` 透传，wrapper 抛中断不会被转成错误结果（`node.py:66-70`） |
+| 中断的两种 reason | `packages/interrupt_manager/types.py:33-59` | `aidev:tool_approval`（ITSM 权限审批，需运维审批与建单）与 `aidev:user_question`（向用户提问）。两者共用 `interrupt()`，但语义与裁决来源不同：前者是权限闸门，后者是信息补全 |
 | 平台续流裁决 | `services/agent/chat.py:914-935`、`packages/interrupt_manager/processor.py:271-356` | `ek.resume` → `get_resume_input` 走 DB 权威：`_aggregate_resume_status` 查记录、未完成分支 `dispatch_interrupts` 建 ITSM 单。headless 走这条必然触达平台，违反 REQ-17 / ACC-22 |
 | 中断编排注入点 | `services/agent/chat.py:522-545` | `interrupt_processor` 是惰性字段；`build` 期已有值时不重建 → 可由外层注入替代实现 |
 | 中断收尾 | `core/ag_ui/agent.py:405-455` | 流结束由 `_resolve_exit` 调 `dispatch_interrupts` 做 per-reason prepare，再以 `RUN_FINISHED(outcome.type="interrupt", interrupts=[首个活跃])` 收尾 |
@@ -354,7 +357,7 @@ src/agent/aidev_agent/headless/
 | 构建期透传 | `services/agent/factory.py:346-417` | `_make_build_context` 按 `agent_type` 组装 `ctx.chat`（`ChatBuildExtras`），`extra` 里的剩余键进 `ctx.extra`；headless 已在用 `channel_type` 走 extra |
 | 工具来源 | `services/agent/chat.py:1973-2005`、`headless/resource_manager.py:164-165` | 工具来自 `resource_manager.construct_tool(tool_code)`；headless 实现直接抛 `platform_api_unsupported` → 当前 headless 无任何工具 |
 
-结论：三点都能挂在既有接缝上（两个薄 wrapper + 模型节点模板中间件 + `_drive_turn` 轮次边界），协议改动集中在 `cli.py` 的行分流；真正的技术难点只有两处——(1) 中断恢复的裁决来源必须换成宿主负载，不能再走 DB 门禁；(2) 工具节点的重放语义（LangGraph 恢复会从头重跑节点），`tool_pre` 不能重复上报。
+结论：三点都能挂在既有接缝上（两个薄 wrapper + 模型节点模板中间件 + `_drive_turn` 轮次边界），协议改动集中在 `cli.py` 的行分流；真正的技术难点有三处——(1) 中断恢复的裁决来源必须换成宿主负载，不能再走 DB 门禁；(2) 工具节点的重放语义（LangGraph 恢复会从头重跑节点），`tool_pre` 不能重复上报；(3) hook 与 ITSM 权限审批是两层不同性质的人工裁决，必须并存且不得互相替代，headless 本期只接线 ask 类中断。
 
 ## 方案对比
 
@@ -431,6 +434,13 @@ src/agent/aidev_agent/headless/
 | `tool_post` | `content` | 用该值替换 `content`（保留 `tool_call_id` / `name` / `additional_kwargs`） |
 | `tool_post` | `context` | 追加到同一 `ToolMessage.content` 尾部（分隔块，标注为 hook 追加）；若同时给 `content`，先替换再追加 |
 
+**与 ITSM 权限审批的关系**（本条为 REQ-13「执行归属」的边界，不因 hook 而改变）：
+
+- `allow` 只是「hook 层不拦」，`execute(request)` 之后仍完整走 `itsm_approval_sync_wrapper`（`approval_wrapper.py:218-232`）：配了审批的工具会照常抛 `aidev:tool_approval` 中断、照常走权限审批。
+- `deny` 是更严格的早退（工具本体零调用、不进审批），不构成绕过——它只减少执行，不放大权限。
+- `ask` 是**额外一次**人工裁决，不等于审批通过：宿主放行后重放仍会进入 ITSM 审批；hook 不得用 `ask` 替掉审批，也不得把 `allow` 当作审批结果。
+- 因此「工具 A 既配了 ITSM 审批、又被 hook 配了 `ask`」时，一轮内可能出现两次中断（先 hook ask，后 ITSM 审批），属预期行为；headless 只接线前者（见 D-14）。
+
 异步 wrapper 里的阻塞等待必须下放到线程池（`asyncio.get_running_loop().run_in_executor(None, bus.emit, ...)`），不得在事件循环线程上阻塞。
 
 ### D-11 构建期透传（REQ-13）
@@ -460,25 +470,35 @@ src/agent/aidev_agent/headless/
 
 ### D-14 `ask` 与 headless 中断恢复（REQ-17）
 
-`ask` 在 wrapper 内直接调 `interrupt()`（与审批同一原语），中断值形状：
+`ask` 在 wrapper 内直接调 `interrupt()`（与审批同一原语，不新建通道），中断值形状：
 
 ```json
-{"reason": "hook_ask", "message": "<宿主 reason>", "toolCallId": "<tool_use_id>", "id": "<可选>"}
+{"reason": "aidev:hook_ask", "message": "<宿主 reason>", "toolCallId": "<tool_use_id>", "id": "<可选>"}
 ```
 
-`interrupt_id` 由 LangGraph 生成，经 `_normalize_interrupt_value`（`core/ag_ui/agent.py:354-402`）归一为 AG-UI `Interrupt`，`toolCallId` 落在 `RUN_FINISHED.outcome.interrupts[0]`，满足 ACC-18。
+`reason` 沿用仓内命名空间（`InterruptReason` 的值形如 `aidev:tool_approval` / `aidev:user_question`），新增 `aidev:hook_ask` 只扩展取值、不新增机制。`interrupt_id` 由 LangGraph 生成，经 `_normalize_interrupt_value`（`core/ag_ui/agent.py:354-402`）归一为 AG-UI `Interrupt`，`toolCallId` 落在 `RUN_FINISHED.outcome.interrupts[0]`，满足 ACC-18。
 
 重放去重（D1）：`HookBus` 维护 `ask_memo: dict[tool_use_id, decision]`；重放时同一 `tool_use_id` 直接复用上次 `ask` 裁决、不再发请求，随即进入 `interrupt()` 取恢复值。memo 在轮次结束（含中断、取消、异常）时清空。
 
+**接线范围（按需求方确认）**：
+
+| 中断 reason | 语义 | 本期 headless |
+| --- | --- | --- |
+| `aidev:hook_ask` | hook `ask` 转人工 | **接线**：可由宿主负载恢复 |
+| `aidev:user_question` | 工具向用户提问 | **接线**：同一条恢复路径，负载即答案 |
+| `aidev:tool_approval` | ITSM 权限审批（需建单与运维裁决） | **不接线**：显式失败 `resume_interrupt_unsupported`，不放行、不改图状态 |
+
+ITSM 不接线的理由：它是权限闸门，裁决权威在平台单据与运维，headless 无建单与 DB 能力；用宿主负载直接放行等于绕开审批，用宿主负载直接拒绝则等于替运维做决定，两者都越界。当前仓内也还没有「工具本人审批」这条链路可接管，故本期只接线 ask 类。
+
 恢复链路：
 
-1. `resume` 负载形状 `{"interruptId": "...", "toolCallId": "可选", "decision": "allow|deny", "reason": "可选"}`，允许单元素列表。
-2. `HeadlessSession` 用上一轮 `RUN_FINISHED(outcome=interrupt)` 缓存下来的 pending 中断校验负载：`interruptId` 必须命中；携带 `toolCallId` 时一并校验。不命中 / 形状不合法 → `HeadlessError(RESUME_INTERRUPT_NOT_FOUND / RESUME_PAYLOAD_UNSUPPORTED)`，不改图状态、不放行其它 pending（ACC-21）。
+1. `resume` 负载形状 `{"interruptId": "...", "toolCallId": "可选", "decision": "allow|deny", "reason": "可选"}`，允许单元素列表；`aidev:user_question` 场景下 `decision` 可为 `{"answers": [...]}` 形状，原样透传给工具。
+2. `HeadlessSession` 用上一轮 `RUN_FINISHED(outcome=interrupt)` 缓存下来的 pending 中断校验负载：`interruptId` 必须命中；携带 `toolCallId` 时一并校验；命中项的 `reason` 必须是 `aidev:hook_ask` 或 `aidev:user_question`。不命中 / 形状不合法 → `HeadlessError(RESUME_INTERRUPT_NOT_FOUND / RESUME_PAYLOAD_UNSUPPORTED)`；命中 ITSM 中断 → `RESUME_INTERRUPT_UNSUPPORTED`。三种失败都不改图状态、不放行其它 pending（ACC-21）。
 3. 校验通过后 `create/resume` 注入 `HeadlessInterruptProcessor`，并把负载放进 `ExecuteKwargs.resume`；`chat._stream` 的 `forwarded_props.command.resume` → `get_resume_input` 走我们的实现。
 4. `HeadlessInterruptProcessor` 两个入口都去平台化：
-   - `get_resume_input(tasks, ...)`：只读 `tasks` 的 pending 中断；命中校验通过后构造 `Command(resume=<裁决>)`（单 pending 直接传取值，多 pending 复用 `_build_resume_map` 只指向命中的那个），返回 `ResumeInputResult(ready=True, command=...)`；不查 DB、不调 `dispatch_interrupts`。
-   - `dispatch_interrupts(tasks, ctx)`：只把 pending 归一为 `InterruptOutcome(status="built")`，**不 prepare、不建单、不 enrich**。
-5. 恢复轮以 `finished` 收尾；裁决为 `deny` 时工具本体零调用，模型收到拒绝说明；裁决不合法（缺 `decision` 或取值未知）按 `deny` 处理并记 warning（宁可不执行，也不误放行）。
+   - `get_resume_input(tasks, ...)`：只读 `tasks` 的 pending 中断；命中且 reason 在白名单内时才构造 `Command(resume=<裁决>)`（单 pending 直接传取值，多 pending 复用 `_build_resume_map` 只指向命中的那个），返回 `ResumeInputResult(ready=True, command=...)`；reason 为 `aidev:tool_approval` → 抛 `RESUME_INTERRUPT_UNSUPPORTED`；不查 DB、不调 `dispatch_interrupts`。
+   - `dispatch_interrupts(tasks, ctx)`：只把 pending 归一为 `InterruptOutcome(status="built")`，**不 prepare、不建单、不 enrich**（ITSM 中断到这里也只是一条待恢复的中断，不会被建单）。
+5. 恢复轮以 `finished` 收尾；裁决为 `deny` 时工具本体零调用，模型收到拒绝说明；裁决不合法（缺 `decision` 或取值未知）按 `deny` 处理并记 warning（宁可不执行，也不误放行）。若 hook 放行后该工具仍需 ITSM 审批，本轮会以 ITSM 中断收尾（`status=interrupt`），宿主再 `resume` 会得到 `resume_interrupt_unsupported`，属本期已知边界。
 6. 恢复后 `ask_memo` 与 pending 缓存清空；同一会话可继续 `turn`。若存在未恢复的 pending 中断时收到 `turn`，返回结构化错误 `session.pending_interrupt`（不拉图，避免 LangGraph 以 pending 状态启动失败）。
 
 ### D-15 协议两类新行与分发（REQ-18）
@@ -508,10 +528,11 @@ fail-open 规则与降级原因（`hook_degraded` 的 `value.reason`）：
 | code | 触发条件 |
 | --- | --- |
 | `resume_interrupt_not_found` | `resume` 负载的 `interruptId` 未命中该会话 pending 中断 |
+| `resume_interrupt_unsupported` | 命中的 pending 中断是 `aidev:tool_approval`（ITSM 权限审批），本期 headless 不接线 |
 | `session.pending_interrupt` | 存在未恢复 pending 中断时收到 `turn` |
 | `hook.value_invalid` | `create.params.hooks` 形状不合法（非对象 / 超时非正整数 / 未知点位） |
 
-既有 `resume_payload_unsupported` 语义收窄为「负载不是中断恢复形状」，一期文档中「headless 不支持中断恢复」的表述由本方案取代。
+既有 `resume_payload_unsupported` 语义收窄为「负载不是中断恢复形状」；一期文档中「headless 不支持中断恢复」的表述由本方案取代，改为「支持 ask 类中断恢复、ITSM 审批中断不接线」。
 
 ### D-18 关闭态零回归（REQ-19）
 
@@ -543,6 +564,19 @@ fail-open 规则与降级原因（`hook_degraded` 的 `value.reason`）：
 - 中断轮：`ok=true`，`result = {"session_code", "turn_id", "status": "interrupt", "interrupts": [<AG-UI Interrupt>]}`；事件侧仍以 `RUN_FINISHED(outcome=interrupt)` 收尾，不新增事件类型。
 - 中断轮同样落账（保留已产出的 assistant 文本），避免下一轮丢上下文；`user` 原文不动。
 
+### `resume` 负载与可恢复范围
+
+```json
+{"session_code": "s1", "resume": {"interruptId": "<pending id>", "toolCallId": "<可选>", "decision": "allow|deny", "reason": "<可选>"}}
+```
+
+| pending 中断 reason | `resume` 行为 |
+| --- | --- |
+| `aidev:hook_ask` | 恢复；`decision` 取 `allow` / `deny` |
+| `aidev:user_question` | 恢复；`decision` 可为 `{"answers": [...]}`，原样交给工具 |
+| `aidev:tool_approval` | `ok=false` + `resume_interrupt_unsupported`，不改图状态 |
+| 其它 / 未命中 | `ok=false` + `resume_interrupt_not_found` 或 `resume_payload_unsupported` |
+
 ### 目录结构
 
 ```text
@@ -573,15 +607,18 @@ src/agent/aidev_agent/headless/
 | `tool_post` 在 `knowledge_retrieval` 批内去重命中时不触发 | 与「每次工具返回都触发」的朴素预期不同 | 属「工具本体未执行」的合理语义，文档写明；用例以普通工具判定 |
 | system prompt 追加会占用上下文预算 | 超长 context 可能挤压历史 | 由宿主负责上下文预算；本仓只做追加，不截断，文档写明 |
 | 宿主不答复时依赖 `timeout_ms` 放行 | 单点最长阻塞 10 s，重工具链上放大 | 超时只降级不阻断；`timeout_ms` 可由宿主收紧 |
+| 工具同时配 ITSM 审批与 hook `ask` | 一轮内两次中断；headless 只接线前者，第二次中断无法恢复，会话停在该中断上 | 属本期明确边界：`resume` 返回 `resume_interrupt_unsupported`、`turn` 返回 `session.pending_interrupt`；宿主应避免对需审批工具下发 hook `ask`，文档写明 |
+| ITSM 中断不接线被误读为「hook 绕开审批」 | 宿主或后续实现可能把 `allow` 当审批结果 | D-10 明确 `allow` 仍走审批、`deny` 只是更严格早退；用例断言 hook 放行后审批 wrapper 仍被调用 |
 | ACC-23 依赖仓外插件 | 本仓无法独立取证 | 按规格「测试约束」记录为未取证，不影响 ACC-14 ~ ACC-22 判定 |
 
 ## 测试策略
 
 - **关闭态零回归（ACC-14）**：同一脚本分别跑「不带 hooks」与一期基线（手工比对的 stdout 落盘文件），断言行集合逐字节一致、无 `type=request`、无 `hook_degraded`。
 - **wrapper 顺序（ACC-16、ACC-17）**：直接对 `build_tool_node` 构造图，断言 `tool_pre` 的 `deny` 在审批 wrapper 之前（用带 `approval` metadata 的 fake 工具，断言审批未被调用）、`tool_post` 看到的是工具原值（断言脱敏 wrapper 之后才生效）。
+- **审批不被绕开（REQ-13 边界）**：同一带审批 metadata 的 fake 工具，`tool_pre=allow` 时断言 ITSM 审批入口仍被调用；`resume` 命中 `aidev:tool_approval` 中断时返回 `resume_interrupt_unsupported` 且不改变图状态、不放行其它 pending。
 - **三点语义（ACC-15 ~ ACC-17）**：fake 宿主固定答复，fake 模型断言收到的请求体：`context` 位于 user 之前、`deny` 后工具调用次数为 0、`block` / `content` / `context` 三种裁定的模型可见结果。
 - **协议与降级（ACC-19、ACC-20）**：子进程级用例断言 `#h1` 派生、答复行不产出响应行、不报未知方法、超时后恰好一条 `hook_degraded`、等待期间 `cancel` 早于超时收尾。
-- **中断恢复（ACC-18、ACC-21）**：`ask` → `status=interrupt` → `resume` 放行（工具执行一次、结果回模型）/ 拒绝（零调用、模型收到拒绝说明）；错误 `interruptId` 返回 `ok=false` 且随后用正确 id 仍可恢复。
+- **中断恢复（ACC-18、ACC-21）**：`ask` → `status=interrupt` → `resume` 放行（工具执行一次、结果回模型）/ 拒绝（零调用、模型收到拒绝说明）；错误 `interruptId` 返回 `ok=false` 且随后用正确 id 仍可恢复；ITSM 中断的 `resume` 显式失败。
 - **无平台（ACC-22）**：完整走一次 `ask → 中断 → resume`，断言进程内无 `django`、`HeadlessResourceManager.get_client` 调用为 0、无单据创建调用。
 - **接入证据（ACC-23）**：仓外 A 档插件 + `hooks.json` 在真实 dsh 跑一轮，记录命令与日志；缺插件时记录「未取证」。
 - 定向命令：`make -C src/agent test path=tests/<目标文件>`，单用例追加 `args="-k <expr>"`。
@@ -594,7 +631,16 @@ src/agent/aidev_agent/headless/
 | REQ-14 `session_start` | D-12 |
 | REQ-15 `tool_pre` | D-10、D-13 |
 | REQ-16 `tool_post` | D-10 |
-| REQ-17 `ask` 与 headless 中断恢复 | D-14、D-17 |
+| REQ-17 `ask` 与 headless 中断恢复 | D-14、D-17（ITSM 部分延后，见「规格偏差与待修订（第二期）」） |
 | REQ-18 协议 hook 往返 | D-15、D-16 |
 | REQ-19 关闭态零回归与凭据约束 | D-16、D-18 |
-| REQ-20 接入文档 hooks 一节 | 见 tasks.md T-22 |
+| REQ-20 接入文档 hooks 一节 | 见 tasks.md T-24 |
+
+## 规格偏差与待修订（第二期）
+
+| 规格条目 | 偏差 | 依据 | 处理 |
+| --- | --- | --- | --- |
+| REQ-17「审批 / `ask_user_question` / hook `ask` 三类中断必须可恢复」 | 本期只接线 `aidev:hook_ask` 与 `aidev:user_question`；`aidev:tool_approval`（ITSM 权限审批）不接线，遇显式失败 | 需求方 2026-10-29 指示：ITSM 是「高危工具需运维权限审批」的闸门，hook 不得绕开；仓内暂无工具本人审批链路可接管，故先不接 ITSM | `HeadlessInterruptProcessor` 以 reason 白名单实现；`resume` 对 ITSM 中断返回 `resume_interrupt_unsupported`；后续接入需另立变更，届时无需改协议 |
+| REQ-17「中断与恢复全程不得创建平台单据」 | 保持 | 不接线 ITSM 后，headless 侧更无建单可能 | `dispatch_interrupts` 只归一不 prepare，T-23 以 mock 断言零建单 |
+
+偏差不影响 ACC-14 ~ ACC-23 的判定：验收项中无「ITSM 审批中断在 headless 恢复」的用例（ACC-18 / ACC-21 / ACC-22 均针对 hook `ask`）。`spec.md` 本次不改写，实现与验收以本方案与 `tasks.md` 为准。

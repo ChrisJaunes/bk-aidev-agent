@@ -181,7 +181,7 @@
 | REQ-14 `session_start` | T-17 |
 | REQ-15 `tool_pre` | T-14、T-15、T-22 |
 | REQ-16 `tool_post` | T-14、T-15、T-22 |
-| REQ-17 `ask` 与 headless 中断恢复 | T-20、T-21、T-23 |
+| REQ-17 `ask` 与 headless 中断恢复 | T-20、T-21、T-23（ITSM 审批中断延后，见方案「规格偏差与待修订（第二期）」） |
 | REQ-18 协议 hook 往返 | T-18、T-19 |
 | REQ-19 关闭态零回归与凭据约束 | T-19、T-23、T-25 |
 | REQ-20 接入文档 hooks 一节 | T-24 |
@@ -249,7 +249,7 @@
 - 需求: REQ-17
 - 依赖: T-16
 - 验证: `make -C src/agent test path=tests/headless/test_hook_interrupt.py`
-- [ ] 完成标准：`resume` 接受 `{"interruptId", "toolCallId"?, "decision", "reason"?}`（允许单元素列表），校验命中上一轮 pending 中断；未命中返回 `ok=false` + `resume_interrupt_not_found`，且随后用命中的 `interruptId` 仍能正常恢复；`HeadlessInterruptProcessor.get_resume_input` 只读 `tasks`、构造 `Command(resume=...)`，不查 DB、不调 `dispatch_interrupts`；`dispatch_interrupts` 只归一为 `InterruptOutcome(status="built")`，无 prepare、无建单；恢复后同一会话仍可 `turn`；存在未恢复 pending 中断时 `turn` 返回 `session.pending_interrupt`；裁决缺失或取值未知按 `deny` 处理并记 warning。
+- [ ] 完成标准：`resume` 接受 `{"interruptId", "toolCallId"?, "decision", "reason"?}`（允许单元素列表，`aidev:user_question` 场景 `decision` 可为 `{"answers": [...]}`），校验命中上一轮 pending 中断；未命中返回 `ok=false` + `resume_interrupt_not_found`，且随后用命中的 `interruptId` 仍能正常恢复；命中 `aidev:tool_approval`（ITSM 权限审批）时返回 `ok=false` + `resume_interrupt_unsupported`，不改图状态、不放行其它 pending；`HeadlessInterruptProcessor.get_resume_input` 只读 `tasks`、以 reason 白名单（`aidev:hook_ask` / `aidev:user_question`）判定，构造 `Command(resume=...)`，不查 DB、不调 `dispatch_interrupts`；`dispatch_interrupts` 只归一为 `InterruptOutcome(status="built")`，无 prepare、无建单；恢复后同一会话仍可 `turn`；存在未恢复 pending 中断时 `turn` 返回 `session.pending_interrupt`；裁决缺失或取值未知按 `deny` 处理并记 warning。
 
 ## T-21 `status=interrupt` 收尾与事件契约
 
@@ -267,7 +267,7 @@
 - 需求: REQ-15、REQ-16、REQ-17
 - 依赖: T-19、T-21
 - 验证: `make -C src/agent test path=tests/headless/test_hook_points.py`
-- [ ] 完成标准：`create.params.tools` 支持进程内注入工具（stdio 下不承诺，文档写明），用例以注入的 fake 工具驱动 `tool_pre` / `tool_post`；`tool_pre=deny` 时工具本体调用次数为 0 且模型收到含 `reason` 的结果、该轮 `finished`；`tool_post=block` 时模型可见结果为 `reason` 且不含原结果，`content` 时等于该值，`context` 时该文本出现在紧接的模型请求中，三种情形工具调用次数均为 1；`tool_pre=ask` 时该轮 `status=interrupt` 且 `outcome.interrupts[0].toolCallId` 等于该次 `tool_use_id`，随后 `resume` 放行时工具执行且结果回模型、`resume` 拒绝时工具零调用且模型收到拒绝说明；`ask` 重放不重复上报同一 `tool_pre`。
+- [ ] 完成标准：`create.params.tools` 支持进程内注入工具（stdio 下不承诺，文档写明），用例以注入的 fake 工具驱动 `tool_pre` / `tool_post`；`tool_pre=deny` 时工具本体调用次数为 0 且模型收到含 `reason` 的结果、该轮 `finished`；**`tool_pre=allow` 时既有 ITSM 审批 wrapper 仍被调用**（带 `approval` metadata 的 fake 工具断言审批入口命中，证明 hook 未绕开权限闸门）；`tool_post=block` 时模型可见结果为 `reason` 且不含原结果，`content` 时等于该值，`context` 时该文本出现在紧接的模型请求中，三种情形工具调用次数均为 1；`tool_pre=ask` 时该轮 `status=interrupt` 且 `outcome.interrupts[0].toolCallId` 等于该次 `tool_use_id`、`reason` 为 `aidev:hook_ask`，随后 `resume` 放行时工具执行且结果回模型、`resume` 拒绝时工具零调用且模型收到拒绝说明；`ask` 重放不重复上报同一 `tool_pre`。
 
 ## T-23 无平台依赖与依赖隔离（中断路径）
 
@@ -285,7 +285,7 @@
 - 需求: REQ-20
 - 依赖: T-22
 - 验证: 手工评审依据：文档自检清单（配置字段与默认值 / 两类协议行与 `id` 派生 / 三点载荷与裁决字段 / `ask` 与中断恢复的宿主义务 / fail-open 与 `hook_degraded` / A 档插件接入与钉版本 六节齐备）
-- [ ] 完成标准：六节齐备；`create.params.hooks` 字段与默认值、`#h<n>` 派生规则、三个点的载荷与裁决取值均写明；`ask` 后宿主如何组装 `resume` 负载（`interruptId` 取自 `RUN_FINISHED.outcome.interrupts[0].id`）写明；`hook_degraded` 与 `timeout_ms` 语义写明；A 档插件复用宿主 hooks 原语属半私有导出、需钉版本并加 import 冒烟；全文不复制宿主源码，不把半私有导出写成稳定 API。
+- [ ] 完成标准：六节齐备；`create.params.hooks` 字段与默认值、`#h<n>` 派生规则、三个点的载荷与裁决取值均写明；`ask` 后宿主如何组装 `resume` 负载（`interruptId` 取自 `RUN_FINISHED.outcome.interrupts[0].id`）写明；`hook_degraded` 与 `timeout_ms` 语义写明；**写明 hook 不替代 ITSM 权限审批、headless 本期只接线 ask 类中断（ITSM 中断 `resume` 返回 `resume_interrupt_unsupported`）**；A 档插件复用宿主 hooks 原语属半私有导出、需钉版本并加 import 冒烟；全文不复制宿主源码，不把半私有导出写成稳定 API。
 
 ## T-25 回归与关闭态零回归封板
 
