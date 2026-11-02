@@ -318,6 +318,32 @@ class RuntimeBackend:
     ) -> ExecuteResult:
         raise NotImplementedError
 
+    # --- code mode（PTC）依赖的文件传输与目录契约 ---
+
+    def upload_files(self, files: list[tuple[str, bytes]], *, state: dict | None = None) -> list[FileUploadResponse]:
+        """批量上传文件（code mode 用它下发 prelude / 用户代码 / 入口脚本与响应）。
+
+        子类必须重写；缺失该能力时 code mode 抛 ``CodeModeUnsupported``，不降级。
+        """
+        raise NotImplementedError
+
+    def download_files(self, paths: list[str], *, state: dict | None = None) -> list[FileDownloadResponse]:
+        """批量下载文件（code mode 用它轮询请求与读取执行状态）。
+
+        子类必须重写；缺失该能力时 code mode 抛 ``CodeModeUnsupported``，不降级。
+        """
+        raise NotImplementedError
+
+    def scratch_dir(self, name: str) -> str:
+        """返回 code mode 一次执行的独立目录（该后端文件 API 与 shell 均可用的路径）。
+
+        目录必须位于该 runtime 的既有沙箱范围内，隔离级别与文件可见范围不因
+        code mode 而放宽（REQ-9 / REQ-10）。子类必须重写：
+        ``local`` / ``bubblewrap`` 返回相对工作目录的路径，``paas`` 落在
+        ``$STORAGE_PATH`` 下，``agent_run``（E2B）落在沙箱内 ``/tmp``。
+        """
+        raise NotImplementedError
+
     # --- 生命周期管理 ---
 
     def close(self) -> None:

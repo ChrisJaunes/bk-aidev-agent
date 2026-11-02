@@ -583,6 +583,11 @@ class BubblewrapFilesystemBackend(RuntimeBackend):
         results.sort(key=lambda x: x.get("path", ""))
         return results
 
+    def scratch_dir(self, name: str) -> str:
+        """code mode 执行目录：工作目录下的相对路径（bwrap 内 cwd 与宿主一致）。"""
+
+        return f".aidev_code_mode/{name}"
+
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """上传多个文件到沙箱（bytes 经 stdin 传入 bwrap 子进程）。"""
         responses: list[FileUploadResponse] = []

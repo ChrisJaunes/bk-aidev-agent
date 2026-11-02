@@ -60,6 +60,13 @@ class ExecuteKwargs(BaseModel):
             "并关闭命令级审批（灰名单命令直接拒绝）；dontAsk 仅剔除 ask 类工具"
         ),
     )
+    tool_use_mode: Literal["function_call", "code_mode"] = Field(
+        default="function_call",
+        description=(
+            "工具使用模式：function_call 为缺省的标准 function calling；code_mode 下模型只绑定"
+            "代码执行工具，用一段 Python 代码编排已装配工具（请求级参数，不落库）"
+        ),
+    )
 
     # A2A PV 共享
     sandbox_pv_id: str | None = Field(default=None, description="父 Agent 的沙箱 PV ID，子 Agent 通过此字段复用父 PV")

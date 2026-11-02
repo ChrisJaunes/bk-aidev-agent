@@ -763,6 +763,11 @@ class FilesystemBackend(RuntimeBackend):
         results.sort(key=lambda x: x.get("path", ""))
         return results
 
+    def scratch_dir(self, name: str) -> str:
+        """code mode 执行目录：工作目录下的相对路径（文件 API 与 shell 均可用）。"""
+
+        return f".aidev_code_mode/{name}"
+
     def upload_files(self, files: list[tuple[str, bytes]], *, state: dict | None = None) -> list[FileUploadResponse]:
         """上传多个文件到文件系统。
 

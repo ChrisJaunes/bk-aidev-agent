@@ -653,6 +653,11 @@ class E2BSandboxBackend(RuntimeBackend):
         results.sort(key=lambda x: x.get("path", ""))
         return results
 
+    def scratch_dir(self, name: str) -> str:
+        """code mode 执行目录：沙箱内 ``/tmp`` 下的独立目录。"""
+
+        return f"/tmp/.aidev_code_mode/{name}"
+
     def upload_files(self, files: list[tuple[str, bytes]], *, state: dict | None = None) -> list[FileUploadResponse]:
         """上传多个文件到沙箱文件系统。
 

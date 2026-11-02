@@ -42,6 +42,16 @@ from langgraph.types import Send
 from typing_extensions import Literal, TypedDict, TypeVar
 
 from aidev_agent.config import settings
+from aidev_agent.core.graphs.react.code_mode import (
+    TOOL_USE_MODE_CODE_MODE,
+    CodeModePromptMiddleware,
+    apply_tool_permissions,
+    build_code_mode_manifest,
+    emit_tool_call,
+    prepare_inner_tools,
+    render_prompt,
+    resolve_tool_use_mode,
+)
 from aidev_agent.core.graphs.react.skill_middleware import (
     SkillsPromptMiddleware,
     _extract_e2b_params,
@@ -59,6 +69,7 @@ from aidev_agent.core.tools.a2a_tools import AgentBackendResolver, get_agent_too
 from aidev_agent.core.tools.a2a_tools import BkAiBackend as BkAiA2ABackend
 from aidev_agent.core.tools.a2a_tools import LocalBackend as LocalA2ABackend
 from aidev_agent.core.tools.ask_user_question import ask_user_question as _ask_user_question_tool
+from aidev_agent.core.tools.code_mode import CodeModeInvoker, CodeModeSession, build_code_execute_tool
 from aidev_agent.core.tools.knowledge import make_knowledge_retrieval_tool
 from aidev_agent.core.tools.read_image import make_read_image_tool
 from aidev_agent.core.tools.runtime_tools import get_client_tools_with_runtime
@@ -231,6 +242,10 @@ class ReActAgentBuilder:
         # 请求级执行参数（工具加载模式 mode 的来源）；未注入时为默认 ExecuteKwargs
         self._execute_kwargs: ExecuteKwargs = ExecuteKwargs()
         self._resource_manager = None
+        # code mode 装配结果（仅 tool_use_mode=code_mode 时填充）
+        self._code_mode_prompt: str | None = None
+        self._code_mode_session: CodeModeSession | None = None
+        self._code_mode_manifest: list = []
 
     # ====================================================================================================
     # 模型设置
@@ -774,13 +789,15 @@ class ReActAgentBuilder:
                 "安全配置不回落默认值，未注入即视为构建错误。"
             )
 
-        # mode 语义落到安全配置：工具加载模式无中断能力（dontInterrupt）时把命令审批从
-        # 安全配置里关掉，即 review 处置档 approval → block——不再产生审批中断，灰名单
-        # 命令 fail-closed 直接拒绝且不创建 ITSM 单（显式 allow / block 档不受影响）。
+        # mode 语义落到安全配置：工具加载模式无中断能力（dontInterrupt）或 code mode
+        # 时把命令审批从安全配置里关掉，即 review 处置档 approval → block——不再产生
+        # 审批中断，灰名单命令 fail-closed 直接拒绝且不创建 ITSM 单（显式 allow / block
+        # 档不受影响）。code mode 不承载任何人工中断（REQ-5），因此与 mode 无关地关闭。
         # 工具工厂与 enforce_command_security 只读这份配置，不接收开关参数。
         # 改写的是浅拷贝上的嵌套 command 配置，注入的共享对象不被原地修改（与脱敏模型
         # 只读共享同一约定）；随后同步给 resolver。build 可能多次调用，已关闭时不再处理。
-        if not command_approval_allowed(self._execute_kwargs.mode):
+        code_mode = resolve_tool_use_mode(self._execute_kwargs) == TOOL_USE_MODE_CODE_MODE
+        if not command_approval_allowed(self._execute_kwargs.mode) or code_mode:
             command_settings = self._security_settings.command
             if command_settings.command_review_disposition == "approval":
                 security_settings = self._security_settings.model_copy(deep=False)
@@ -880,6 +897,10 @@ class ReActAgentBuilder:
             node_options.extra_template_middlewares.append(TeamPromptMiddleware(specs=self._a2a_specs))
             node_options.extra_tool_middlewares.append(ToolFilterMiddleware())
 
+        # code mode：精简工具清单（完整 JSON Schema 不再注入模型）
+        if self._code_mode_prompt:
+            node_options.extra_template_middlewares.append(CodeModePromptMiddleware(prompt=self._code_mode_prompt))
+
         # 创建模型节点
         model_node = std_make_model_node(
             llm=llm,
@@ -968,7 +989,67 @@ class ReActAgentBuilder:
 
         # 按工具加载模式裁剪（default 原样返回，保证与变更前一致）；
         # 过滤后的列表在 build() 中同时交给 model 节点与 ToolNode。
-        return filter_tools_by_loading_mode(tools, mode)
+        assembled = filter_tools_by_loading_mode(tools, mode)
+        if resolve_tool_use_mode(self._execute_kwargs) != TOOL_USE_MODE_CODE_MODE:
+            return assembled
+        return self._prepare_code_mode_tools(assembled, langchain_middleware)
+
+    def _prepare_code_mode_tools(
+        self, assembled: List[BaseTool], langchain_middleware: Sequence[AgentMiddleware]
+    ) -> List[BaseTool]:
+        """code mode 的模型工具面：只返回 1 个 ``code_execute``（REQ-3）。
+
+        内层可调用集合在 ``assembled`` 之上再收紧：强制剔除 ask 类与带审批工具，
+        并叠加 ``tool_allow`` / ``tool_deny``；提示清单与代码桩都从同一集合派生。
+        """
+
+        execute_kwargs = self._execute_kwargs
+        inner_tools = prepare_inner_tools(
+            assembled,
+            mode=execute_kwargs.mode,
+            tool_allow=execute_kwargs.tool_allow,
+            tool_deny=execute_kwargs.tool_deny,
+        )
+        # 内层节点不接回图事件流：关闭计时 wrapper（它会向当前 run 派发
+        # on_tool_node_finish）；内层调用的展示由 code_execute 自己的三元组承担。
+        inner_node_options = (self._tool_node_options or ToolNodeSettings()).model_copy(update={"use_timer": False})
+        inner_tool_node = self._prepare_agent_tool_node(
+            inner_tools,
+            name="code_mode_inner_tools",
+            langchain_middleware=langchain_middleware,
+            node_options=inner_node_options,
+        )
+        manifest = build_code_mode_manifest(inner_tools)
+        self._code_mode_manifest = manifest
+        invoker = CodeModeInvoker(tools=inner_tools, tool_node=inner_tool_node, event_emitter=emit_tool_call)
+        session = CodeModeSession()
+        self._code_mode_session = session
+
+        runtime_description = ""
+        if self._runtime_backend_resolver is not None:
+            runtime_description = self._runtime_backend_resolver.runtime_param_description()
+        self._code_mode_prompt = render_prompt(
+            manifest,
+            runtime_description=runtime_description,
+            max_tool_calls=settings.CODE_MODE_MAX_TOOL_CALLS,
+            execute_timeout=settings.CODE_MODE_EXECUTE_TIMEOUT,
+            max_retries=settings.CODE_MODE_MAX_RETRIES,
+        )
+        logger.info(
+            "[code-mode] 装配完成：内层可调用工具 %s，模型绑定 1 个代码执行工具",
+            [tool.name for tool in inner_tools],
+        )
+
+        code_execute = build_code_execute_tool(
+            session=session,
+            resolver=self._runtime_backend_resolver,
+            invoker=invoker,
+            manifest=manifest,
+        )
+        # REQ-3 字面语义：code_execute 只可能被 allow/deny 裁掉。
+        return apply_tool_permissions(
+            [code_execute], tool_allow=execute_kwargs.tool_allow, tool_deny=execute_kwargs.tool_deny
+        )
 
     def _prepare_skills(self) -> None:
         """准备 skills 系统。

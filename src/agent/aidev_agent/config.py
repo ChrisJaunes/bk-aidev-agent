@@ -176,6 +176,18 @@ BK_SSM_ENDPOINT = env.str("BK_SSM_ENDPOINT", "https://bkssm.service.consul")  # 
 # 此处不另造判据。
 BKAI_SECURITY_COMMAND_RULES: list = env.json("BKAI_SECURITY_COMMAND_RULES", [])
 
+# code mode（PTC，``ExecuteKwargs.tool_use_mode=code_mode``）限额配置
+# 单次代码执行超时（秒），透传 backend.execute；超时按超时状态回传模型
+CODE_MODE_EXECUTE_TIMEOUT = env.int("CODE_MODE_EXECUTE_TIMEOUT", 120)
+# 单段代码内工具调用次数上限，超限在代码内抛 CodeModeBudgetExceeded
+CODE_MODE_MAX_TOOL_CALLS = env.int("CODE_MODE_MAX_TOOL_CALLS", 50)
+# 执行输出截断字符数（与 execute 工具的 100000 同口径）
+CODE_MODE_OUTPUT_LIMIT = env.int("CODE_MODE_OUTPUT_LIMIT", 100000)
+# 连续失败的额外重试次数（首次执行不计入），耗尽后本轮以失败结束
+CODE_MODE_MAX_RETRIES = env.int("CODE_MODE_MAX_RETRIES", 3)
+# 宿主轮询沙箱 calls/ 目录的间隔（秒），仅调优用
+CODE_MODE_BRIDGE_POLL_INTERVAL = env.float("CODE_MODE_BRIDGE_POLL_INTERVAL", 0.1)
+
 # BkAI 工具开关配置
 BKAI_TOOL_A2A_ENABLED = env.bool("BKAI_TOOL_A2A_ENABLED", True)
 BKAI_TOOL_TEAM_ENABLED = env.bool("BKAI_TOOL_TEAM_ENABLED", True)

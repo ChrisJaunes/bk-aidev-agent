@@ -880,6 +880,11 @@ class PaasSandboxBackend(RuntimeBackend):
         results.sort(key=lambda x: x.get("path", ""))
         return results
 
+    def scratch_dir(self, name: str) -> str:
+        """code mode 执行目录：落在沙箱 ``$STORAGE_PATH`` 下（持久卷内，权限不变）。"""
+
+        return f"$STORAGE_PATH/.aidev_code_mode/{name}"
+
     @_paas_error_enhance
     def upload_files(self, files: list[tuple[str, bytes]], *, state: dict | None = None) -> list[FileUploadResponse]:
         """上传多个文件到沙箱文件系统。"""
