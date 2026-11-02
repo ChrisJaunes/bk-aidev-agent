@@ -9,6 +9,7 @@ dependencies = [
     "langchain>=1.1.0",
     "langgraph>=1.0.0",
     "langchain-openai<1.0.0,>=0.3.0",
+    "openai>=2.54.0,<3.0.0",
     "pyro4<5.0,>=4.82",
     "bkapi-client-core<2.0.0,>=1.2.0",
     "jinja2<4.0.0,>=3.1.6",
@@ -45,6 +46,12 @@ description = "bkaidev agent builder"
 a2a = [
     "a2a-sdk>=1.1.0",
     "agent-client-protocol>=0.10.1",
+]
+# Platform-backed headless TUI runtime: pip install aidev-agent[headless]
+headless = [
+    "langgraph>=1.2.0",
+    "langgraph-checkpoint-sqlite>=3.1.0,<4.0.0",
+    "langgraph-checkpoint>=4.1.0,<5.0.0",
 ]
 # OpenTelemetry 可选 extras：
 #   pip install aidev-agent[opentelemetry]

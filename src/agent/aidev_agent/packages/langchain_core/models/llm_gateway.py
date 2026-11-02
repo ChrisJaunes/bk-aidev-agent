@@ -48,6 +48,8 @@ from aidev_agent.utils.datetimes import get_current_timestamp_in_milliseconds
 from aidev_agent.utils.file_reference import is_image_content_item
 from aidev_agent.utils.tracing import CLIENT_SPAN_KIND, recording_span
 
+from .llm_retry import RunScopedAsyncOpenAI, RunScopedOpenAI
+
 try:
     from aidev_agent.packages.opentelemetry.resilience import (
         begin_model_attempt,
@@ -284,6 +286,35 @@ class ChatModel(RawChatOpenAI, ApiGwMixin):
         if fallback is None:
             return model
         return ObservableRunnableWithFallbacks(runnable=model, fallbacks=[fallback])
+
+    @model_validator(mode="after")
+    def validate_environment(self):
+        create_sync = not self.client
+        create_async = not self.async_client
+        super().validate_environment()
+
+        # Reuse LangChain-configured HTTP clients (proxy/TLS/timeouts included).
+        # Explicitly injected completion clients remain under caller control.
+        for create, root_name, client_name, client_class in (
+            (create_sync, "root_client", "client", RunScopedOpenAI),
+            (create_async, "root_async_client", "async_client", RunScopedAsyncOpenAI),
+        ):
+            if not create:
+                continue
+            original = getattr(self, root_name)
+            client = client_class(
+                api_key=original.api_key,
+                organization=original.organization,
+                base_url=original.base_url,
+                timeout=original.timeout,
+                max_retries=original.max_retries,
+                default_headers=self.default_headers,
+                default_query=self.default_query,
+                http_client=original._client,
+            )
+            setattr(self, root_name, client)
+            setattr(self, client_name, client.chat.completions)
+        return self
 
     @model_validator(mode="before")
     @classmethod
