@@ -122,8 +122,8 @@
 
 ### T-7 单测：判定、拒绝、终止、配置：通过
 
-- `cd src/agent && make test path=tests/core/nodes/tool/test_loop_guard.py` → 27 passed。
-- 覆盖 AC1、AC2、AC4、AC5、AC6、AC10、AC11、AC12、AC14。
+- `cd src/agent && make test path=tests/core/nodes/tool/test_loop_guard.py` → 28 passed（返工后，新增逐轮驱动用例）。
+- 覆盖 AC1、AC2、AC4、AC5、AC6、AC10、AC11、AC12、AC14；`test_two_rejections_track_last_real_result` 逐轮驱动 tools 节点，覆盖第 4、5 次两次拒绝的摘要来源（见返工记录 T-R1-1）。
 
 ### T-8 单测：Trace 表达与零影响：通过
 
@@ -147,3 +147,17 @@
 
 - 方案 D-1 列举的类名为 `ToolLoopRejectionError`，但 D-4 与「对外可观测契约」要求 `error.type=ToolLoopRejection`
   （`_handle_error` 取异常类名）。为满足可观测契约与 AC3，拒绝异常类最终命名为 `ToolLoopRejection`。
+
+## 返工记录
+
+### T-R1-1 拒绝反馈摘要取错来源（关联 T-3、T-7；REQ-2、方案 D-3）
+
+- 阻塞项：F-1。默认 T=3/F=2 时，同一判定键第 5 次调用（第二次拒绝）反馈中的「最后一次真实返回内容摘要」取到了第 4 次的拒绝文案，而不是最近一次真实执行的返回结果。
+- 原因：摘要来源按「连续段内全部调用」收集 `tool_call_id` 后取最近一条 ToolMessage。第 4 次调用本身被拒绝、未执行工具，但其拒绝反馈同样是一条 ToolMessage，因而被当成真实结果取用。
+- 修复：`_scan` 增加 `allowed_limit`（取策略的 `repeat_limit`），只从连续段内序号小于 `T` 的调用收集 `tool_call_id`——只有这些调用真正执行过工具；`_decide` 传入 `policy.repeat_limit`。`count_contiguous` 的计数语义不变。
+- 新增用例：`test_two_rejections_track_last_real_result`，用 `StateGraph(tools → END)` 逐轮驱动 5 次调用，断言第 4、5 次均为 `status="error"`、已连续调用次数分别为 4 与 5、两次摘要均等于第 3 次真实执行返回的 `echo:x#3`，且摘要段不含拒绝文案。
+- 验证：
+  - `pytest tests/core/nodes/tool/test_loop_guard.py` → 28 passed；`pytest tests/packages/opentelemetry/test_tool_result_status.py` → 10 passed；`pytest tests/core/nodes/test_tool.py` → 56 passed。
+  - 修复前用同一用例复跑（回退 `loop_guard.py` 至 `e201a1fd`）→ FAILED，摘要段取到上一轮拒绝文案，确认为本条阻塞项的判别用例。
+  - 回归：`make test path=tests/core/nodes` → 568 passed, 27 deselected, 1 xfailed；`make test path=tests/packages/opentelemetry` → 255 passed, 1 failed（仍为 `test_otel_service.py::test_otel_config_uses_central_attribute_limits_by_default` 既有失败）。
+  - 拒绝 span 的 `error.type=ToolLoopRejection`、`tool.name` / `tool.input` 口径、不写 `gen_ai.tool.call.result`，以及第 `T+F+1` 次终止行为均由上述用例覆盖且保持不变。

@@ -169,7 +169,18 @@ def count_contiguous(messages: list[AnyMessage], call: ToolCall, messages_key: s
     return _scan(messages, call, messages_key)[0]
 
 
-def _scan(messages: Any, call: ToolCall, messages_key: str = "messages") -> tuple[int, ToolMessage | None]:
+def _scan(
+    messages: Any,
+    call: ToolCall,
+    messages_key: str = "messages",
+    allowed_limit: int | None = None,
+) -> tuple[int, ToolMessage | None]:
+    """返回连续出现次数与「最近一次真实执行」的返回结果。
+
+    ``allowed_limit`` 为允许真实执行的次数；连续段内序号不小于它的调用都被拒绝，
+    其 ToolMessage 是拒绝反馈而非真实结果，不能作为摘要来源。传 None 时不做该过滤
+    （仅供只需要计数的调用方使用）。
+    """
     window = _count_window(_extract_messages(messages, messages_key))
     current_key = _call_key(call)
     if current_key[1] is None:
@@ -182,15 +193,21 @@ def _scan(messages: Any, call: ToolCall, messages_key: str = "messages") -> tupl
             position = index
             break
 
-    count = 0
-    segment_ids: set[str] = set()
+    # 连续段按「由旧到新」排列，段内序号即该次调用发生前的连续次数
+    segment: list[_Slot] = []
     index = position - 1
     while index >= 0 and slots[index].key == current_key:
-        count += 1
-        segment_ids |= slots[index].tool_call_ids
+        segment.append(slots[index])
         index -= 1
+    segment.reverse()
 
-    return count, _nearest_result(window, segment_ids)
+    executed_ids: set[str] = set()
+    for offset, slot in enumerate(segment):
+        if allowed_limit is not None and offset >= allowed_limit:
+            break
+        executed_ids |= slot.tool_call_ids
+
+    return len(segment), _nearest_result(window, executed_ids)
 
 
 def _truncate(content: Any, limit: int) -> str:
@@ -299,7 +316,7 @@ class LoopGuardToolNode(ToolNode):
         """判定当前调用；判定逻辑自身出错时一律按放行处理。"""
         try:
             messages = _extract_messages(tool_runtime.state, self._messages_key)
-            count, last_result = _scan(messages, call, self._messages_key)
+            count, last_result = _scan(messages, call, self._messages_key, policy.repeat_limit)
         except Exception as error:  # noqa: BLE001 - 判定失败不得阻断工具调用主链路
             logger.warning("[ToolLoopGuard] 重复调用判定失败，本次按放行处理: %s", error)
             return LoopDecision(action=ALLOW)

@@ -39,7 +39,7 @@ def _tools(counter: list) -> list:
     def echo(text: str) -> str:
         """回显文本。"""
         counter.append(text)
-        return f"echo:{text}"
+        return f"echo:{text}#{len(counter)}"
 
     @tool
     def other(text: str) -> str:
@@ -85,6 +85,15 @@ def _graph(tools: list, *, settings: ToolNodeSettings | None = None, checkpointe
 
 def _last_tool_message(result: dict) -> ToolMessage:
     return [msg for msg in result["messages"] if isinstance(msg, ToolMessage)][-1]
+
+
+SUMMARY_HEADER = "最后一次真实返回内容摘要：\n"
+
+
+def _summary_of(content: str) -> str:
+    """取出拒绝反馈里「最后一次真实返回内容摘要」段。"""
+    _, _, rest = str(content).partition(SUMMARY_HEADER)
+    return rest.partition("请改用其他工具")[0].strip()
 
 
 class TestFingerprint:
@@ -178,6 +187,27 @@ class TestGuardBehaviour:
         message = _last_tool_message(_graph(_tools(counter)).invoke(_state(4)))
         assert message.status == "error"
         assert counter == []
+
+    def test_two_rejections_track_last_real_result(self):
+        """逐轮驱动 tools 节点：第 4、5 次拒绝的摘要都取自最近一次真实执行结果。"""
+        counter: list = []
+        graph = _graph(_tools(counter))
+        messages: list = [HumanMessage(content="逐轮驱动")]
+        results = []
+        for index in range(5):
+            messages = graph.invoke({"messages": [*messages, AIMessage(content="", tool_calls=[_call(index)])]})[
+                "messages"
+            ]
+            results.append(_last_tool_message({"messages": messages}))
+
+        first, second = results[3], results[4]
+        assert (first.status, second.status) == ("error", "error")
+        assert "已连续调用次数：4" in first.content
+        assert "已连续调用次数：5" in second.content
+        assert _summary_of(first.content) == "echo:x#3"
+        assert _summary_of(second.content) == "echo:x#3"
+        assert "拒绝" not in _summary_of(second.content)
+        assert counter == ["x", "x", "x"]
 
     def test_terminate_after_feedback_rounds(self):
         counter: list = []
