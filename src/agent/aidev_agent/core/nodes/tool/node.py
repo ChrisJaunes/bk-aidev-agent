@@ -28,11 +28,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import AsyncToolCallWrapper, ToolCallRequest, ToolCallWrapper
 from langgraph.types import Command
 
+from aidev_agent.config import BKAI_TOOL_LOOP_FEEDBACK_ROUNDS, BKAI_TOOL_LOOP_REPEAT_LIMIT
 from aidev_agent.pydantic_models import SecuritySettings
 
 from .approval_wrapper import itsm_approval_async_wrapper, itsm_approval_sync_wrapper
 from .deduplication import KnowledgeToolNode, deduplicate_async, deduplicate_sync
 from .json_repair_wrapper import json_repair_on_error_async_wrapper, json_repair_on_error_sync_wrapper
+from .loop_guard import LoopGuardPolicy
 from .pydantic_models import ToolNodeSettings
 from .result_limit_wrapper import build_result_limit_async_wrapper, build_result_limit_sync_wrapper
 from .security_wrapper import (
@@ -299,6 +301,12 @@ def build_tool_node(
     # 构建wrapper链
     final_sync_wrapper = _chain_tool_call_wrappers(sync_wrapper_list)
     final_async_wrapper = _chain_async_tool_call_wrappers(async_wrapper_list)
+    # 循环守卫：阈值与反馈轮次只从部署环境读取；摘要上限沿用既有结果长度上限
+    loop_guard = LoopGuardPolicy(
+        repeat_limit=BKAI_TOOL_LOOP_REPEAT_LIMIT,
+        feedback_rounds=BKAI_TOOL_LOOP_FEEDBACK_ROUNDS,
+        result_limit=node_options.result_limit_thrd,
+    )
     return KnowledgeToolNode(
         tools=tools,
         name=name,
@@ -307,4 +315,5 @@ def build_tool_node(
         messages_key=messages_key,
         wrap_tool_call=final_sync_wrapper,
         awrap_tool_call=final_async_wrapper,
+        loop_guard=loop_guard,
     )

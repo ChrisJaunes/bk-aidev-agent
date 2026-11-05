@@ -7,8 +7,9 @@ from contextvars import ContextVar
 from threading import Lock
 
 from langchain_core.messages import ToolMessage
-from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolCallRequest
+
+from .loop_guard import LoopGuardToolNode
 
 DUPLICATE_WAIT_TIMEOUT_SECONDS = 60.0
 
@@ -29,7 +30,7 @@ class _Batch:
 _batch: ContextVar[_Batch | None] = ContextVar("knowledge_tool_batch", default=None)
 
 
-class KnowledgeToolNode(ToolNode):
+class KnowledgeToolNode(LoopGuardToolNode):
     """Context is copied into ToolNode workers, never persisted in graph state."""
 
     def _func(self, input, config, runtime):
