@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Annotated, Any, List
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -205,17 +205,22 @@ def test_deny_and_replace_survive_resume_for_whole_batch(fake_llm, build_model_n
 
 
 def test_model_hooks_are_once_per_turn_across_resume(fake_llm, build_model_node_with_hooks) -> None:
-    """AC5/AC6 续流后 model_pre 仍为 1 次；model_post 整轮 1 次，identity.turn 不变。"""
+    """AC5/AC6 续流后 model_pre 仍为 1 次；model_post 终止补触发 1 次 + 最终答复 1 次。
+
+    计数口径：本轮「最终答复触发」（AC4）与「终止补触发」（AC6）各自最多一次——中断终止
+    补触发 1 次；续流后的最终答复再按 AC4 触发 1 次（``replace`` 生效）。同一轮
+    ``identity.turn`` 恒定。
+    """
     calls: list[dict] = []
     tools = [_make_tool("alpha", calls)]
     pre_turns: list[int] = []
-    post_turns: list[int] = []
+    post_calls: list[tuple[int, str]] = []
 
     def model_pre(context):
         pre_turns.append(context.identity.turn)
 
     def model_post(context):
-        post_turns.append(context.identity.turn)
+        post_calls.append((context.identity.turn, context.payload.response.content))
 
     hooks = HookSet(
         {
@@ -238,7 +243,7 @@ def test_model_hooks_are_once_per_turn_across_resume(fake_llm, build_model_node_
     # 生产出口：中断终止按 AC6 补触发一次 model_post
     finalize_run(None, first)
     assert pre_turns == [1]
-    assert post_turns == [1]
+    assert post_calls == [(1, "")]
 
     resume_value = [{"payload": {"answers": [{"selectedOptions": ["允许执行"]}]}}]
     second = _new_config(hooks, "thread-turn", resume=resume_value)
@@ -246,8 +251,9 @@ def test_model_hooks_are_once_per_turn_across_resume(fake_llm, build_model_node_
     finalize_run(None, second)
 
     assert pre_turns == [1]
-    assert post_turns == [1]
-    assert set(pre_turns + post_turns) == {1}
+    # 中断终止补触发 1 次（payload 为 tool_calls 响应）+ 续流最终答复 1 次
+    assert post_calls == [(1, ""), (1, "final")]
+    assert set(pre_turns) == {1}
 
 
 def test_started_without_resume_still_fires_model_post(fake_llm, build_model_node_with_hooks) -> None:
@@ -281,8 +287,8 @@ def test_resume_keeps_hook_channel_in_state(point, fake_llm, build_model_node_wi
     assert HOOK_STATE_CHANNEL in graph.get_state(config).values
 
 
-def test_pure_resume_consumes_model_post_budget() -> None:
-    """纯续流（无新输入）不再重复触发 model_post，轮序号保持。"""
+def test_pure_resume_consumes_terminal_post_budget() -> None:
+    """纯续流（无新输入）不再重复终止补触发，但最终答复仍开放 AC4 触发。"""
     hooks = HookSet({HookPoint.MODEL_POST: [lambda context: None]})
     config = _new_config(hooks, "thread-unit", resume=[{"payload": {"answers": []}}])
     snapshot = {
@@ -300,7 +306,8 @@ def test_pure_resume_consumes_model_post_budget() -> None:
     state = get_run_state(config)
     assert state.turn == 1
     assert state.model_pre_done is True
-    assert state.model_post_done is True
+    assert state.terminal_post_done is True
+    assert state.model_post_done is False
 
 
 def test_resume_with_new_input_opens_new_turn() -> None:
@@ -313,6 +320,7 @@ def test_resume_with_new_input_opens_new_turn() -> None:
             "turn": 1,
             "model_pre_done": True,
             "model_post_done": True,
+            "terminal_post_done": True,
             "model_request_count": 1,
             "tool_pre_decisions": {},
         }
@@ -324,3 +332,87 @@ def test_resume_with_new_input_opens_new_turn() -> None:
     assert state.turn == 2
     assert state.model_pre_done is False
     assert state.model_post_done is False
+
+
+def test_model_post_replace_applies_to_final_answer_after_resume(fake_llm, build_model_node_with_hooks) -> None:
+    """AC4/AC6 续流后的最终答复仍触发 model_post，replace 成为会话实际输出。
+
+    计数口径：中断终止补触发 1 次（payload 为最后一次响应，``replace`` 被忽略）；续流后的
+    最终答复再触发 1 次（payload 为该最终答复，``replace`` 生效）。
+    """
+    calls: list[dict] = []
+    tools = [_make_tool("alpha", calls)]
+    payloads: list[str] = []
+
+    def model_post(context):
+        payloads.append(context.payload.response.content)
+        if context.payload.response.content == "final":
+            return HookDecision(kind=HookDecisionKind.REPLACE, payload="REPLACED-FINAL")
+
+    hooks = HookSet(
+        {
+            HookPoint.MODEL_POST: [model_post],
+            HookPoint.TOOL_PRE: [lambda context: HookDecision(kind=HookDecisionKind.ASK, reason="ask")],
+        }
+    )
+    llm = fake_llm(
+        [
+            AIMessage(content="", tool_calls=[_tool_call("call-1", "alpha")]),
+            AIMessage(content="final"),
+        ]
+    )
+    graph = _build_graph(build_model_node_with_hooks(llm, hooks=hooks, tools=tools), tools, hooks)
+
+    first = _new_config(hooks, "thread-replace")
+    graph.invoke({"messages": [HumanMessage(content="hello")]}, first)
+    finalize_run(None, first)
+
+    resume_value = [{"payload": {"answers": [{"selectedOptions": ["允许执行"]}]}}]
+    second = _new_config(hooks, "thread-replace", resume=resume_value)
+    graph.invoke(Command(resume=resume_value), second)
+    finalize_run(None, second)
+
+    assert payloads == ["", "final"]
+    last = graph.get_state(second).values["messages"][-1]
+    assert last.content == "REPLACED-FINAL"
+
+
+def test_two_consecutive_turns_are_independent(fake_llm, build_model_node_with_hooks) -> None:
+    """同 thread 连续两轮非续流对话：每轮 model_pre/model_post 各 1 次，覆盖视图不跨轮泄漏。"""
+    calls: list[dict] = []
+    tools = [_make_tool("alpha", calls)]
+    pre_turns: list[int] = []
+    post_calls: list[tuple[int, str]] = []
+    marker = "OVERRIDE-TURN-1"
+
+    def model_pre(context):
+        pre_turns.append(context.identity.turn)
+        if context.identity.turn == 1:
+            return HookDecision(
+                kind=HookDecisionKind.REPLACE,
+                payload=[SystemMessage(content=marker), HumanMessage(content="replaced-1")],
+            )
+        return None
+
+    def model_post(context):
+        post_calls.append((context.identity.turn, context.payload.response.content))
+
+    hooks = HookSet({HookPoint.MODEL_PRE: [model_pre], HookPoint.MODEL_POST: [model_post]})
+    llm = fake_llm([AIMessage(content="one"), AIMessage(content="two")])
+    graph = _build_graph(build_model_node_with_hooks(llm, hooks=hooks, tools=tools), tools, hooks)
+
+    first = _new_config(hooks, "thread-two-turns")
+    graph.invoke({"messages": [HumanMessage(content="first")]}, first)
+    finalize_run(None, first)
+
+    second = _new_config(hooks, "thread-two-turns")
+    graph.invoke({"messages": [HumanMessage(content="second")]}, second)
+    finalize_run(None, second)
+
+    assert pre_turns == [1, 2]
+    assert post_calls == [(1, "one"), (2, "two")]
+
+    # 第二轮请求不携带第一轮的覆盖视图（装配由测试夹具固定，此处只断言覆盖片段不泄漏）
+    second_request = llm.calls[1]
+    assert second_request
+    assert all(getattr(message, "content", "") != marker for message in second_request)

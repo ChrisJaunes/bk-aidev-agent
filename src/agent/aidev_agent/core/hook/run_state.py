@@ -69,7 +69,8 @@ class HookRunState:
         model_pre_done: 本轮 ``model_pre`` 是否已触发（每轮一次）。
         model_pre_override: ``model_pre.replace`` 的覆盖消息列表。
         model_pre_anchor_ids: 覆盖发生时已存在的消息 id 集合，用于切出新追加的尾部消息。
-        model_post_done: 本轮 ``model_post`` 是否已触发（每轮一次）。
+        model_post_done: 本轮最终答复已触发 ``model_post``（AC4，每轮一次）。
+        terminal_post_done: 本轮的终止补触发（AC6）已消费；与 AC4 独立计数。
         model_request_count: 本轮模型请求次数。
         last_response: 本轮最后一次模型响应，供无最终答复的终止路径补触发。
         tool_pre_decisions: ``tool_call_id`` 到 ``tool_pre`` 裁决的映射。
@@ -86,6 +87,7 @@ class HookRunState:
     model_pre_override: list[AnyMessage] | None = None
     model_pre_anchor_ids: frozenset[str] = frozenset()
     model_post_done: bool = False
+    terminal_post_done: bool = False
     model_request_count: int = 0
     last_response: Any = None
     tool_pre_decisions: dict[str, HookDecision] = field(default_factory=dict)
@@ -111,6 +113,7 @@ class HookRunState:
             "model_pre_override": override,
             "model_pre_anchor_ids": sorted(self.model_pre_anchor_ids),
             "model_post_done": self.model_post_done,
+            "terminal_post_done": self.terminal_post_done,
             "model_request_count": self.model_request_count,
             "tool_pre_decisions": {
                 tool_call_id: _decision_to_mapping(decision)
@@ -125,6 +128,7 @@ class HookRunState:
             self.turn = turn
         self.model_pre_done = self.model_pre_done or bool(persisted.get("model_pre_done"))
         self.model_post_done = self.model_post_done or bool(persisted.get("model_post_done"))
+        self.terminal_post_done = self.terminal_post_done or bool(persisted.get("terminal_post_done"))
         self.model_request_count = max(self.model_request_count, int(persisted.get("model_request_count") or 0))
         if self.model_pre_override is None:
             override = persisted.get("model_pre_override")
@@ -205,47 +209,66 @@ def dump_run_state(config: RunnableConfig | None) -> dict | None:
 
 
 def restore_run_state(state_values: Any, config: RunnableConfig | None) -> None:
-    """从图状态快照续接运行态（模型节点、pv 节点与工具 wrapper 入口调用）。
+    """按本轮语义续接运行态（模型节点、pv 节点与工具 wrapper 入口调用）。
 
-    同一运行内只并入一次快照：续流是新运行，续接后本运行后续节点的写入不会再被旧快照覆盖。
+    同一运行内只处理一次：本运行后续节点的写入不会再被旧快照覆盖。
 
-    - 纯续流（无新用户输入）：上一段运行已在终止路径（中断）按 AC6 消费本轮 ``model_post``
-      预算，续流后不再重复触发。
-    - 续流携带新的用户输入（跳过提问）：视为新一轮，轮序号 +1 并重新开放 ``model_pre`` /
-      ``model_post``。
+    - 非续流（新的用户轮次）：只承接轮序号（上一轮 ``turn`` + 1），其余全部重置——上一轮的
+      ``model_pre_done`` / ``model_post_done`` / ``model_pre_override`` 与 ``tool_pre`` 裁决都不
+      带入新一轮。
+    - 纯续流（同一条消息的中断续流）：并入快照，轮序号延续；上一段运行没有最终答复即终止，
+      终止触发（AC6）已消费过，续流后不再重复补触发。
+    - 续流携带新的用户输入（跳过提问）：视为新一轮，轮序号 +1 并重新开放点位。
     """
     state = get_run_state(config)
     if state is None or not isinstance(state_values, dict) or state.persisted_merged:
         return
-    persisted = state_values.get(HOOK_STATE_CHANNEL)
-    if isinstance(persisted, dict):
-        state.merge_mapping(persisted)
     state.persisted_merged = True
 
     configurable = config.get("configurable") if isinstance(config, dict) else None
     execute_kwargs = (configurable or {}).get("execute_kwargs")
-    if not getattr(execute_kwargs, "resume", None):
+    resuming = bool(getattr(execute_kwargs, "resume", None))
+    if resuming and not getattr(execute_kwargs, "input", ""):
+        persisted = state_values.get(HOOK_STATE_CHANNEL)
+        if isinstance(persisted, dict):
+            state.merge_mapping(persisted)
+            if not state.model_post_done and state.model_request_count > 0:
+                # 上一段运行无最终答复即终止（中断）：AC6 终止触发已消费一次
+                state.terminal_post_done = True
         return
-    if getattr(execute_kwargs, "input", ""):
-        # 跳过提问后用户直接输入新消息：新一轮从 1 重新计数，覆盖视图不再继承
-        state.turn += 1
-        state.model_pre_done = False
-        state.model_post_done = False
-        state.model_pre_override = None
-        state.model_pre_anchor_ids = frozenset()
-        return
-    if state.model_request_count > 0:
-        state.model_post_done = True
+
+    # 新一轮：只承接轮序号，其余按新一轮重新开始
+    persisted = state_values.get(HOOK_STATE_CHANNEL)
+    previous_turn = persisted.get("turn") if isinstance(persisted, dict) else 0
+    state.turn = int(previous_turn or 0) + 1
+    state.session_started = False
+    state.session_append = None
+    state.model_pre_done = False
+    state.model_pre_override = None
+    state.model_pre_anchor_ids = frozenset()
+    state.model_post_done = False
+    state.model_request_count = 0
+    state.last_response = None
+    state.tool_pre_decisions = {}
+    state.terminal_post_done = False
 
 
 def finalize_run(state_values: Any = None, config: RunnableConfig | None = None) -> None:
     """运行收尾：在无最终答复的终止路径（中断 / 续跑上限 / 取消）补触发一次 ``model_post``。
 
-    此时运行已终止，只执行观察语义；``replace`` / ``deny`` 记 warning 后忽略。
-    ``hooks`` 未注入或本轮已触发过 ``model_post`` 时直接跳过，不读取任何图状态。
+    与 AC4 的「最终答复触发」各自独立计数：终止补触发按运行记一次（``terminal_post_done``），
+    续流后的最终答复仍会按 AC4 再触发一次并可 ``replace``。此处运行已终止，仅观察语义；
+    ``replace`` / ``deny`` 记 warning 后忽略。未注入 hooks 或本轮已有最终答复时直接跳过，
+    不读取任何图状态。
     """
     state = get_run_state(config)
-    if state is None or state.runner is None or state.model_post_done or state.last_response is None:
+    if (
+        state is None
+        or state.runner is None
+        or state.model_post_done
+        or state.terminal_post_done
+        or state.last_response is None
+    ):
         return
     try:
         payload = ModelPostPayload(
@@ -264,4 +287,4 @@ def finalize_run(state_values: Any = None, config: RunnableConfig | None = None)
     except Exception:
         logger.warning("[Hook] terminal model_post failed run=%s", state.run_id, exc_info=True)
     finally:
-        state.model_post_done = True
+        state.terminal_post_done = True

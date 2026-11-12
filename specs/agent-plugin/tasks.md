@@ -139,7 +139,7 @@
 
 | 命令 | 结果 | 说明 |
 | --- | --- | --- |
-| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（59 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
+| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（61 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
 | `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services -q` | 通过（2500 passed, 73 skipped, 1 xfailed） | 模型节点、工具节点、图装配、AG-UI、中断与 services 回归全绿 |
 | `uvx ruff@0.14.10 check` / `ruff format --check`（改动文件与 `tests/core/hook`） | 通过 | 无告警 |
 
@@ -169,9 +169,41 @@
 
 验证结果（本轮）：
 
-- `tests/core/hook`：59 passed（含 `test_resume.py` 8 条）。
+- `tests/core/hook`：61 passed（含 `test_resume.py` 10 条）。
 - `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
   73 skipped, 1 xfailed。
 - 未注入 hooks 时 `hook_run_state` 通道不进入 state schema、不写入，零回归用例保持通过。
 - 评审改进建议 W-2（`_prepare_model_post` 显式检查 `model_post_done`）、W-3（处理器线程透传 `contextvars`）、
   W-4（处理器异常回传收窄为 `Exception`）已一并采纳；W-1 由新增真实中断用例覆盖。
+
+## 返工记录（第 2 轮评审，reviewed_sha `9c4d6614`）
+
+阻塞项：F-3 续接快照跨轮泄漏（同一 thread 第 2 个普通轮次起 `model_pre` / `model_post` 被静默跳过，
+且上一轮 `model_pre.replace` 覆盖视图被用于新轮请求）；F-4 纯续流后的最终答复不再触发 `model_post`，
+使 AC4 的 `replace` 在所有审批 / ask 轮次失效。
+
+根因与修复：
+
+- F-3 根因：`restore_run_state` 对任何运行都无条件并入图状态快照，而快照通道随 thread 持久化，
+  新一轮运行会把上一轮的 `model_pre_done` / `model_post_done` / `model_pre_override` 一并带入。
+- F-3 修复：按本轮语义区分——非续流（新的用户轮次）只承接轮序号（上一轮 `turn` + 1），其余
+  `session_*`、`model_pre_done`、`model_post_done`、`model_pre_override`、`model_request_count` 与
+  `tool_pre` 裁决全部重置；只有「纯续流」才并入快照并延续轮序号。
+- F-4 根因：终止补触发复用了 `model_post_done` 这一「每轮一次」标记，导致续流后的最终答复被抑制。
+- F-4 修复：拆成两个独立标记——`model_post_done`（AC4：最终答复触发，可 `replace`）与
+  `terminal_post_done`（AC6：无最终答复的终止补触发）。终止补触发不再吞掉最终答复。
+- 计数口径（写入 `verification.md` 与用例 docstring）：
+  - 普通轮：`model_post` 1 次（AC4，payload 为最终答复）。
+  - 中断终止的运行：补触发 1 次（AC6，payload 为最后一次响应，`replace` / `deny` 忽略）。
+  - 续流后的最终答复：再按 AC4 触发 1 次，`replace` 成为会话实际输出。
+  - 同一轮的重复续流不会重复补触发（`terminal_post_done` 在续流入口置位）。
+- 新增用例：`test_two_consecutive_turns_are_independent`（同 thread 两轮非续流：
+  `model_pre`/`model_post` 各 1 次、`turn` 1→2、覆盖视图不跨轮）、
+  `test_model_post_replace_applies_to_final_answer_after_resume`（续流最终答复的 payload 与替换结果）。
+
+验证结果（本轮）：
+
+- `tests/core/hook`：61 passed（含 `test_resume.py` 10 条）。
+- `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
+  73 skipped, 1 xfailed。
+- 未注入 hooks 时零回归不变。
