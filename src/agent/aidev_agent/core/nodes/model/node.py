@@ -90,6 +90,7 @@ def build_model_node(
     judge_llm: BaseChatModel | None = None,
     tools: List[BaseTool],
     node_options: ModelNodeSettings | None = None,
+    hooks=None,
 ) -> RunnableCallable:
     """创建标准 QA 场景的模型节点。
 
@@ -102,6 +103,7 @@ def build_model_node(
         judge_llm: 判断用 LLM（用于 quality_gate 评估任务完成度）；None 时 fail-open
         tools: 工具列表（全量工具，内部会根据 state 决策筛选）
         node_options: 模型节点选项（可选，不传则使用默认值）
+        hooks: hook 执行器；None 时模型链不插入任何 hook 步骤
 
     Returns:
         RunnableCallable，包含同步和异步两个节点函数
@@ -206,18 +208,21 @@ def build_model_node(
         context_assembly.add_middleware("tool", m)
 
     # 在闭包作用域中一次性构建共享的 LCEL 模型链。
-    model_chain = _build_model_chain(
-        llm=llm,
-        context_assembly=context_assembly,
-        max_retries=node_options.max_model_retries,
-        quality_gate=quality_gate,
-        use_structured_response=use_structured_response,
-        enable_parallel_tool_calls=enable_parallel_tool_calls,
-        use_tool_call_promotion=node_options.use_tool_call_promotion,
-        token_limit=node_options.token_limit,
-        token_margin=node_options.token_margin,
-        track_memory_source=node_options.track_memory_source,
-    )
+    chain_kwargs: Dict[str, Any] = {
+        "llm": llm,
+        "context_assembly": context_assembly,
+        "max_retries": node_options.max_model_retries,
+        "quality_gate": quality_gate,
+        "use_structured_response": use_structured_response,
+        "enable_parallel_tool_calls": enable_parallel_tool_calls,
+        "use_tool_call_promotion": node_options.use_tool_call_promotion,
+        "token_limit": node_options.token_limit,
+        "token_margin": node_options.token_margin,
+        "track_memory_source": node_options.track_memory_source,
+    }
+    if hooks is not None:
+        chain_kwargs["hooks"] = hooks
+    model_chain = _build_model_chain(**chain_kwargs)
 
     def model_node(
         state: ModelState,

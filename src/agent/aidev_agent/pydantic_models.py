@@ -1082,6 +1082,12 @@ class AgentExecutorKwargs(BaseModel):
         description="安全防护配置实例；由 ChatCompletionAgent 从 AgentConfig.security_settings 传入。",
     )
 
+    # 进程内 hook 处理器集合（HookSet）；None 表示未注入，全链路保持基线行为
+    hooks: Optional[Any] = Field(
+        default=None,
+        description="hook 处理器集合（HookSet）；由 AgentInstanceFactory.build_agent(hooks=...) 注入",
+    )
+
 
 class AgentConfig(BaseModel):
     """智能体配置"""

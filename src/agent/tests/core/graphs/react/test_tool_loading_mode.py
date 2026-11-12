@@ -279,6 +279,8 @@ class TestAssemblyStructure:
             "security_settings",
             "wrappers",
             "async_wrappers",
+            # agent-plugin：hook 注入为新增的可选关键字参数，未注入时不改变 wrapper 链形状
+            "hooks",
         ]
 
     def test_filter_runs_once_at_assembly_without_builder_catalog_cache(self):

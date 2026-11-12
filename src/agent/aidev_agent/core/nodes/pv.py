@@ -155,6 +155,7 @@ def make_pv_node(
     *,
     enable_pv_by_paas_runtime: bool = True,
     enable_pv_by_subagent: bool = True,
+    before_dispatch: Callable[[dict, RunnableConfig], None] | None = None,
 ) -> Callable[[dict, RunnableConfig], dict]:
     """构建 PV 节点。
 
@@ -168,12 +169,17 @@ def make_pv_node(
         enable_pv_by_paas_runtime: 是否在检测到 paas_sandbox tool_call 时创建 PV
             （含 read_image —— 其运行时名由 image_uri 解析），默认 True
         enable_pv_by_subagent: 是否在检测到 Agent/sendMessages tool_call 时复用或创建 PV，默认 True
+        before_dispatch: Send 分派前的扩展点（注入 hooks 时串行触发 ``tool_pre``）；None 时不插入
 
     Returns:
         可用于 LangGraph node 的 callable，接受 (state, config) 参数
     """
 
     def pv_node(state: dict, config: RunnableConfig) -> dict:
+        # 步骤 0：Send 分派前的扩展点（hook tool_pre）；纯观察，不改变 PV 判定
+        if before_dispatch is not None:
+            before_dispatch(state, config)
+
         # 步骤 1：检查是否已有 session 级别的 PV
         existing_pv = state.get("runtime_paas_sbx_pv", [])
         existing_session_pv = next((pv for pv in existing_pv if _is_session_pv(pv)), None)

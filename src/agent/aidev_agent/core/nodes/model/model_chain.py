@@ -34,6 +34,8 @@ from tenacity import RetryError
 
 from aidev_agent.config import settings
 from aidev_agent.core.ag_ui.types import SessionPersistenceEventNames
+from aidev_agent.core.hook.run_state import record_model_response
+from aidev_agent.core.hook.stages import apply_model_post, apply_model_post_async, apply_session_and_model_pre
 from aidev_agent.packages.langchain_core.output_parsers import StructuredOutputToToolMessageParser
 from aidev_agent.packages.opentelemetry.context_obs import measure_context, observe_assembly
 from aidev_agent.utils.message_metadata import AssistantCompletionTimestamp, finalize_memory_source
@@ -200,6 +202,7 @@ def _build_model_chain(
     token_limit: int | None = None,
     token_margin: int | None = None,
     track_memory_source: bool = False,
+    hooks=None,
 ) -> Runnable:
     """构建共享的 LCEL 模型链。
 
@@ -221,6 +224,7 @@ def _build_model_chain(
         token_limit: 上下文 token 预算（原值上报，未配置为 None）
         token_margin: 上下文 token 余量（原值上报，未配置为 None）
         track_memory_source: 本次运行是否接入个人记忆；关闭时不标记待结算、不派发记忆来源结算事件
+        hooks: hook 执行器；None 时链结构与方法体保持基线（不新增 Runnable 步骤）
 
     Returns:
         Runnable，支持 .invoke() 和 .ainvoke()
@@ -340,6 +344,8 @@ def _build_model_chain(
                 )
             raise RetryableRateLimitError(ctx.response or AIMessage(content=""))
         ctx.response = response
+        if hooks is not None:
+            record_model_response(ctx.config, response)
         return ctx
 
     async def _acall_llm(ctx: ProcessorContext) -> ProcessorContext:
@@ -421,6 +427,8 @@ def _build_model_chain(
                 )
             raise RetryableRateLimitError(ctx.response or AIMessage(content=""))
         ctx.response = response
+        if hooks is not None:
+            record_model_response(ctx.config, response)
         return ctx
 
     def _finalize_response(ctx: ProcessorContext) -> ProcessorContext:
@@ -475,9 +483,29 @@ def _build_model_chain(
 
     # _exhaustion_fallback 是模块级函数（无闭包依赖）
 
-    model_chain = RunnableLambda(_assemble) | retryable_model_chain.with_fallbacks(
+    def _apply_pre_hooks(ctx: ProcessorContext) -> ProcessorContext:
+        """装配后、首次请求前触发 session_start / model_pre，并应用 append / replace。"""
+        apply_session_and_model_pre(ctx, hooks)
+        return ctx
+
+    def _apply_model_post_hook(ctx: ProcessorContext) -> ProcessorContext:
+        """每轮最终答复后触发 model_post（链尾，重试与回退之外，只执行一次）。"""
+        apply_model_post(ctx, hooks)
+        return ctx
+
+    async def _aapply_model_post_hook(ctx: ProcessorContext) -> ProcessorContext:
+        await apply_model_post_async(ctx, hooks)
+        return ctx
+
+    assembler = RunnableLambda(_assemble)
+    if hooks is not None:
+        assembler = assembler | RunnableLambda(_apply_pre_hooks)
+
+    model_chain = assembler | retryable_model_chain.with_fallbacks(
         [RunnableLambda(_exhaustion_fallback)],
         exceptions_to_handle=(RetryError,),
     )
+    if hooks is not None:
+        model_chain = model_chain | RunnableLambda(_apply_model_post_hook, _aapply_model_post_hook)
 
     return model_chain

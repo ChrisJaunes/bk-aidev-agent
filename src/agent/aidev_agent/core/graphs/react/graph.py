@@ -57,6 +57,8 @@ from aidev_agent.core.graphs.react.tool_loading_mode import (
     filter_tools_by_loading_mode,
     filter_tools_by_request,
 )
+from aidev_agent.core.hook.runner import HookRunner
+from aidev_agent.core.hook.stages import run_tool_pre_stage
 from aidev_agent.core.nodes.knowledge import make_knowledge_node
 from aidev_agent.core.nodes.model import ModelNodeSettings
 from aidev_agent.core.nodes.model import build_model_node as std_make_model_node
@@ -245,10 +247,17 @@ class ReActAgentBuilder:
         self._execute_kwargs: ExecuteKwargs = ExecuteKwargs()
         self._resource_manager = None
         self._personal_memory: PersonalMemoryRuntime | None = None
+        # 进程内 hook 处理器集合（HookSet）；None 表示未注入，装配形状与基线一致
+        self._hooks = None
 
     # ====================================================================================================
     # 模型设置
     # ====================================================================================================
+    def set_hooks(self, hooks) -> "ReActAgentBuilder":
+        """注入 hook 处理器集合（HookSet）；``None`` 表示不启用 hook。"""
+        self._hooks = hooks
+        return self
+
     def enable_personal_memory(self, runtime: PersonalMemoryRuntime) -> "ReActAgentBuilder":
         """启用自动个人记忆：注入使用宿主请求上下文的 `PersonalMemoryRuntime`。
 
@@ -655,6 +664,10 @@ class ReActAgentBuilder:
         if options.execute_kwargs is not None:
             self._execute_kwargs = options.execute_kwargs
 
+        # hook 处理器集合（由 AgentInstanceFactory 注入）；None 时不改变装配形状
+        if options.hooks is not None:
+            self.set_hooks(options.hooks)
+
         # RuntimeBackendResolver（由调用方构造并注入）——必须先于 skills 块内
         # enable_runtime_paas/local（新方案下这些调用要求 resolver 已存在）
         if options.runtime_backend_resolver is not None:
@@ -843,6 +856,7 @@ class ReActAgentBuilder:
         judge_llm: BaseChatModel | None,
         tools: List[BaseTool],
         node_options_kwargs: dict[str, Any] | None = None,
+        hooks: HookRunner | None = None,
     ):
         """创建模型节点。
 
@@ -856,6 +870,7 @@ class ReActAgentBuilder:
             tools: 模型节点绑定的工具列表
             node_options_kwargs: 调用方追加的 ModelNodeSettings 参数，覆盖 SDK 推导值；
                 其中的 extra_*_middlewares 排在 SDK 自带中间件之后
+            hooks: hook 执行器；None 时模型链不插入任何 hook 步骤
 
         Returns:
             model_node: 模型节点
@@ -918,13 +933,16 @@ class ReActAgentBuilder:
         node_options.extra_template_middlewares[:0] = sdk_template_middlewares
 
         # 创建模型节点
-        model_node = std_make_model_node(
-            llm=llm,
-            non_thinking_llm=non_thinking_llm,
-            judge_llm=judge_llm,
-            tools=tools,
-            node_options=node_options,
-        )
+        model_node_kwargs: dict[str, Any] = {
+            "llm": llm,
+            "non_thinking_llm": non_thinking_llm,
+            "judge_llm": judge_llm,
+            "tools": tools,
+            "node_options": node_options,
+        }
+        if hooks is not None:
+            model_node_kwargs["hooks"] = hooks
+        model_node = std_make_model_node(**model_node_kwargs)
 
         return model_node
 
@@ -1113,11 +1131,15 @@ class ReActAgentBuilder:
             resolver.register(backend_type_name, backend_cls)
         self._a2a_resolver = resolver
 
-    def _prepare_agent_pv_node(self):
+    def _prepare_agent_pv_node(self, tools: List[BaseTool] | None = None):
         """构造 PV Node，用于惰性创建/获取持久卷。
 
         仅在启用 paas_sandbox runtime 时注入真实的 BkPaaSSandboxApi client；
         否则仍返回 pv_node callable（无 PV 支持），保持图结构一致。
+
+        Args:
+            tools: 图绑定的工具列表；注入 hooks 时用于在 Send 分派前串行触发 ``tool_pre``
+                （代理解包场景下需按真实工具名判定）。
 
         Returns:
             pv_node callable
@@ -1133,12 +1155,24 @@ class ReActAgentBuilder:
             paas_app_code = executor_info.get("app_code", "")
             if paas_app_code and self._resource_manager is not None:
                 paas_client = self._resource_manager.get_paas_sbx_client(executor_info)
-        return make_pv_node(
-            client=paas_client,
-            app_code=paas_app_code,
-            resource_manager=self._resource_manager,
-            enable_pv_by_subagent=bool(self._enable_a2a_tool),
-        )
+        before_dispatch = None
+        if self._hooks is not None:
+            tool_list = list(tools or [])
+
+            def _tool_pre_stage(state: dict, config: RunnableConfig) -> None:
+                run_tool_pre_stage(state, config, tool_list)
+
+            before_dispatch = _tool_pre_stage
+
+        pv_kwargs: dict[str, Any] = {
+            "client": paas_client,
+            "app_code": paas_app_code,
+            "resource_manager": self._resource_manager,
+            "enable_pv_by_subagent": bool(self._enable_a2a_tool),
+        }
+        if before_dispatch is not None:
+            pv_kwargs["before_dispatch"] = before_dispatch
+        return make_pv_node(**pv_kwargs)
 
     def _prepare_agent_interrupt_node(self, *, tools: List[BaseTool]):
         """构造中断检查节点 (approval_check)。【已废弃】
@@ -1164,6 +1198,7 @@ class ReActAgentBuilder:
         tags: List[str] | None = None,
         langchain_middleware: Sequence[AgentMiddleware],
         node_options: ToolNodeSettings,
+        hooks: HookRunner | None = None,
     ):
         middleware_w_wrap_tool_call = [
             m.wrap_tool_call
@@ -1202,6 +1237,7 @@ class ReActAgentBuilder:
                 async_wrappers=middleware_w_awrap_tool_call,
                 node_options=node_options,
                 security_settings=security_settings,
+                **({"hooks": hooks} if hooks is not None else {}),
             )
         return None
 
@@ -1415,6 +1451,9 @@ class ReActAgentBuilder:
 
         self._prepare_agent_options()
 
+        # hook 执行器为每次 build() 新建；未注入时全链路保持 None
+        hook_runner = HookRunner(self._hooks) if self._hooks is not None else None
+
         # Skills / runtime tools setup (must run before preparing tools)
         if self._enable_skills:
             self._prepare_skills()
@@ -1439,30 +1478,35 @@ class ReActAgentBuilder:
         )
 
         # 统一处理 model_node
-        model_node = self._prepare_agent_model_node(
-            llm=self._llm,
-            non_thinking_llm=non_thinking_llm,
-            judge_llm=judge_llm,
+        model_node_kwargs: dict[str, Any] = {
+            "llm": self._llm,
+            "non_thinking_llm": non_thinking_llm,
+            "judge_llm": judge_llm,
             # 延迟加载时模型只绑定内置 + 元工具，目录经模板中间件注入；ToolNode 仍持全量 tools
-            tools=builtin_tools if lazy_catalog is not None else tools,
-            node_options_kwargs=(
+            "tools": builtin_tools if lazy_catalog is not None else tools,
+            "node_options_kwargs": (
                 {"extra_template_middlewares": [ToolDirectoryMiddleware(catalog=lazy_catalog)]}
                 if lazy_catalog is not None
                 else None
             ),
-        )
+        }
+        if hook_runner is not None:
+            model_node_kwargs["hooks"] = hook_runner
+        model_node = self._prepare_agent_model_node(**model_node_kwargs)
 
         # 构造 PV Node
-        pv_node = self._prepare_agent_pv_node()
+        pv_node = self._prepare_agent_pv_node(tools=tools) if hook_runner is not None else self._prepare_agent_pv_node()
 
         # 统一处理 tool_node：tool_call 代理解包与延迟加载同生共死，由装配层推导、无条件覆盖
         tool_node_options = self._tool_node_options or ToolNodeSettings()
         tool_node_options.use_tool_call_proxy = lazy_catalog is not None
-        tool_node = self._prepare_agent_tool_node(
-            tools,
-            langchain_middleware=self._langchain_middleware,
-            node_options=tool_node_options,
-        )
+        tool_node_kwargs: dict[str, Any] = {
+            "langchain_middleware": self._langchain_middleware,
+            "node_options": tool_node_options,
+        }
+        if hook_runner is not None:
+            tool_node_kwargs["hooks"] = hook_runner
+        tool_node = self._prepare_agent_tool_node(tools, **tool_node_kwargs)
 
         # 初始化 Store
         store = self._prepare_store(store=self._store, file_store=self._file_store)

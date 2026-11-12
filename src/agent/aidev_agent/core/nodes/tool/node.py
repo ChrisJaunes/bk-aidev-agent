@@ -40,6 +40,12 @@ from aidev_agent.utils.tool_result import is_error_content
 
 from .approval_wrapper import itsm_approval_async_wrapper, itsm_approval_sync_wrapper
 from .deduplication import KnowledgeToolNode, deduplicate_async, deduplicate_sync
+from .hook_wrapper import (
+    build_tool_post_async_wrapper,
+    build_tool_post_sync_wrapper,
+    build_tool_pre_async_wrapper,
+    build_tool_pre_sync_wrapper,
+)
 from .json_repair_wrapper import json_repair_on_error_async_wrapper, json_repair_on_error_sync_wrapper
 from .loop_guard import (
     LoopGuardPolicy,
@@ -259,6 +265,7 @@ def build_tool_node(
     security_settings: SecuritySettings | None = None,
     wrappers: Sequence[ToolCallWrapper] | None = None,
     async_wrappers: Sequence[AsyncToolCallWrapper] | None = None,
+    hooks=None,
 ) -> ToolNode:
     """构造带有中间件支持的 ToolNode。
 
@@ -281,6 +288,7 @@ def build_tool_node(
             （配置缺失不静默降级为默认规则脱敏）。
         wrappers: 可选的自定义同步包装器列表，会在内置包装器之后执行。
         async_wrappers: 可选的自定义异步包装器列表，会在内置包装器之后执行。
+        hooks: hook 执行器；None 时不改变 wrapper 列表形状（零回归）。
 
     Returns:
         配置了中间件的 ToolNode 实例。
@@ -359,9 +367,17 @@ def build_tool_node(
         tools_by_name = {tool.name: tool for tool in tools}
         sync_wrapper_list.insert(0, build_tool_call_unwrap_sync_wrapper(tools_by_name))
         async_wrapper_list.insert(0, build_tool_call_unwrap_async_wrapper(tools_by_name))
+    # tool_pre 应用 wrapper：位于代理解包之后、不可信净化 / 脱敏 / ITSM 审批之前。
+    if hooks is not None:
+        sync_wrapper_list.insert(1 if node_options.use_tool_call_proxy else 0, build_tool_pre_sync_wrapper(hooks))
+        async_wrapper_list.insert(1 if node_options.use_tool_call_proxy else 0, build_tool_pre_async_wrapper(hooks))
     # 在结果改名、限长、净化和事件发送前识别原始错误内容。
     sync_wrapper_list.append(_content_error_sync_wrapper)
     async_wrapper_list.append(_content_error_async_wrapper)
+    # tool_post wrapper：链最内层，看到未脱敏原文；输出继续流经 _content_error / 去重 / 截断 / 脱敏 / 净化。
+    if hooks is not None:
+        sync_wrapper_list.append(build_tool_post_sync_wrapper(hooks))
+        async_wrapper_list.append(build_tool_post_async_wrapper(hooks))
     if node_options.enable_tool_loop_guard:
         loop_guard = LoopGuardPolicy(
             repeat_limit=BKAI_TOOL_LOOP_REPEAT_LIMIT,

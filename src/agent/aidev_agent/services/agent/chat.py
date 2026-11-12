@@ -40,6 +40,7 @@ from aidev_agent.core.ag_ui.utils import (
     get_stream_payload_input,
 )
 from aidev_agent.core.citations import uses_citations
+from aidev_agent.core.hook.run_state import bind_run_state, finalize_run
 from aidev_agent.core.nodes.model import convert_chat_history_to_messages
 from aidev_agent.core.tools.a2a_tools.types import AgentBackendType, AgentSpec
 from aidev_agent.core.tools.runtime_tools import RuntimeBackendResolver
@@ -184,6 +185,14 @@ class ChatCompletionAgent(BaseModel):
     字段名保留为 ``agent_cls`` 避免外部破坏，但语义已是「实例」。"""
     messages: list[BaseMessage] = Field(default_factory=list)
     checkpointer: BaseCheckpointSaver | None = None
+    hooks: Any = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "hook 处理器集合（HookSet）；由 AgentInstanceFactory.build_agent(hooks=...) 经 ChatBuildExtras "
+            "注入。None 表示不启用 hook，运行态不写任何键。"
+        ),
+    )
 
     event_handler: Callable[[BaseEvent], None] | None = None
     mcp_fetch_failures: list[dict] = Field(default_factory=list, description="MCP 工具拉取失败记录，用于流式事件")
@@ -297,6 +306,8 @@ class ChatCompletionAgent(BaseModel):
 
         if chat.agent_cls is not None:
             self.agent_cls = chat.agent_cls
+        if chat.hooks is not None:
+            self.hooks = chat.hooks
         if ctx.session_code is not None:
             self.thread_id = ctx.session_code
         if ctx.event_handler is not None:
@@ -1043,6 +1054,7 @@ class ChatCompletionAgent(BaseModel):
         cfg["configurable"]["thread_id"] = self.thread_id
         cfg["configurable"]["execute_kwargs"] = execute_kwargs
         self._execute_kwargs = execute_kwargs
+        self._bind_hook_run_state(cfg, execute_kwargs, messages)
 
         # 清除 checkpoint 中的旧消息，避免与平台消息重复
         # 平台传入的 messages 已包含完整历史，无需拼接
@@ -1058,16 +1070,45 @@ class ChatCompletionAgent(BaseModel):
 
         if execute_kwargs.stream:
             if execute_kwargs.legacy_streaming:
-                return self._stream_with_legacy(agent_e, cfg, state, messages)
+                stream = self._stream_with_legacy(agent_e, cfg, state, messages)
             else:
-                return self._stream(agent_e, cfg, state, messages, execute_kwargs)
+                stream = self._stream(agent_e, cfg, state, messages, execute_kwargs)
+            if self.hooks is None:
+                return stream
+            return self._finalize_stream(stream, cfg)
 
         else:
             from aidev_agent.services.resume_events import uses_resume_event_stream
 
-            if uses_resume_event_stream(self.resource_manager, execute_kwargs):
-                return self._invoke_resume_with_events(agent_e, cfg, state, messages, execute_kwargs)
-            return self._invoke(agent_e, cfg, state, messages, execute_kwargs)
+            try:
+                if uses_resume_event_stream(self.resource_manager, execute_kwargs):
+                    return self._invoke_resume_with_events(agent_e, cfg, state, messages, execute_kwargs)
+                return self._invoke(agent_e, cfg, state, messages, execute_kwargs)
+            finally:
+                if self.hooks is not None:
+                    finalize_run(None, cfg)
+
+    def _bind_hook_run_state(
+        self, cfg: RunnableConfig, execute_kwargs: ExecuteKwargs, messages: list[BaseMessage]
+    ) -> None:
+        """把 hook 运行态绑定到本次运行；未注入 hooks 时不写任何键。"""
+        if self.hooks is None:
+            return
+        run_id = execute_kwargs.turn_id or (getattr(messages[-1], "id", None) if messages else None) or ""
+        bind_run_state(
+            cfg,
+            self.hooks,
+            agent_code=self.memory_agent_code or (self.agent_info or {}).get("agent_code", ""),
+            session_code=self.thread_id or execute_kwargs.session_code or "",
+            run_id=str(run_id),
+        )
+
+    def _finalize_stream(self, stream, cfg: RunnableConfig):
+        """流式出口包装：迭代结束（含异常、客户端断开）时补触发运行收尾。"""
+        try:
+            yield from stream
+        finally:
+            finalize_run(None, cfg)
 
     def _invoke_resume_with_events(self, agent_e, cfg, state, messages, execute_kwargs):
         """Keep a non-stream HTTP response while using the AG-UI resume/persistence path.
@@ -1655,6 +1696,7 @@ class ChatCompletionAgent(BaseModel):
             resource_manager=self.resource_manager,
             security_settings=self.security_settings,
             runtime_backend_resolver=self.runtime_backend_resolver,
+            hooks=self.hooks,
         )
 
     def _refresh_llm_history_image_urls(self, chat_history: list[ChatPrompt]) -> None:
