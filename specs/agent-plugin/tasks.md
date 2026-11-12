@@ -139,7 +139,7 @@
 
 | 命令 | 结果 | 说明 |
 | --- | --- | --- |
-| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（61 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
+| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（63 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
 | `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services -q` | 通过（2500 passed, 73 skipped, 1 xfailed） | 模型节点、工具节点、图装配、AG-UI、中断与 services 回归全绿 |
 | `uvx ruff@0.14.10 check` / `ruff format --check`（改动文件与 `tests/core/hook`） | 通过 | 无告警 |
 
@@ -169,7 +169,7 @@
 
 验证结果（本轮）：
 
-- `tests/core/hook`：61 passed（含 `test_resume.py` 10 条）。
+- `tests/core/hook`：63 passed（含 `test_resume.py` 12 条）。
 - `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
   73 skipped, 1 xfailed。
 - 未注入 hooks 时 `hook_run_state` 通道不进入 state schema、不写入，零回归用例保持通过。
@@ -203,7 +203,33 @@
 
 验证结果（本轮）：
 
-- `tests/core/hook`：61 passed（含 `test_resume.py` 10 条）。
+- `tests/core/hook`：63 passed（含 `test_resume.py` 12 条）。
 - `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
   73 skipped, 1 xfailed。
 - 未注入 hooks 时零回归不变。
+
+## 返工记录（第 3 轮评审，reviewed_sha `0258307a`）
+
+阻塞项：F-5「续流 + 新输入（跳过提问）」被归入新一轮时清空 `tool_pre_decisions`，挂起的 `ask`
+在续流后取不到裁决直接执行工具，未获批的工具照常运行（AC8 审批闸门被绕过）。
+
+根因与修复：
+
+- 根因：F-3 的「新一轮重置」把 `tool_pre_decisions` 一并清空，但「跳过提问 + 新输入」发生在
+  挂起批次尚未落地时，工具 wrapper 仍会重新进入同一个挂起调用，需要原裁决。
+- 修复：新一轮只重置**本轮级**标记（`model_pre_done` / `model_post_done` / `model_pre_override`
+  / `model_request_count` / `session_*`），`tool_pre` 裁决改为按 `tool_call_id` 只保留**仍挂起**
+  （尚无 `ToolMessage`）的调用，其余丢弃（`core/hook/run_state.py::_pending_decisions`）。
+  这样 `deny` / `replace` / `ask` 在换轮后同样生效，且不会把已完成调用的裁决带进新轮。
+- 新增用例（真实 `interrupt()` + `Command(resume=..., update={"messages": [...]})`，`ExecuteKwargs.input` 非空）：
+  - `test_skip_with_new_input_keeps_ask_denied`：跳过提问时工具执行 0 次、结果 `status=error`；
+    新一轮 `model_pre` 按新轮触发 1 次（`turn` 1→2）。
+  - `test_skip_with_new_input_keeps_deny_and_replace`：同批次 replace / deny / ask 混合，换轮后
+    replace 参数为改写值、deny 与 ask 的调用均不执行。
+
+验证结果（本轮）：
+
+- `tests/core/hook`：63 passed（含 `test_resume.py` 12 条）。
+- `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
+  73 skipped, 1 xfailed。
+- F-3 / F-4 已确认行为未回退（连续两轮、纯续流最终答复 `replace` 用例保持通过）。

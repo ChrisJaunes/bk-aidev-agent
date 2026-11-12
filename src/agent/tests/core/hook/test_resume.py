@@ -47,10 +47,10 @@ def _route(state: dict) -> str:
     return END
 
 
-def _new_config(hooks: HookSet | None, thread_id: str, *, resume: Any = None) -> dict:
+def _new_config(hooks: HookSet | None, thread_id: str, *, resume: Any = None, input_text: str = "") -> dict:
     config: dict = {"configurable": {"thread_id": thread_id}, "callbacks": []}
     if resume is not None:
-        config["configurable"]["execute_kwargs"] = ExecuteKwargs(resume=resume)
+        config["configurable"]["execute_kwargs"] = ExecuteKwargs(resume=resume, input=input_text)
     bind_run_state(config, hooks, agent_code="agent", session_code=thread_id, run_id="run-1")
     return config
 
@@ -416,3 +416,108 @@ def test_two_consecutive_turns_are_independent(fake_llm, build_model_node_with_h
     second_request = llm.calls[1]
     assert second_request
     assert all(getattr(message, "content", "") != marker for message in second_request)
+
+
+def test_skip_with_new_input_keeps_ask_denied(fake_llm, build_model_node_with_hooks) -> None:
+    """AC8 跳过提问（resume + 新输入）时挂起的 ask 未获批准，工具不执行且返回 error。"""
+    calls: list[dict] = []
+    tools = [_make_tool("alpha", calls)]
+    pre_turns: list[int] = []
+    post_calls: list[tuple[int, str]] = []
+
+    def model_pre(context):
+        pre_turns.append(context.identity.turn)
+
+    def model_post(context):
+        post_calls.append((context.identity.turn, context.payload.response.content))
+
+    hooks = HookSet(
+        {
+            HookPoint.MODEL_PRE: [model_pre],
+            HookPoint.MODEL_POST: [model_post],
+            HookPoint.TOOL_PRE: [lambda context: HookDecision(kind=HookDecisionKind.ASK, reason="need approval")],
+        }
+    )
+    llm = fake_llm(
+        [
+            AIMessage(content="", tool_calls=[_tool_call("call-1", "alpha")]),
+            AIMessage(content="skipped-final"),
+        ]
+    )
+    graph = _build_graph(build_model_node_with_hooks(llm, hooks=hooks, tools=tools), tools, hooks)
+
+    first = _new_config(hooks, "thread-skip")
+    graph.invoke({"messages": [HumanMessage(content="hello")]}, first)
+    assert _interrupts(graph, first)
+    finalize_run(None, first)
+
+    # 跳过提问：resume 答案为空 + 新用户输入
+    resume_value = [{"payload": {"answers": []}}]
+    second = _new_config(hooks, "thread-skip", resume=resume_value, input_text="换个问题")
+    graph.invoke(
+        Command(resume=resume_value, update={"messages": [HumanMessage(content="换个问题")]}),
+        second,
+    )
+
+    assert calls == []
+    tool_messages = [
+        message for message in graph.get_state(second).values["messages"] if isinstance(message, ToolMessage)
+    ]
+    assert tool_messages
+    assert tool_messages[-1].status == "error"
+    assert "hook ask not approved" in tool_messages[-1].content
+
+    # 新一轮：model_pre 按新轮触发 1 次，turn 递增
+    assert pre_turns == [1, 2]
+    assert post_calls[-1][1] == "skipped-final"
+
+
+def test_skip_with_new_input_keeps_deny_and_replace(fake_llm, build_model_node_with_hooks) -> None:
+    """AC8 跳过提问换轮时，同批次挂起的 deny / replace 裁决仍按 tool_call_id 生效。"""
+    alpha_calls: list[dict] = []
+    beta_calls: list[dict] = []
+    gamma_calls: list[dict] = []
+    tools = [
+        _make_tool("alpha", alpha_calls),
+        _make_tool("beta", beta_calls),
+        _make_tool("gamma", gamma_calls),
+    ]
+
+    def tool_pre(context):
+        if context.payload.tool_name == "alpha":
+            return HookDecision(kind=HookDecisionKind.REPLACE, payload={"query": "rewritten"})
+        if context.payload.tool_name == "beta":
+            return HookDecision(kind=HookDecisionKind.DENY, reason="blocked")
+        return HookDecision(kind=HookDecisionKind.ASK, reason="need approval")
+
+    hooks = HookSet({HookPoint.TOOL_PRE: [tool_pre]})
+    llm = fake_llm(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _tool_call("call-1", "alpha"),
+                    _tool_call("call-2", "beta"),
+                    _tool_call("call-3", "gamma"),
+                ],
+            ),
+            AIMessage(content="skipped-final"),
+        ]
+    )
+    graph = _build_graph(build_model_node_with_hooks(llm, hooks=hooks, tools=tools), tools, hooks)
+
+    first = _new_config(hooks, "thread-skip-batch")
+    graph.invoke({"messages": [HumanMessage(content="hello")]}, first)
+    assert _interrupts(graph, first)
+    finalize_run(None, first)
+
+    resume_value = [{"payload": {"answers": []}}]
+    second = _new_config(hooks, "thread-skip-batch", resume=resume_value, input_text="换个问题")
+    graph.invoke(
+        Command(resume=resume_value, update={"messages": [HumanMessage(content="换个问题")]}),
+        second,
+    )
+
+    assert alpha_calls == [{"name": "alpha", "query": "rewritten"}]
+    assert beta_calls == []
+    assert gamma_calls == []

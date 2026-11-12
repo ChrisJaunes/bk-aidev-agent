@@ -29,7 +29,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import AnyMessage, messages_from_dict, messages_to_dict
+from langchain_core.messages import AIMessage, AnyMessage, ToolMessage, messages_from_dict, messages_to_dict
 from langchain_core.runnables import RunnableConfig
 
 from .contexts import HookIdentity, ModelPostPayload
@@ -213,12 +213,13 @@ def restore_run_state(state_values: Any, config: RunnableConfig | None) -> None:
 
     同一运行内只处理一次：本运行后续节点的写入不会再被旧快照覆盖。
 
-    - 非续流（新的用户轮次）：只承接轮序号（上一轮 ``turn`` + 1），其余全部重置——上一轮的
-      ``model_pre_done`` / ``model_post_done`` / ``model_pre_override`` 与 ``tool_pre`` 裁决都不
-      带入新一轮。
+    - 非续流（新的用户轮次）：只承接轮序号（上一轮 ``turn`` + 1），本轮级标记（``model_pre_done``
+      / ``model_post_done`` / ``model_pre_override`` 等）全部重置；仍处于挂起状态（尚无 ToolMessage）
+      的 ``tool_pre`` 裁决按 ``tool_call_id`` 保留，避免丢弃尚未落地的审批裁决。
     - 纯续流（同一条消息的中断续流）：并入快照，轮序号延续；上一段运行没有最终答复即终止，
       终止触发（AC6）已消费过，续流后不再重复补触发。
-    - 续流携带新的用户输入（跳过提问）：视为新一轮，轮序号 +1 并重新开放点位。
+    - 续流携带新的用户输入（跳过提问）：视为新一轮，轮序号 +1 并重新开放点位；挂起批次的
+      ``tool_pre`` 裁决同样保留，未获批准的 ``ask`` 不得因换轮而放行。
     """
     state = get_run_state(config)
     if state is None or not isinstance(state_values, dict) or state.persisted_merged:
@@ -237,7 +238,7 @@ def restore_run_state(state_values: Any, config: RunnableConfig | None) -> None:
                 state.terminal_post_done = True
         return
 
-    # 新一轮：只承接轮序号，其余按新一轮重新开始
+    # 新一轮：承接轮序号并重置本轮级标记；挂起批次的 tool_pre 裁决继续保留
     persisted = state_values.get(HOOK_STATE_CHANNEL)
     previous_turn = persisted.get("turn") if isinstance(persisted, dict) else 0
     state.turn = int(previous_turn or 0) + 1
@@ -249,8 +250,35 @@ def restore_run_state(state_values: Any, config: RunnableConfig | None) -> None:
     state.model_post_done = False
     state.model_request_count = 0
     state.last_response = None
-    state.tool_pre_decisions = {}
     state.terminal_post_done = False
+    state.tool_pre_decisions = _pending_decisions(state_values, persisted)
+
+
+def _pending_decisions(state_values: dict, persisted: Any) -> dict[str, HookDecision]:
+    """只保留仍挂起（尚未产出 ToolMessage）的 tool_call 裁决。
+
+    「跳过提问 + 新输入」会在挂起批次尚未落地时进入新一轮；裁决按 ``tool_call_id`` 继续生效，
+    未获批准的 ``ask`` 不会因换轮而放行，``deny`` / ``replace`` 也保持原有语义。
+    """
+    if not isinstance(persisted, dict):
+        return {}
+    raw_decisions = persisted.get("tool_pre_decisions") or {}
+    if not raw_decisions:
+        return {}
+    messages = state_values.get("messages") or []
+    if not messages:
+        return {}
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not getattr(last, "tool_calls", None):
+        return {}
+    done_ids = {message.tool_call_id for message in messages if isinstance(message, ToolMessage)}
+    pending_ids = {call.get("id") for call in last.tool_calls if call.get("id") and call.get("id") not in done_ids}
+    retained: dict[str, HookDecision] = {}
+    for tool_call_id in pending_ids:
+        decision = _decision_from_mapping(raw_decisions.get(tool_call_id))
+        if decision is not None:
+            retained[tool_call_id] = decision
+    return retained
 
 
 def finalize_run(state_values: Any = None, config: RunnableConfig | None = None) -> None:
