@@ -27,6 +27,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 
 from aidev_agent.api.paas_client import Client
+from aidev_agent.core.hook.run_state import HOOK_STATE_CHANNEL, dump_run_state
 from aidev_agent.core.tools.read_image import _parse_image_uri
 from aidev_agent.pydantic_models import ExecuteKwargs
 
@@ -148,6 +149,14 @@ def _delete_unpersisted_volume(client: Client, app_code: str, volume_id: str) ->
         logger.warning("PV cleanup failed: volume_id=%s", volume_id, exc_info=True)
 
 
+def _with_hook_state(result: dict, config: RunnableConfig) -> dict:
+    """把本轮 tool_pre 裁决写进图状态快照，供中断续流后的工具 wrapper 续接。"""
+    hook_state = dump_run_state(config)
+    if hook_state is None:
+        return result
+    return {**result, HOOK_STATE_CHANNEL: hook_state}
+
+
 def make_pv_node(
     client: Client,
     app_code: str,
@@ -180,6 +189,12 @@ def make_pv_node(
         if before_dispatch is not None:
             before_dispatch(state, config)
 
+        result = _collect_pv(state, config)
+        if before_dispatch is None:
+            return result
+        return _with_hook_state(result, config)
+
+    def _collect_pv(state: dict, config: RunnableConfig) -> dict:
         # 步骤 1：检查是否已有 session 级别的 PV
         existing_pv = state.get("runtime_paas_sbx_pv", [])
         existing_session_pv = next((pv for pv in existing_pv if _is_session_pv(pv)), None)

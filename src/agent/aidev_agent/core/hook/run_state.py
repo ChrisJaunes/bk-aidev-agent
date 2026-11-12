@@ -17,8 +17,10 @@ to the current version of the project delivered to anyone in the future.
 
 hook 运行态：随 ``config["configurable"]`` 传递的 per-run 内存对象。
 
-不写图状态、不落库、不进 AG-UI 快照；未注入 hooks 时不写入任何键，运行收尾也不读取
-任何图状态（零回归）。
+中断续流是一次新的运行（新的 config），因此运行态中的「每轮一次」标记与 ``tool_pre`` 裁决必须
+按 thread 续接：整轮只读的进度快照落在图状态 ``hook_run_state`` 通道（由模型节点与 pv 节点写、
+无 hooks 时不写），新运行在模型节点 / pv 节点 / 工具 wrapper 入口按快照续接，续流后不重复触发、
+不丢失裁决。未注入 hooks 时不写入任何键，运行收尾也不读取任何图状态（零回归）。
 """
 
 from __future__ import annotations
@@ -27,27 +29,33 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, messages_from_dict, messages_to_dict
 from langchain_core.runnables import RunnableConfig
 
 from .contexts import HookIdentity, ModelPostPayload
-from .decisions import PASS, HookDecision
+from .decisions import PASS, HookDecision, HookDecisionKind
 from .points import HookPoint
 from .registry import HookSet
 from .runner import HookRunner
 
 __all__ = [
     "HOOK_RUN_STATE_KEY",
+    "HOOK_STATE_CHANNEL",
     "HookRunState",
     "bind_run_state",
+    "dump_run_state",
     "get_run_state",
     "finalize_run",
     "record_model_response",
+    "restore_run_state",
 ]
 
 logger = logging.getLogger(__name__)
 
 HOOK_RUN_STATE_KEY = "aidev_hook_run_state"
+
+HOOK_STATE_CHANNEL = "hook_run_state"
+"""图状态中的续接快照通道（仅在注入 hooks 时进入 state schema 并被写入）。"""
 
 
 @dataclass
@@ -81,6 +89,7 @@ class HookRunState:
     model_request_count: int = 0
     last_response: Any = None
     tool_pre_decisions: dict[str, HookDecision] = field(default_factory=dict)
+    persisted_merged: bool = False
 
     def identity(self) -> HookIdentity:
         """构造处理器可见的只读标识。"""
@@ -90,6 +99,59 @@ class HookRunState:
             run_id=self.run_id,
             turn=self.turn,
         )
+
+    def to_mapping(self) -> dict:
+        """导出可 JSON 序列化的续接快照（写进图状态 ``hook_run_state`` 通道）。"""
+        override = None
+        if self.model_pre_override is not None:
+            override = messages_to_dict(self.model_pre_override)
+        return {
+            "turn": self.turn,
+            "model_pre_done": self.model_pre_done,
+            "model_pre_override": override,
+            "model_pre_anchor_ids": sorted(self.model_pre_anchor_ids),
+            "model_post_done": self.model_post_done,
+            "model_request_count": self.model_request_count,
+            "tool_pre_decisions": {
+                tool_call_id: _decision_to_mapping(decision)
+                for tool_call_id, decision in self.tool_pre_decisions.items()
+            },
+        }
+
+    def merge_mapping(self, persisted: dict) -> None:
+        """把续接快照并回运行态：只前进不后退，已有裁决不被覆盖。"""
+        turn = persisted.get("turn")
+        if isinstance(turn, int) and turn > self.turn:
+            self.turn = turn
+        self.model_pre_done = self.model_pre_done or bool(persisted.get("model_pre_done"))
+        self.model_post_done = self.model_post_done or bool(persisted.get("model_post_done"))
+        self.model_request_count = max(self.model_request_count, int(persisted.get("model_request_count") or 0))
+        if self.model_pre_override is None:
+            override = persisted.get("model_pre_override")
+            if isinstance(override, list) and override:
+                self.model_pre_override = messages_from_dict(override)
+                anchor_ids = persisted.get("model_pre_anchor_ids") or []
+                self.model_pre_anchor_ids = frozenset(str(each) for each in anchor_ids)
+        for tool_call_id, raw in (persisted.get("tool_pre_decisions") or {}).items():
+            if tool_call_id in self.tool_pre_decisions:
+                continue
+            decision = _decision_from_mapping(raw)
+            if decision is not None:
+                self.tool_pre_decisions[tool_call_id] = decision
+
+
+def _decision_to_mapping(decision: HookDecision) -> dict:
+    return {"kind": decision.kind.value, "reason": decision.reason, "payload": decision.payload}
+
+
+def _decision_from_mapping(raw: Any) -> HookDecision | None:
+    if not isinstance(raw, dict):
+        return None
+    try:
+        kind = HookDecisionKind(raw.get("kind"))
+    except ValueError:
+        return None
+    return HookDecision(kind=kind, reason=raw.get("reason") or "", payload=raw.get("payload"))
 
 
 def bind_run_state(
@@ -132,6 +194,48 @@ def record_model_response(config: RunnableConfig | None, response: Any) -> None:
         return
     state.model_request_count += 1
     state.last_response = response
+
+
+def dump_run_state(config: RunnableConfig | None) -> dict | None:
+    """导出当前运行态的续接快照；未注入 hooks 时返回 ``None``（不写图状态）。"""
+    state = get_run_state(config)
+    if state is None:
+        return None
+    return state.to_mapping()
+
+
+def restore_run_state(state_values: Any, config: RunnableConfig | None) -> None:
+    """从图状态快照续接运行态（模型节点、pv 节点与工具 wrapper 入口调用）。
+
+    同一运行内只并入一次快照：续流是新运行，续接后本运行后续节点的写入不会再被旧快照覆盖。
+
+    - 纯续流（无新用户输入）：上一段运行已在终止路径（中断）按 AC6 消费本轮 ``model_post``
+      预算，续流后不再重复触发。
+    - 续流携带新的用户输入（跳过提问）：视为新一轮，轮序号 +1 并重新开放 ``model_pre`` /
+      ``model_post``。
+    """
+    state = get_run_state(config)
+    if state is None or not isinstance(state_values, dict) or state.persisted_merged:
+        return
+    persisted = state_values.get(HOOK_STATE_CHANNEL)
+    if isinstance(persisted, dict):
+        state.merge_mapping(persisted)
+    state.persisted_merged = True
+
+    configurable = config.get("configurable") if isinstance(config, dict) else None
+    execute_kwargs = (configurable or {}).get("execute_kwargs")
+    if not getattr(execute_kwargs, "resume", None):
+        return
+    if getattr(execute_kwargs, "input", ""):
+        # 跳过提问后用户直接输入新消息：新一轮从 1 重新计数，覆盖视图不再继承
+        state.turn += 1
+        state.model_pre_done = False
+        state.model_post_done = False
+        state.model_pre_override = None
+        state.model_pre_anchor_ids = frozenset()
+        return
+    if state.model_request_count > 0:
+        state.model_post_done = True
 
 
 def finalize_run(state_values: Any = None, config: RunnableConfig | None = None) -> None:

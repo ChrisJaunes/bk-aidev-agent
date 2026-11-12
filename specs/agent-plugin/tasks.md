@@ -139,7 +139,7 @@
 
 | 命令 | 结果 | 说明 |
 | --- | --- | --- |
-| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（50 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
+| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（58 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
 | `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services -q` | 通过（2500 passed, 73 skipped, 1 xfailed） | 模型节点、工具节点、图装配、AG-UI、中断与 services 回归全绿 |
 | `uvx ruff@0.14.10 check` / `ruff format --check`（改动文件与 `tests/core/hook`） | 通过 | 无告警 |
 
@@ -147,3 +147,29 @@
 
 - `tests/core/graphs/react/test_tool_loading_mode.py` 的 `build_tool_node` 签名断言同步加入新增可选参数 `hooks`；未注入时 wrapper 列表形状与基线逐项一致（链序断言用例仍全绿）。
 - `model_post` 的三条终止出口（中断 / 续跑上限 / 取消）统一经 `_execute` 出口的 `finalize_run` 补触发；`_invoke` 走 `finally`，流式走 `_finalize_stream` 包装，未注入 hooks 时不做任何包装与读取。
+
+## 返工记录（第 1 轮评审，reviewed_sha `070471e5`）
+
+阻塞项：hook 运行态按 run 重建，中断续流后 `tool_pre` 裁决丢失（人工拒绝 `ask` 后工具仍执行、
+`deny` / `replace` 同样失效），同一根因导致续流后同一轮 `model_pre` / `model_post` 重复触发。
+
+根因与修复：
+
+- 根因：运行态只存在 `config["configurable"]`，续流是新运行（新 config），裁决与「每轮一次」标记全部重置；
+  续流时 pv 节点不会重跑，工具 wrapper 取不到原裁决。
+- 修复：新增图状态续接通道 `hook_run_state`（仅在注入 hooks 时进入 state schema）。模型节点与 pv 节点
+  在返回时写入快照（`turn`、`model_pre_done`、`model_pre_override`、`model_post_done`、
+  `model_request_count`、`tool_pre_decisions`），模型节点 / pv 节点 / 工具 wrapper 在入口按快照续接，
+  只在每个运行内并入一次，已下发的裁决不被覆盖。
+- `model_post` 只按「每轮一次」触发：最终答复触发后置位；终止路径（中断）按 AC6 补触发并计为本轮一次，
+  纯续流（无新用户输入）不再重复；续流携带新用户输入（跳过提问）视为新一轮，`turn` +1 并重新开放点位。
+- 新增 `tests/core/hook/test_resume.py`：基于真实 `interrupt()` + `Command(resume=...)` + `MemorySaver`
+  （不 monkeypatch interrupt）覆盖：拒绝不执行 / 允许执行一次、同批次 `deny`+`replace` 续流后仍生效、
+  `model_pre` 与 `model_post` 整轮各一次且 `identity.turn` 不变、正常路径仍触发 `model_post`。
+
+验证结果（本轮）：
+
+- `tests/core/hook`：58 passed（含 `test_resume.py` 8 条）。
+- `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
+  73 skipped, 1 xfailed。
+- 未注入 hooks 时 `hook_run_state` 通道不进入 state schema、不写入，零回归用例保持通过。

@@ -39,7 +39,7 @@ from langgraph.types import Command, interrupt
 from aidev_agent.core.hook.contexts import ToolPostPayload
 from aidev_agent.core.hook.decisions import HookDecision, HookDecisionKind
 from aidev_agent.core.hook.points import HookPoint
-from aidev_agent.core.hook.run_state import get_run_state
+from aidev_agent.core.hook.run_state import get_run_state, restore_run_state
 from aidev_agent.core.hook.runner import HookRunner
 from aidev_agent.packages.interrupt_manager.ask_user_question import (
     AskUserQuestionTarget,
@@ -111,9 +111,12 @@ def _ask_approved(request: ToolCallRequest, decision: HookDecision) -> bool:
 
 
 def _tool_pre_decision(request: ToolCallRequest) -> HookDecision | None:
-    state = get_run_state(_runtime_config(request))
+    config = _runtime_config(request)
+    state = get_run_state(config)
     if state is None:
         return None
+    # 续流后 pv 阶段不会重跑：从图状态快照续接同一批次已下发的裁决
+    restore_run_state(getattr(request, "state", None), config)
     tool_call_id = request.tool_call.get("id") or ""
     return state.tool_pre_decisions.get(tool_call_id)
 

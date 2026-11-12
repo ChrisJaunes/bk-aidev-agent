@@ -146,6 +146,16 @@ class DefaultState(TypedDict):
     personal_memory: dict
 
 
+class HookState(TypedDict, total=False):
+    """hook 续接快照通道。
+
+    仅在注入 hooks 时并入 state schema：中断续流是新运行，本轮「每轮一次」标记与
+    ``tool_pre`` 裁决需按 thread 续接。未注入 hooks 时该通道不进入 schema、不被写入。
+    """
+
+    hook_run_state: dict
+
+
 class KnowledgeInputState(TypedDict):
     input: str
     query: str
@@ -1277,6 +1287,9 @@ class ReActAgentBuilder:
             合并后的 state_schema 类型
         """
         schemas: list[type] = [DefaultState]
+        # hook 续接快照只在注入 hooks 时进入 schema，未注入时图状态键集合与基线一致
+        if self._hooks is not None:
+            schemas.append(HookState)
 
         if _TaskState is not None and (self._enable_task or self._a2a_specs or self._enable_team):
             if self._a2a_specs or self._enable_team:

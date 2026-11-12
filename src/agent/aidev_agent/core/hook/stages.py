@@ -38,7 +38,7 @@ from .contexts import ModelPostPayload, ModelPrePayload, SessionStartPayload, To
 from .decisions import HookDecisionKind
 from .errors import HookDeniedError
 from .points import HookPoint
-from .run_state import get_run_state
+from .run_state import get_run_state, restore_run_state
 from .runner import HookRunner
 
 __all__ = [
@@ -118,6 +118,8 @@ def apply_session_and_model_pre(ctx: Any, hooks: HookRunner | None) -> None:
     state = get_run_state(ctx.config)
     if state is None:
         return
+    # 续流是新运行：先从图状态快照续接本轮进度与 tool_pre 裁决
+    restore_run_state(getattr(ctx, "state", None), ctx.config)
 
     messages = list(ctx.messages)
     tool_names = _tool_names(getattr(ctx, "tools", None))
@@ -197,6 +199,10 @@ def _prepare_model_post(ctx: Any, hooks: HookRunner | None) -> Any:
     state = get_run_state(ctx.config)
     if state is None:
         return None
+    restore_run_state(getattr(ctx, "state", None), ctx.config)
+    if state.model_post_done:
+        # 本轮 model_post 已触发（本段运行或终止路径的 AC6 补触发），续流后不重复
+        return None
     response = getattr(ctx, "response", None)
     if response is None or getattr(response, "tool_calls", None):
         return None
@@ -220,6 +226,8 @@ def run_tool_pre_stage(state_values: dict, config: RunnableConfig, tools: Any = 
     run_state = get_run_state(config)
     if run_state is None or run_state.runner is None:
         return
+    # 续流是新运行：先续接本轮进度与已下发的 tool_pre 裁决，避免重复触发或丢裁决
+    restore_run_state(state_values, config)
     # 延迟导入：避免 core.hook 与 core.nodes 包初始化期互相引用
     from aidev_agent.core.nodes.tool.tool_call_proxy_wrapper import resolve_real_tool_call
 

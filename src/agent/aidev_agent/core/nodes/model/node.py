@@ -30,6 +30,8 @@ from langgraph.graph.message import add_messages
 from langgraph.store.base import BaseStore
 from typing_extensions import Required, TypedDict
 
+from aidev_agent.core.hook.run_state import HOOK_STATE_CHANNEL, dump_run_state
+
 from .basic_middleware import (
     BaseVariablesMiddleware,
     DeepSeekR1VariablesMiddleware,
@@ -245,7 +247,7 @@ def build_model_node(
         # 断言链运行时必填字段（中间件路径不校验）
         assert ctx.config is not None and ctx.state is not None
         final_ctx = model_chain.invoke(ctx)
-        return {"messages": [final_ctx.response]}
+        return _node_output(final_ctx, config)
 
     async def amodel_node(
         state: ModelState,
@@ -268,6 +270,16 @@ def build_model_node(
         # 断言链运行时必填字段（中间件路径不校验）
         assert ctx.config is not None and ctx.state is not None
         final_ctx = await model_chain.ainvoke(ctx)
-        return {"messages": [final_ctx.response]}
+        return _node_output(final_ctx, config)
+
+    def _node_output(final_ctx: ProcessorContext, config: RunnableConfig) -> Dict[str, Any]:
+        """构造节点返回值；注入 hooks 时附带本轮续接快照（供中断续流续接）。"""
+        output: Dict[str, Any] = {"messages": [final_ctx.response]}
+        if hooks is None:
+            return output
+        hook_state = dump_run_state(config)
+        if hook_state is not None:
+            output[HOOK_STATE_CHANNEL] = hook_state
+        return output
 
     return RunnableCallable(model_node, amodel_node, trace=True)
