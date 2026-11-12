@@ -209,3 +209,20 @@ def test_empty_hook_set_has_no_handlers() -> None:
     runner = HookRunner(HookSet())
     assert runner.has(HookPoint.SESSION_START) is False
     assert runner.run_sync(HookPoint.SESSION_START, IDENTITY, None) is PASS
+
+
+def test_sync_handler_sees_caller_contextvars() -> None:
+    """同步处理器在独立线程执行时仍能看到调用方的 contextvars（W-3）。"""
+    import contextvars
+
+    marker: contextvars.ContextVar[str] = contextvars.ContextVar("marker", default="")
+    marker.set("trace-ctx")
+    seen: list[str] = []
+
+    def handler(context):
+        seen.append(marker.get())
+
+    runner = HookRunner(HookSet({HookPoint.MODEL_PRE: [handler]}))
+    runner.run_sync(HookPoint.MODEL_PRE, IDENTITY, None)
+
+    assert seen == ["trace-ctx"]

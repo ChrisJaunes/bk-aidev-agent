@@ -31,6 +31,7 @@ import inspect
 import logging
 import threading
 import time
+from contextvars import copy_context
 from typing import Any
 
 from .contexts import HookContext, HookIdentity
@@ -161,16 +162,18 @@ class HookRunner:
 
         线程无法被强杀：超时后仅放弃等待并按 pass 返回，处理器若永久阻塞仍会占一个
         线程（fail-open 已保证业务不受影响，线程泄漏风险见方案「风险」一节）。
+        线程内以 ``copy_context().run`` 执行，处理器可见调用方的 contextvars（追踪等）。
         """
         box: dict[str, Any] = {}
 
         def invoke() -> None:
             try:
                 box["value"] = cls._resolve_awaitable(handler(context))
-            except BaseException as error:  # noqa: BLE001 - 原样回传给等待线程
+            except Exception as error:  # noqa: BLE001 - 原样回传给等待线程；BaseException 不穿透 fail-open
                 box["error"] = error
 
-        thread = threading.Thread(target=invoke, name="aidev-hook-handler", daemon=True)
+        run = copy_context().run
+        thread = threading.Thread(target=run, args=(invoke,), name="aidev-hook-handler", daemon=True)
         thread.start()
         thread.join(cls.TIMEOUT_SECONDS)
         if thread.is_alive():

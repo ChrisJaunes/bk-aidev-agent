@@ -139,7 +139,7 @@
 
 | 命令 | 结果 | 说明 |
 | --- | --- | --- |
-| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（58 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
+| `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/hook -q` | 通过（59 passed） | AC1–AC15 全部在 `tests/core/hook` 有对应用例，文件头以 `# AC<n>` 标注 |
 | `cd src/agent && uv run --no-sync pytest -c pyproject.toml tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services -q` | 通过（2500 passed, 73 skipped, 1 xfailed） | 模型节点、工具节点、图装配、AG-UI、中断与 services 回归全绿 |
 | `uvx ruff@0.14.10 check` / `ruff format --check`（改动文件与 `tests/core/hook`） | 通过 | 无告警 |
 
@@ -169,7 +169,9 @@
 
 验证结果（本轮）：
 
-- `tests/core/hook`：58 passed（含 `test_resume.py` 8 条）。
+- `tests/core/hook`：59 passed（含 `test_resume.py` 8 条）。
 - `tests/core/nodes tests/core/graphs tests/core/ag_ui tests/core/interrupt tests/services`：2500 passed,
   73 skipped, 1 xfailed。
 - 未注入 hooks 时 `hook_run_state` 通道不进入 state schema、不写入，零回归用例保持通过。
+- 评审改进建议 W-2（`_prepare_model_post` 显式检查 `model_post_done`）、W-3（处理器线程透传 `contextvars`）、
+  W-4（处理器异常回传收窄为 `Exception`）已一并采纳；W-1 由新增真实中断用例覆盖。
