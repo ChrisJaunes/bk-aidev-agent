@@ -149,14 +149,6 @@ def _delete_unpersisted_volume(client: Client, app_code: str, volume_id: str) ->
         logger.warning("PV cleanup failed: volume_id=%s", volume_id, exc_info=True)
 
 
-def _with_hook_state(result: dict, config: RunnableConfig) -> dict:
-    """把本轮 tool_pre 裁决写进图状态快照，供中断续流后的工具 wrapper 续接。"""
-    hook_state = dump_run_state(config)
-    if hook_state is None:
-        return result
-    return {**result, HOOK_STATE_CHANNEL: hook_state}
-
-
 def make_pv_node(
     client: Client,
     app_code: str,
@@ -192,7 +184,9 @@ def make_pv_node(
         result = _collect_pv(state, config)
         if before_dispatch is None:
             return result
-        return _with_hook_state(result, config)
+        # 把本轮 tool_pre 裁决写进图状态快照，供中断续流后的工具 wrapper 续接
+        hook_state = dump_run_state(config)
+        return {**result, HOOK_STATE_CHANNEL: hook_state} if hook_state is not None else result
 
     def _collect_pv(state: dict, config: RunnableConfig) -> dict:
         # 步骤 1：检查是否已有 session 级别的 PV

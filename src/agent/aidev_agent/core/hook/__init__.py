@@ -23,18 +23,21 @@ Agent Core hook 协议与注入入口。
 
 from __future__ import annotations
 
-from .contexts import (
+from .protocol import (
+    ALLOWED_DECISION_KINDS,
+    PASS,
     HookContext,
+    HookDecision,
+    HookDecisionKind,
+    HookDeniedError,
     HookIdentity,
+    HookPoint,
     ModelPostPayload,
     ModelPrePayload,
     SessionStartPayload,
     ToolPostPayload,
     ToolPrePayload,
 )
-from .decisions import PASS, HookDecision, HookDecisionKind
-from .errors import HookDeniedError
-from .points import ALLOWED_DECISION_KINDS, HookPoint
 from .registry import HookHandler, HookSet
 from .run_state import HookRunState, bind_run_state, finalize_run, get_run_state, record_model_response
 from .runner import HookRunner

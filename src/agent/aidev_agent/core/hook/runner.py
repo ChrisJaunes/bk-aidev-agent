@@ -34,9 +34,7 @@ import time
 from contextvars import copy_context
 from typing import Any
 
-from .contexts import HookContext, HookIdentity
-from .decisions import PASS, HookDecision, HookDecisionKind
-from .points import ALLOWED_DECISION_KINDS, HookPoint
+from .protocol import ALLOWED_DECISION_KINDS, PASS, HookContext, HookDecision, HookDecisionKind, HookIdentity, HookPoint
 from .registry import HookHandler, HookSet
 
 __all__ = ["HookRunner"]
@@ -70,14 +68,6 @@ class HookRunner:
 
     def __init__(self, hooks: HookSet | None = None) -> None:
         self._hooks = hooks or HookSet()
-
-    @property
-    def hooks(self) -> HookSet:
-        return self._hooks
-
-    def has(self, point: HookPoint) -> bool:
-        """该点位是否注册了处理器；为 False 时调用方应整体跳过。"""
-        return bool(self._hooks.handlers(point))
 
     def run_sync(self, point: HookPoint, identity: HookIdentity, payload: Any) -> HookDecision:
         """同步执行该点位的处理器。"""

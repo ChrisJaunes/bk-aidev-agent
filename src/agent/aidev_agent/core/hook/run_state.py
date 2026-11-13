@@ -32,9 +32,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage, messages_from_dict, messages_to_dict
 from langchain_core.runnables import RunnableConfig
 
-from .contexts import HookIdentity, ModelPostPayload
-from .decisions import PASS, HookDecision, HookDecisionKind
-from .points import HookPoint
+from .protocol import PASS, HookDecision, HookDecisionKind, HookIdentity, HookPoint, ModelPostPayload
 from .registry import HookSet
 from .runner import HookRunner
 

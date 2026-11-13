@@ -25,8 +25,9 @@ from aidev_agent.core.hook import (
     HookPoint,
     HookRunner,
     HookSet,
+    ToolPostPayload,
+    ToolPrePayload,
 )
-from aidev_agent.core.hook.contexts import ToolPostPayload, ToolPrePayload
 
 IDENTITY = HookIdentity(agent_code="agent", session_code="session", run_id="run", turn=1)
 
@@ -206,9 +207,9 @@ def test_each_execution_logs_structured_record(caplog: pytest.LogCaptureFixture)
 
 
 def test_empty_hook_set_has_no_handlers() -> None:
-    runner = HookRunner(HookSet())
-    assert runner.has(HookPoint.SESSION_START) is False
-    assert runner.run_sync(HookPoint.SESSION_START, IDENTITY, None) is PASS
+    hooks = HookSet()
+    assert hooks.handlers(HookPoint.SESSION_START) == ()
+    assert HookRunner(hooks).run_sync(HookPoint.SESSION_START, IDENTITY, None) is PASS
 
 
 def test_sync_handler_sees_caller_contextvars() -> None:

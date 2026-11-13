@@ -36,9 +36,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import AsyncToolCallWrapper, ToolCallRequest, ToolCallWrapper
 from langgraph.types import Command, interrupt
 
-from aidev_agent.core.hook.contexts import ToolPostPayload
-from aidev_agent.core.hook.decisions import HookDecision, HookDecisionKind
-from aidev_agent.core.hook.points import HookPoint
+from aidev_agent.core.hook.protocol import HookDecision, HookDecisionKind, HookPoint, ToolPostPayload
 from aidev_agent.core.hook.run_state import get_run_state, restore_run_state
 from aidev_agent.core.hook.runner import HookRunner
 from aidev_agent.packages.interrupt_manager.ask_user_question import (

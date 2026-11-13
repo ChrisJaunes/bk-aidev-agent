@@ -21,9 +21,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Callable, Union
 
-from .contexts import HookContext
-from .decisions import HookDecision
-from .points import HookPoint
+from .protocol import HookContext, HookDecision, HookPoint
 
 __all__ = ["HookHandler", "HookSet"]
 
@@ -48,13 +46,6 @@ class HookSet:
     def handlers(self, point: HookPoint) -> tuple[HookHandler, ...]:
         """返回该点位的处理器元组；未注册时为空元组。"""
         return self._handlers.get(point, ())
-
-    def points(self) -> tuple[HookPoint, ...]:
-        """返回已注册处理器的点位（按首次注入顺序）。"""
-        return tuple(self._handlers)
-
-    def __bool__(self) -> bool:
-        return bool(self._handlers)
 
     def __repr__(self) -> str:
         summary = ", ".join(f"{point.value}={len(handlers)}" for point, handlers in self._handlers.items())
