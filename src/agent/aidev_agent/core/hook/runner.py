@@ -21,8 +21,9 @@ hook 执行器：持有一组处理器，在 6 个点位按注入顺序分发。
 - 处理器直接读写原生对象；返回点位对应的对象即生效，返回 ``None`` 表示不干预。
 - 同一点位多个处理器依次执行，后一个看到的 payload 是前一个的结果。
 - ``tool_pre`` 返回 ``ToolMessage`` / ``Command`` 时短路，工具不再执行。
-- 处理器抛异常、超时（``TIMEOUT_SECONDS``）或返回类型不符时按不干预处理并记 warning，
-  业务链路继续；``HookAbort`` / ``HookRetry`` 是控制流，原样抛给调用点。
+- 处理器抛异常、超时（``HookSet.timeout_seconds``，缺省 ``TIMEOUT_SECONDS``）或返回类型不符时按
+  不干预处理并记 warning，业务链路继续；``HookAbort`` / ``HookRetry`` 与 LangGraph 中断
+  （``GraphBubbleUp``，如处理器内调用 ``interrupt()`` 转人工）是控制流，原样抛给调用点。
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from contextvars import copy_context
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
@@ -180,7 +182,7 @@ class HookRunner:
         started = time.monotonic()
         try:
             result = self._call_with_timeout(handler, context)
-        except (HookAbort, HookRetry) as error:
+        except (HookAbort, HookRetry, GraphBubbleUp) as error:
             self._log(point, context.identity, handler, type(error).__name__, started)
             raise
         except TimeoutError:
@@ -198,9 +200,8 @@ class HookRunner:
         self._log(point, context.identity, handler, "ok", started)
         return result
 
-    @classmethod
-    def _call_with_timeout(cls, handler: HookHandler, context: HookContext) -> Any:
-        """在独立线程执行处理器，超过 ``TIMEOUT_SECONDS`` 按超时处理。
+    def _call_with_timeout(self, handler: HookHandler, context: HookContext) -> Any:
+        """在独立线程执行处理器，超过等待上限按超时处理。
 
         线程无法被强杀：超时后仅放弃等待（fail-open 保证业务不受影响）。线程内以
         ``copy_context().run`` 执行，处理器可见调用方的 contextvars（追踪等）。
@@ -209,15 +210,16 @@ class HookRunner:
 
         def invoke() -> None:
             try:
-                box["value"] = cls._resolve_awaitable(handler(context))
+                box["value"] = self._resolve_awaitable(handler(context))
             except Exception as error:  # noqa: BLE001 - 原样回传给等待线程；BaseException 不穿透 fail-open
                 box["error"] = error
 
         thread = threading.Thread(target=copy_context().run, args=(invoke,), name="aidev-hook-handler", daemon=True)
         thread.start()
-        thread.join(cls.TIMEOUT_SECONDS)
+        timeout = self._handlers.timeout_seconds or self.TIMEOUT_SECONDS
+        thread.join(timeout)
         if thread.is_alive():
-            raise TimeoutError(f"hook handler exceeded {cls.TIMEOUT_SECONDS}s")
+            raise TimeoutError(f"hook handler exceeded {timeout}s")
         if "error" in box:
             raise box["error"]
         return box.get("value")

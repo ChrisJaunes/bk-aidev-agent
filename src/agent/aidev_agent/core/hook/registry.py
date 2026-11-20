@@ -18,6 +18,7 @@ to the current version of the project delivered to anyone in the future.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Union
 
@@ -34,14 +35,26 @@ class HookSet:
 
     构建期校验点位名与可调用性：未知点位名抛 ``ValueError``，非可调用对象抛
     ``TypeError``。实例内不持有模块级可变状态，可按实例隔离。
+
+    ``timeout_seconds`` 是单个处理器的等待上限；None 时使用 ``HookRunner.TIMEOUT_SECONDS``。
     """
 
-    def __init__(self, handlers: Mapping[Union[HookPoint, str], Sequence[HookHandler]] | None = None) -> None:
+    def __init__(
+        self,
+        handlers: Mapping[Union[HookPoint, str], Sequence[HookHandler]] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         normalized: dict[HookPoint, tuple[HookHandler, ...]] = {}
         for raw_point, raw_handlers in (handlers or {}).items():
             point = _normalize_point(raw_point)
             normalized[point] = _normalize_handlers(raw_handlers)
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+        ):
+            raise ValueError(f"hook timeout_seconds must be a positive finite number, got {timeout_seconds!r}")
         self._handlers = normalized
+        self.timeout_seconds = timeout_seconds
 
     def handlers(self, point: HookPoint) -> tuple[HookHandler, ...]:
         """返回该点位的处理器元组；未注册时为空元组。"""

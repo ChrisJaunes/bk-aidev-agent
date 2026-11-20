@@ -66,6 +66,21 @@ class AgentDeadlineExceededError(TimeoutError):
     """The configured total Agent/session runtime limit was exhausted."""
 
 
+class AgentFactoryError(AIDevException):
+    """Agent 工厂注入点的结构化失败。
+
+    携带稳定的 ``code``（调用方据此分流，不解析文案）与 ``reason``（人类可读原因）。
+    ``resume`` 负载校验分支使用 ``resume_payload_missing`` / ``resume_payload_unsupported``；
+    ``reason`` 只允许带字段名与类型，不得回显负载取值。
+    """
+
+    MESSAGE = "Agent 工厂调用失败"
+
+    def __init__(self, *, code: str, reason: str, message: str | None = None):
+        self.reason = reason
+        super().__init__(message=message or reason, code=code)
+
+
 def find_mcp_errors(exc):
     if isinstance(exc, McpError):
         _logger.exception(f"MCP error: {exc}")

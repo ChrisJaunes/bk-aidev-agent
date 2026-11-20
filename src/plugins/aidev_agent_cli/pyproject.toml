@@ -1,0 +1,108 @@
+[project]
+name = "aidev-agent-cli"
+version = "0.1.0"
+description = "CLI stdio runtime for the BK AI Dev Agent platform"
+authors = [{name = "tencentblueking"}]
+license = {text = "MIT"}
+readme = "readme.md"
+# 与 aidev-agent SDK 的 "<3.12,>=3.11" 取交集：本包 import SDK，运行版本必须落在两侧都合法的区间。
+requires-python = ">=3.11.9,<3.12"
+dependencies = [
+    "aidev-agent>=3.0.0",
+    # 以下为插件直接 import 的第三方包。版本下界取自 aidev-agent SDK 的 uv.lock
+    # （ag-ui-protocol 0.1.10 / langchain-core 1.7.3 / langgraph 1.2.18 / xxhash 3.6.0），
+    # 即「SDK 已经解析出来的那一组」，不猜新版本，也不在这里另起一套上限。
+    # langgraph-checkpoint 由 checkpoint extra 声明（sqlite saver 3.1 需要 >=4.1.0）。
+    "ag-ui-protocol>=0.1.10,<1.0.0",
+    "langchain-core>1.1.3",
+    "langgraph>=1.2.0",
+    "xxhash>=3.6.0",
+]
+
+[project.optional-dependencies]
+# TUI 运行面的持久化能力：pip install "aidev-agent-cli[checkpoint]"
+checkpoint = [
+    "langgraph>=1.2.0",
+    "langgraph-checkpoint-sqlite>=3.1.0,<4.0.0",
+    "langgraph-checkpoint>=4.1.0,<5.0.0",
+]
+# TUI 追踪：pip install "aidev-agent-cli[checkpoint,opentelemetry]"
+#
+# 复用 SDK 的 opentelemetry extra，而不是在这里复制一份版本钉死清单：
+#   * 追踪实现（aidev_agent.packages.opentelemetry）本来就属 SDK，版本组合由 SDK 维护；
+#     插件复制一份只会在 SDK 升级时静默漂移。
+#   * 独立分发的 wheel 同样可以引用依赖项的 extra —— extra 只是安装器解析的 marker，
+#     不改变 CLI -> SDK 的单向依赖方向，也不要求 SDK 反向依赖 CLI。
+opentelemetry = [
+    "aidev-agent[opentelemetry]>=3.0.0",
+]
+# ACP 服务端：pip install "aidev-agent-cli[acp]"
+#
+# 下界取 pre-release 是**有意的**：镜像上尚无 >=1.0 正式版，而 >=1.0.0rc3 的候选集含 rc3，
+# 因此普通安装（无 --pre）可解析；上游出正式版时无需改本文件。**不写等号**——那会阻断升级。
+# ACP 是**可选**能力：不装本 extra 时 headless 与 agui 照常运行（``--protocol acp`` 会给出
+# "请安装 aidev-agent-cli[acp]" 而不是 ImportError 栈）。
+acp = [
+    "agent-client-protocol>=1.0.0rc3",
+]
+
+[tool.uv.sources]
+# 本地开发装当前 SDK 源码，而不是 PyPI 上同版本的发布产物。
+# 独立安装 wheel 时该 source 不生效（sdist/wheel 的元数据里不带 [tool.uv.sources]）。
+aidev-agent = { path = "../../agent", editable = true }
+
+[dependency-groups]
+dev = [
+    # checkpoint / 追踪 / ACP 是跑通全部用例的前置：checkpoint 相关用例（tests/infrastructure、
+    # tests/runtime）需要 sqlite saver，install_otel 的测试（tests/infrastructure）需要 SDK 的
+    # OTel 实现，ACP 相关用例（tests/adapters、tests/integration）需要真实的 agent-client-protocol。
+    # 直接复用同一组 extras，避免两份清单漂移。
+    "aidev-agent-cli[checkpoint,opentelemetry,acp]",
+    "pytest>=7.4.4,<9",
+    "pytest-asyncio<0.24.0,>=0.23.3",
+    "pytest-env<1.2.0,>=1.1.3",
+    "pytest-timeout==2.3.1",
+    "pytest-mock<4.0.0,>=3.14.0",
+    "responses<1.0.0,>=0.25.0",
+    "loguru>=0.7.3",
+    "faker>=37.0.0,<38.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aidev_agent_cli"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "PIE", "PERF", "SIM"]
+ignore = ["PERF401", "E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint.isort]
+# 与 SDK 保持同一 import 排序约定，迁入模块无需为拆分改写导入块
+section-order = [
+  "future",
+  "standard-library",
+  "third-party",
+  "first-party",
+  "local-folder",
+]
+relative-imports-order = "closest-to-furthest"
+
+[tool.pytest.ini_options]
+timeout = 60
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+addopts = "-vvv --maxfail=2 -s"
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

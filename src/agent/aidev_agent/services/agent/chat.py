@@ -231,6 +231,7 @@ class ChatCompletionAgent(BaseModel):
         description=(
             "InterruptProcessor 统一中断编排器，execute() 入口惰性构造（ItsmTicketCreator "
             "需 execute_kwargs.executor/session_code，build 期拿不到，D-11）。"
+            "可由外层注入替代实现（CLI 运行面的 HeadlessInterruptProcessor）；注入后 build 不覆盖。"
         ),
     )
     memory_agent_code: str = Field(default="", description="当前运行智能体的记忆隔离身份")
@@ -280,6 +281,10 @@ class ChatCompletionAgent(BaseModel):
         self.memory_agent_code = ctx.agent_code
         self.skills = builder.build_skills()
         self.tools = builder.build_tools()
+        # 进程内注入工具（CLI 运行面 create.params.tools 的测试 / 嵌入式接缝；不是协议承诺）
+        injected_tools = ctx.extra.get("injected_tools") or []
+        if injected_tools:
+            self.tools = list(self.tools or []) + list(injected_tools)
         self.mcp_fetch_failures = builder.mcp_fetch_failures
         self.knowledge_bases = builder.build_knowledge_bases()
         self.knowledges = builder.build_knowledge_items()
@@ -307,6 +312,9 @@ class ChatCompletionAgent(BaseModel):
             self.agent_cls = chat.agent_cls
         if chat.hook_handlers is not None:
             self.hook_handlers = chat.hook_handlers
+        if chat.interrupt_processor is not None:
+            # execute() 的惰性构造只在 None 时生效，因此注入实现不会被覆盖
+            self.interrupt_processor = chat.interrupt_processor
         if ctx.session_code is not None:
             self.thread_id = ctx.session_code
         if ctx.event_handler is not None:
@@ -1855,7 +1863,7 @@ class ChatAgentBuilder:
         kwargs: dict[str, Any] = {
             "model": config.chat_model,
             "fallback_model": config.fallback_model,
-            "base_url": settings.LLM_GW_ENDPOINT,
+            "base_url": chat.base_url or settings.LLM_GW_ENDPOINT,
         }
 
         temperature = chat.temperature if chat.temperature is not None else config.temperature
@@ -1905,11 +1913,11 @@ class ChatAgentBuilder:
         model_name = self.ctx.agent_config.non_thinking_llm
         if not model_name:
             return None
+        chat = self.ctx.chat or ChatBuildExtras()
         kwargs: dict[str, Any] = {
             "model": model_name,
-            "base_url": settings.LLM_GW_ENDPOINT,
+            "base_url": chat.base_url or settings.LLM_GW_ENDPOINT,
         }
-        chat = self.ctx.chat or ChatBuildExtras()
         if chat.auth_headers:
             kwargs["auth_headers"] = chat.auth_headers
         if chat.default_headers:
@@ -1933,7 +1941,7 @@ class ChatAgentBuilder:
         ``non_thinking_llm`` / ``llm_code``。
         """
         model_name = self.ctx.agent_config.fast_llm
-        base_url = settings.LLM_GW_ENDPOINT
+        base_url = (self.ctx.chat or ChatBuildExtras()).base_url or settings.LLM_GW_ENDPOINT
         if not model_name or not base_url:
             return None
         kwargs: dict[str, Any] = {
@@ -1971,7 +1979,7 @@ class ChatAgentBuilder:
         agent_info = getattr(self.ctx.agent_config, "agent_info", None) or {}
         prompt_setting = agent_info.get("prompt_setting") or {}
         model_name = prompt_setting.get("fallback_vision_model")
-        base_url = settings.LLM_GW_ENDPOINT
+        base_url = (self.ctx.chat or ChatBuildExtras()).base_url or settings.LLM_GW_ENDPOINT
         if not model_name:
             return None
         kwargs: dict[str, Any] = {

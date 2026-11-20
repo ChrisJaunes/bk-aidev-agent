@@ -9,10 +9,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.prebuilt.tool_node import ToolCallRequest, ToolRuntime
-from langgraph.types import Command
-
 from aidev_agent.core.hook import (
     HookAbort,
     HookPoint,
@@ -20,6 +16,10 @@ from aidev_agent.core.hook import (
     HookRunner,
     HookSet,
 )
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.errors import GraphInterrupt
+from langgraph.prebuilt.tool_node import ToolCallRequest, ToolRuntime
+from langgraph.types import Command
 
 from .conftest import make_config
 
@@ -216,6 +216,38 @@ def test_timeout_degrades(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCap
 
     assert result is None
     assert "timeout" in caplog.text
+
+
+@pytest.mark.parametrize("timeout_seconds, applied", [(1.0, True), (0.05, False)])
+def test_hookset_timeout_overrides_default(monkeypatch: pytest.MonkeyPatch, timeout_seconds, applied) -> None:
+    """HookSet.timeout_seconds 优先于类默认值：放宽时慢处理器生效，收紧时按超时降级。"""
+    monkeypatch.setattr(HookRunner, "TIMEOUT_SECONDS", 0.3)
+
+    def slow(context):
+        time.sleep(0.5)
+        return ToolMessage(content="slow", tool_call_id="call-1")
+
+    runner = HookRunner(HookSet({HookPoint.TOOL_POST: [slow]}, timeout_seconds=timeout_seconds))
+    result = runner.tool_post(make_config(), ToolMessage(content="raw", tool_call_id="call-1"))
+
+    assert (result is not None and result.content == "slow") is applied
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1, float("inf"), float("nan"), True])
+def test_hookset_rejects_invalid_timeout(timeout_seconds) -> None:
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        HookSet(timeout_seconds=timeout_seconds)
+
+
+def test_graph_interrupt_is_not_swallowed() -> None:
+    """处理器内 interrupt() 抛出的 GraphBubbleUp 是控制流，不按 fail-open 吞掉。"""
+
+    def ask(context):
+        raise GraphInterrupt(())
+
+    runner = HookRunner(HookSet({HookPoint.TOOL_PRE: [ask]}))
+    with pytest.raises(GraphInterrupt):
+        runner.tool_pre(_request())
 
 
 def test_hook_abort_is_not_swallowed() -> None:

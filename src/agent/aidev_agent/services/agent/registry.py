@@ -47,6 +47,10 @@ class ChatBuildExtras:
     checkpointer: Optional["BaseCheckpointSaver"] = None
     hook_handlers: Any = None
     """进程内 hook 处理器集合（HookSet）；None 表示未注入，全链路保持基线行为。"""
+    interrupt_processor: Any = None
+    """中断编排器实现；注入后 ``build`` 不覆盖，``execute`` 的惰性构造只在 None 时生效。"""
+    base_url: Optional[str] = None
+    """本次构建的 LLM 网关地址；缺省 None 时回落 ``settings.LLM_GW_ENDPOINT``（零行为变化）。"""
 
 
 @dataclass
