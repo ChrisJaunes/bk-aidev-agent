@@ -14,9 +14,9 @@ python -u -m aidev_agent_cli --protocol acp --resources platform
 
 ## 2. 身份规则
 
-含 platform 时按环境变量 BKAI_TUI_ACCESS_TOKEN、用户配置 auth.access_token 的顺序解析 token。两者都没有时在连接绑定前非零退出，不污染 stdout。token 不接受 argv，不进入日志或响应。
+与其他协议同一条组装路径：token 只来自 bkai_tui.json 的 auth.access_token，不读环境变量，不接受 argv，不进入日志或响应。缺 token 不在启动期拦截，由首次平台调用报错。
 
-ACP 启动取得的身份只在内存生效，不覆盖交互式登录态。RuntimeService 在接纳时捕获 IdentitySnapshot；已接纳轮次不因后续登录改变身份，下一次接纳使用新的 revision。Session 不订阅身份变化，也不缓存资源 manager。
+RuntimeService 在接纳时捕获 IdentitySnapshot；已接纳轮次不因后续登录改变身份，下一次接纳使用新的 revision。Session 不订阅身份变化，也不缓存资源 manager。
 
 ## 3. 能力
 

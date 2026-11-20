@@ -7,7 +7,7 @@
 - 把 ``~/.bkai`` 下的真实配置隔离到会话临时目录，任何用例都不得读取开发者
   机器上的 ``bkai_tui.json`` / ``mcp.json`` / ``agents/*.json``。
 
-**不设静默跳过门禁**：checkpoint 相关用例（``tests/infrastructure``、``tests/runtime``）
+**不设静默跳过门禁**：checkpoint 相关用例（``tests/runtime``）
 需要 sqlite saver，缺了就直接报错。
 ``make init`` 装的 dev 组已通过 ``aidev-agent-cli[checkpoint]`` 带上它；
 若仍缺失，说明环境不是用本仓 Makefile 建的——此时「少收集却显示全绿」
@@ -34,7 +34,7 @@ _SESSION_HOME: Path | None = None
 def pytest_configure(config):
     """收集前把消息处理器切到 InMemory，并把 ``HOME`` 指向会话临时目录。
 
-    ``HOME`` 必须在**收集之前**就改掉：``infrastructure.logging`` 在模块导入期
+    ``HOME`` 必须在**收集之前**就改掉：``utils.logging`` 在模块导入期
     用 ``Path.home()`` 算出 ``~/.bkai/logs/worker.log`` 并立刻打开它。若等到首个
     fixture 再改，那条日志文件已经写进开发者自己的 home 了。
     """
@@ -61,23 +61,23 @@ def pytest_configure(config):
 def _isolated_config_home() -> None:
     """把 ``~/.bkai`` 下所有**导入期固化**的默认路径再显式改指临时 home。
 
-    ``TuiConfig.USER_CONFIG_FILE`` / ``McpResolver.DEFAULT_MCP_FILE`` 在模块导入期
+    ``BkAiConfig.USER_CONFIG_FILE`` / ``McpResolver.DEFAULT_MCP_FILE`` 在模块导入期
     用 ``Path.home()`` 固化。``pytest_configure`` 已经改了 ``HOME``，正常情况下它们
     自然落在临时 home；这里再按名字替换一次，保证即使这些模块在 ``pytest_configure``
     之前被某个插件提前导入，也不会残留指向开发者 home 的路径。运行时才解析的
-    ``LocalDeclarations.user_path`` / ``TuiConfig.project_path`` 只认 ``HOME``，已被
+    ``BkAiAgentInfo.user_path`` / ``BkAiConfig.project_path`` 只认 ``HOME``，已被
     ``pytest_configure`` 覆盖；``subprocess`` 拉起的子进程继承 ``os.environ``，同样
     落在这个临时 home。想测 ``install_otel`` 本身的行为，由
-    ``tests/infrastructure/test_tui_main.py`` 的 autouse fixture 局部删掉
+    ``tests/bootstrap/test_tui_main.py`` 的 autouse fixture 局部删掉
     ``AGENT_TUI_OTEL`` 开关。
     """
-    from aidev_agent_cli.infrastructure.logging import BKAI_HOME_DIRNAME
-    from aidev_agent_cli.infrastructure.settings import TuiConfig
+    from aidev_agent_cli.utils.logging import BKAI_HOME_DIRNAME
+    from aidev_agent_cli.runtime.settings import BkAiConfig
     from aidev_agent_cli.resources.local_config import McpResolver
 
     home = _SESSION_HOME or Path(tempfile.mkdtemp(prefix="aidev-cli-test-home-"))
     mp = pytest.MonkeyPatch()
-    mp.setattr(TuiConfig, "USER_CONFIG_FILE", str(home / BKAI_HOME_DIRNAME / "bkai_tui.json"))
+    mp.setattr(BkAiConfig, "USER_CONFIG_FILE", str(home / BKAI_HOME_DIRNAME / "bkai_tui.json"))
     mp.setattr(McpResolver, "DEFAULT_MCP_FILE", str(home / BKAI_HOME_DIRNAME / "mcp.json"))
     yield
     mp.undo()

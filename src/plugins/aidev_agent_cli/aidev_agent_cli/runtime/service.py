@@ -8,18 +8,40 @@ import os
 from dataclasses import dataclass, replace
 from logging import getLogger
 
-from .auth import AuthManager, ProcessConfig
-from .contracts import EventConsumer, LaunchOptions, ResumeRequest, RunHandle, RunRequest, SessionOptions
-from .errors import RuntimeFault
-from .inputs import ChatInput, ContextInput, ResumeInterrupt
-from .models import HookHandler, IdentitySnapshot, SessionSnapshot, SettingsSnapshot, TurnSnapshot
-from .runs import CANCEL_GRACE_SECONDS, CancelOutcome, FIFOScheduler
-from .session import SessionInfo, SessionRegistry
-from ..infrastructure.settings import TuiConfig, resolve_acp_access_token
-from ..resources.local_config import LocalDeclarations
+from ..hooks.models import ProcessHooks
+from .auth import AuthManager
+from .process_config import ProcessConfig
+from ..infrastructure.ports import EventConsumer
+from ..utils.runs import LaunchOptions, ResumeRequest, RunRequest, SessionOptions
+from .handles import RunHandle
+from ..utils.errors import RESUME_INTERRUPT_NOT_FOUND, RuntimeFault
+from ..utils.interrupts import match_pending_interrupt
 from ..resources.sources import uses_platform
+from ..utils.inputs import ChatInput, ContextInput, ResumeInterrupt
+from .models import AgentSnapshot, ProcessSnapshot, TurnSnapshot
+from .runs import CANCEL_GRACE_SECONDS, CancelOutcome, RunQueue
+from ..utils.runs import SessionInfo
+from .session import SessionRegistry
 
 logger = getLogger(__name__)
+
+
+def _resume_target(pending: list[dict], value: ResumeInterrupt, *, platform: bool) -> dict | None:
+    """跨轮校验：恢复项必须命中本会话已提交的 pending 中断。
+
+    平台来源且本地无 pending 时放行（中断事实在平台侧），返回 ``None``；中断类型能否恢复由 sdk 判定。
+    """
+    item = value.payload[0] if isinstance(value.payload, list) else value.payload
+    if not pending:
+        if platform:
+            return None
+        raise RuntimeFault(RESUME_INTERRUPT_NOT_FOUND, "该会话当前没有待恢复的中断", {"interruptId": item["interruptId"]})
+    matched = match_pending_interrupt(pending, item)
+    if matched is None:
+        raise RuntimeFault(
+            RESUME_INTERRUPT_NOT_FOUND, "interruptId 未命中该会话的 pending 中断", {"fields": ["resume.interruptId"]}
+        )
+    return matched
 
 
 @dataclass
@@ -31,25 +53,41 @@ class CloseOutcome:
 
 class RuntimeService:
     def __init__(
-        self, *, config: ProcessConfig | None = None, auth: AuthManager | None = None, busy_mode: str = "reject"
+        self,
+        *,
+        config: ProcessConfig | None = None,
+        busy_mode: str = "reject",
+        hooks: ProcessHooks | None = None,
     ) -> None:
         self.state = "running"
         self._shutdown_task = None
         self._session_closes = {}
         self._control_lock = asyncio.Lock()
         self._revision = 0
-        self._workspace_root = os.getcwd()
         self._config = config or ProcessConfig()
-        self._auth = auth or AuthManager()
-        self._sessions = SessionRegistry(self._config.defaults)
-        self._scheduler = FIFOScheduler(self._sessions, busy_mode=busy_mode, on_reap_failure=self._worker_reap_failed)
+        self._auth = self._config.auth
+        self._sessions = SessionRegistry(self._config.launch, self._config.history_path)
+        #: 进程级 hook：配置写进每轮快照，worker 的 hook 请求由它应答。
+        self._hooks = hooks
+        self._queue = RunQueue(
+            self._sessions,
+            busy_mode=busy_mode,
+            on_reap_failure=self._worker_reap_failed,
+            hooks=hooks,
+            history_path=self._config.history_path,
+        )
 
     def _worker_reap_failed(self):
         self.state = "closing"
 
     @property
+    def hooks(self) -> ProcessHooks | None:
+        """进程级 hook；adapter 用它绑定回调通道（客户端回调模式）。"""
+        return self._hooks
+
+    @property
     def defaults(self):
-        return self._config.defaults
+        return self._config.launch
 
     async def default_agent_code(self):
         return await asyncio.to_thread(self._config.default_agent_code)
@@ -108,42 +146,60 @@ class RuntimeService:
         return session.session_code if session is not None and not session.closed else None
 
     def run_handles(self):
-        return self._scheduler.handles()
+        return self._queue.handles()
+
+    def session_of_run(self, run_id):
+        """未落定运行 ``run_id`` 所属的会话；未知或已结束返回 ``None``。"""
+        for session_code, bucket in self._queue.handles().items():
+            handle = bucket.get(run_id)
+            if handle is not None and not handle.settled:
+                return session_code
+        return None
 
     def has_live_runs(self, code):
-        return self._scheduler.busy(code)
+        return self._queue.busy(code)
 
-    def _snapshot(self, kind, session, request, hooks):
+    def _snapshot(self, kind, session, request, *, resume_target=None, rejection=None):
         options = session.options
         value = request.input
         identity = self._auth.snapshot()
+        env = {**os.environ, **self._config.env}
         return TurnSnapshot(
-            session=SessionSnapshot(
+            agent=AgentSnapshot(
                 session_code=session.session_code,
                 agent_code=options.agent_code or self._config.default_agent_code(),
                 resources=options.resources,
                 model=options.model,
-                identity=IdentitySnapshot(
-                    options.username or identity.username, identity.access_token, identity.revision
-                ),
-                settings=SettingsSnapshot(
-                    self._workspace_root, {**os.environ, **self._config.env}, revision=self._revision + session.revision
-                ),
+                username=options.username or identity.username,
+                access_token=identity.access_token,
+                credentials=self._config.credentials(),
                 base_url=options.base_url,
                 auth_headers=copy.deepcopy(options.auth_headers),
                 temperature=options.temperature,
                 max_tokens=options.max_tokens,
+                hooks=self._hooks.config.snapshot() if self._hooks is not None else None,
                 tool_factories=options.tool_factories,
+                checkpoint_path=self._config.checkpoint_path,
+                rate_limit_retries=int(env.get("AGENT_TUI_LLM_RATE_LIMIT_RETRIES") or 0),
+                rate_limit_wait_budget=float(env.get("AGENT_TUI_LLM_RATE_LIMIT_WAIT_BUDGET") or 0),
             ),
+            process=ProcessSnapshot(
+                self._config.launch.workspace_root,
+                env,
+                revision=self._revision + session.revision,
+            ),
+            identity_revision=identity.revision,
+            state=session.state,
+            resume_target=resume_target,
+            rejection=rejection,
             kind=kind,
             correlation_id=request.correlation_id,
             run_id="",
             input=copy.deepcopy(value),
             execute_options=copy.deepcopy(request.execute_options) if isinstance(request, RunRequest) else {},
-            hooks={"timeout_ms": hooks.timeout_ms, "points": sorted(hooks.points())} if hooks else None,
         )
 
-    async def _admit(self, kind, request, sink=None, *, hooks=None, hook_handler=None):
+    async def _admit(self, kind, request, sink=None):
         self._ensure_running()
         async with self._control_lock:
             session = self._require(request.session_code)
@@ -160,30 +216,29 @@ class RuntimeService:
                     raise RuntimeFault("session.pending_interrupt", "请先恢复待处理中断")
             elif kind == "resume" and not isinstance(request.input, ResumeInterrupt):
                 raise RuntimeFault("resume_payload_unsupported", "resume 需要 ResumeInterrupt")
-            if hooks is not None and hook_handler is None:
-                raise RuntimeFault("hook.value_invalid", "启用 hook 必须提供本轮 hook_handler")
-            snapshot = self._snapshot(kind, session, request, hooks)
-            return await self._scheduler.submit(request, sink=sink, hook_handler=hook_handler, snapshot=snapshot)
+            resume_target = rejection = None
+            if kind == "resume":
+                try:
+                    resume_target = _resume_target(session.pending, request.input, platform=uses_platform(session.options.resources))
+                except RuntimeFault as exc:
+                    # 与 SDK 侧失败同形：本轮以 RUN_ERROR + failed 结果落定，而不是拒绝 admission。
+                    rejection = {"code": exc.code, "message": exc.message}
+            snapshot = self._snapshot(kind, session, request, resume_target=resume_target, rejection=rejection)
+            return await self._queue.submit(request, sink=sink, snapshot=snapshot)
 
     async def start(
         self,
         request: RunRequest,
         sink: EventConsumer | None = None,
-        *,
-        hooks=None,
-        hook_handler: HookHandler | None = None,
     ) -> RunHandle:
-        return await self._admit("start", request, sink, hooks=hooks, hook_handler=hook_handler)
+        return await self._admit("start", request, sink)
 
     async def resume(
         self,
         request: ResumeRequest,
         sink: EventConsumer | None = None,
-        *,
-        hooks=None,
-        hook_handler: HookHandler | None = None,
     ) -> RunHandle:
-        return await self._admit("resume", request, sink, hooks=hooks, hook_handler=hook_handler)
+        return await self._admit("resume", request, sink)
 
     async def prepare(self, session_code):
         handle = await self._admit("prepare", RunRequest(session_code))
@@ -221,7 +276,7 @@ class RuntimeService:
         self._ensure_running()
         async with self._control_lock:
             session = self._require(code)
-            if self._scheduler.busy(code):
+            if self._queue.busy(code):
                 raise RuntimeFault("session.busy", "运行期间不能修改配置")
             if kind not in ("agents", "models", "mcps", "knowledge") or not isinstance(value, str) or not value:
                 raise RuntimeFault("config.invalid", "无效配置项")
@@ -229,14 +284,14 @@ class RuntimeService:
                 session.options = replace(session.options, agent_code=value)
             else:
                 agent_code = session.options.agent_code or self._config.default_agent_code()
-                await asyncio.to_thread(LocalDeclarations().write, kind, value, code=agent_code)
+                await asyncio.to_thread(self._config.agent_info(agent_code).write, kind, value, code=agent_code)
                 if kind == "models":
                     session.options = replace(session.options, model=value)
             session.revision += 1
             self._revision += 1
 
     async def cancel(self, session_code, run_id=None):
-        return await self._scheduler.cancel(session_code, run_id)
+        return await self._queue.cancel(session_code, run_id)
 
     async def close(self, session_code):
         task = self._session_closes.get(session_code)
@@ -252,7 +307,7 @@ class RuntimeService:
         return await asyncio.shield(task)
 
     async def _close_session(self, code):
-        await self._scheduler.close_session(code)
+        await self._queue.close_session(code)
         self._sessions.get(code).close()
         return CloseOutcome(code, True, False)
 
@@ -261,13 +316,13 @@ class RuntimeService:
             raise RuntimeFault("shutdown.invalid", "grace 必须是非负秒数")
         if self._shutdown_task is None:
             self.state = "closing"
-            self._scheduler.begin_close()
+            self._queue.begin_close()
             self._shutdown_task = asyncio.create_task(self._shutdown(reason, grace))
         await asyncio.shield(self._shutdown_task)
 
     async def _shutdown(self, reason, grace):
         async with self._control_lock:
-            await self._scheduler.close_all(reason, grace=grace)
+            await self._queue.close_all(reason, grace=grace)
             await asyncio.gather(*(self.close(code) for code in self._sessions.codes()))
             self._sessions.close_all()
             self.state = "closed"
@@ -277,7 +332,7 @@ class RuntimeService:
 #: 协议 → busy 语义（入口唯一的一张表）。
 #:
 #: 同会话第二轮的处置：acp-dsh 排队串行（dsh 的 followup 本就串行）；agui / acp 立即拒绝
-#: （它们的请求要求立即应答）。资源默认值不在这张表里：那是入口 ``resolve_resources`` 的事。
+#: （它们的请求要求立即应答）。资源默认值不在这张表里：那是入口 ``parse_resources`` 的事。
 PROTOCOL_BUSY_MODES: dict[str, str] = {
     "agui": "reject",
     "acp": "reject",
@@ -287,34 +342,16 @@ PROTOCOL_BUSY_MODES: dict[str, str] = {
 
 def build_runtime(
     protocol: str,
+    config: ProcessConfig,
     *,
-    model: str = "",
-    session: str = "",
-    resources: tuple[str, ...],
-    env: dict[str, str] | None = None,
-    auth: AuthManager | None = None,
+    hooks: ProcessHooks | None = None,
 ) -> "RuntimeService":
-    """**唯一**的 ``RuntimeService`` 组装点：入口、测试与嵌入式调用方都经它。
+    """**唯一**的 \`\`RuntimeService\`\` 组装点：入口、测试与嵌入式调用方都经它。
 
-    进程级配置（命令行默认值 / env）、身份（acp 带平台来源时解析启动 token，只在内存生效）、
-    checkpoint 存储与 busy 语义都在这里决定；adapter 只接收组装好的 service。
-
-    ``resources`` 是入口解析好的资源序列（含省略 ``--resources`` 时的默认预设）：这里不为
-    它兜底——会话拿到什么就是什么。
-    阻塞且会导入 SDK：调用方须在启动钩子之后调用。
+    \`\`config\`\` 由入口组装好（本地配置 / 启动选项 / 身份）；这里只按协议决定 busy 语义并接上 hook。
+    调用方须在启动钩子之后调用。
     """
-    busy_mode = PROTOCOL_BUSY_MODES[protocol]
-    defaults = LaunchOptions(model=model, session=session, resources=tuple(resources))
-
-    if auth is None and protocol == "acp" and uses_platform(resources):
-        # 缺 token 在任何连接绑定之前失败（stderr + 非零退出），绝不写进协议通道。
-        auth = AuthManager(access_token=resolve_acp_access_token())
-
-    return RuntimeService(
-        config=ProcessConfig(env=dict(env) if env is not None else TuiConfig.read().env, defaults=defaults),
-        auth=auth,
-        busy_mode=busy_mode,
-    )
+    return RuntimeService(config=config, busy_mode=PROTOCOL_BUSY_MODES[protocol], hooks=hooks)
 
 
 __all__ = [

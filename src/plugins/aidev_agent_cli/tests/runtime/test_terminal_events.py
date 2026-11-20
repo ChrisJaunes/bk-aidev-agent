@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""``runtime.terminal`` 的字典形状必须与 SDK 真序列化器逐键相同。
+"""``utils.terminal`` 的字典形状必须与 SDK 真序列化器逐键相同。
 
 为什么需要这一条
 ----------------
 父进程（``runner``）在 worker 收尾后补 ``RUN_ERROR`` / ``RUN_FINISHED``，而父进程不得装载
-SDK——于是形状被固化成纯 stdlib 的字典（:mod:`aidev_agent_cli.runtime.terminal`）。那条
+SDK——于是形状被固化成纯 stdlib 的字典（:mod:`aidev_agent_cli.utils.terminal`）。那条
 "不得装载 SDK"的约束由 ``test_layer_graph`` 守住；这里守住**另一面**：字典与 SDK 的
 ``model_dump(mode="json", by_alias=True, exclude_none=True)`` 完全一致，否则父进程补的事件
 会在协议层与 worker 发出的事件不同形。
@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from aidev_agent_cli.runtime import terminal
+from aidev_agent_cli.utils import terminal
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -94,7 +94,7 @@ def test_finished_and_error_builders_match_the_sdk_serialization() -> None:
 
 def test_sdk_events_reuses_the_same_shape() -> None:
     """worker 侧的 builder 只是把同一份字典转成 SDK 模型——形状没有第二份事实来源。"""
-    from aidev_agent_cli.runtime.sdk import events
+    from aidev_agent_cli.sdk import events
 
     error_event, finished_event = events.build_cancel_terminal_events("thread-2")
     dumped_error = error_event.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -109,7 +109,7 @@ def test_sdk_events_reuses_the_same_shape() -> None:
 
 def test_terminal_module_is_stdlib_only() -> None:
     """形状定义处自身零第三方依赖（由 §4 的分层断言兜底，这里点明意图）。"""
-    source = (ROOT / "aidev_agent_cli" / "runtime" / "terminal.py").read_text(encoding="utf-8")
+    source = (ROOT / "aidev_agent_cli" / "utils" / "terminal.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported = {node.names[0].name for node in tree.body if isinstance(node, ast.Import) and node.names}
     from_imported = {node.module for node in tree.body if isinstance(node, ast.ImportFrom) and node.module}

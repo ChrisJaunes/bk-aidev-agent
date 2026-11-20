@@ -101,8 +101,8 @@ __all__ = ["ScriptedAgent", "script_session", "strip_sse_shell"]
 def thread_safe_sink(sink: Any, loop: asyncio.AbstractEventLoop) -> Any:
     """Unit-test bridge for worker-local synchronous SDK semantics, not production execution."""
 
-    from aidev_agent_cli.runtime.models import event_payload
-    from aidev_agent_cli.runtime.runner import _call_sink
+    from aidev_agent_cli.sdk.events import event_payload
+    from aidev_agent_cli.runtime.runs import _call_sink
 
     def _deliver(event: Any) -> None:
         if getattr(sink, "peer_gone", False):

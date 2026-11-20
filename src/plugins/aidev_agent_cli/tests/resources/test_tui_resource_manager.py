@@ -2,7 +2,7 @@
 
 **文件名说明**：``test_tui_resource_manager.py`` 是旧 UI 场景命名，实际断言对象是
 ``aidev_agent_cli.resources.local_config``（在文件内别名为 ``resource_manager``）与
-``resources.loaders.*`` 的 loader 链——``LocalConfig`` / ``LocalDeclarations`` /
+``resources.loaders.*`` 的 loader 链——``LocalConfig`` / ``BkAiAgentInfo`` /
 ``McpConfig`` / ``McpResolver`` / ``WorkspaceIndex``，以及配置/知识/审批/MCP/runtime
 覆盖的加载顺序与快照缓存。真正的 ``resources.manager.LocalResourceManager`` 单元测试
 在同目录的 ``test_resource_manager.py``。文件名保留不改，避免改动测试节点 ID。
@@ -46,7 +46,18 @@ from aidev_agent_cli.resources.local_config import LocalConfig, McpConfig
 from aidev_agent_cli.resources.manager import LocalResourceManager
 from aidev_agent_cli.resources.sources import PLATFORM_SOURCES
 from aidev_agent_cli.resources.workspace import DirectoryListing, WorkspaceIndex
+from aidev_agent_cli.utils.logging import LOG_FILE_OVERRIDE, configure_logging
 from tests.integration._paths import PLUGIN_ROOT
+
+
+@pytest.fixture(autouse=True)
+def _package_logging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """本文件断言 stderr 上的诊断行：显式装好本包日志，不依赖其他用例先跑过入口。
+
+    stderr handler 每条记录现取 ``sys.stderr``，因此与 ``capsys`` 的替换兼容；文件日志落到临时目录。
+    """
+    monkeypatch.setenv(LOG_FILE_OVERRIDE, str(tmp_path / "aidev_agent_cli.log"))
+    configure_logging()
 
 #: platform 加载器持 SDK，注册表按需装载——用它而不是包根的静态名字。
 PlatformConfigLoader = get_loader_class("platform")
@@ -307,7 +318,7 @@ class TestPreservedBehaviours:
 class TestLocalOverlay:
     # 261014-urj D8/A-4: ``rm.local`` 与 ``rm.local_agent_code()`` 已删除——
     # per-agent 化后不再有"进程级 single local"，入口 agent_code 的来源迁往
-    # ``worker.config.TuiConfig.agent_code``。原 ``test_local_agent_code_is_surfaced`` /
+    # ``worker.config.BkAiConfig.agent_code``。原 ``test_local_agent_code_is_surfaced`` /
     # ``test_local_agent_code_defaults_to_empty`` 因此**删除**（所测行为已不存在）。
     # 新的入口 agent_code 解析断言见 ``test_agent_runner.py`` 的
     # ``test_agent_code_comes_from_tui_config``。
@@ -749,36 +760,36 @@ class TestModuleImportsTheSDK:
 # Local declaration layer (§1 — <BKAI_HOME>/agent.json, two scopes)
 # ============================================================================
 
-#: §1 的配置面句柄。常量与路径辅助已收进 :class:`LocalDeclarations`
+#: §1 的配置面句柄。常量与路径辅助已收进 :class:`BkAiAgentInfo`
 #: （类属性/类方法），因此断言统一按 ``local_config.X`` 书写。
 #:
 #: 用 ``SimpleNamespace`` 而非别名到类，是为了让
 #: ``monkeypatch.setattr(local_config, ...)`` 只改这个命名空间、**不会**污染真类
 #: 上其他测试共享的状态。与 §2 的 ``mcp_config`` 句柄同一模式。
 local_config = SimpleNamespace(
-    CONFIG_FILE_OVERRIDE=resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE,
-    DECLARATION_FIELDS=resource_manager.LocalDeclarations.DECLARATION_FIELDS,
-    LOCAL_CONFIG_KEYS=resource_manager.LocalDeclarations.LOCAL_CONFIG_KEYS,
-    REJECTED_SECRET_KEYS=resource_manager.LocalDeclarations.REJECTED_SECRET_KEYS,
-    AGENT_CODE_ENV=resource_manager.LocalDeclarations.AGENT_CODE_ENV,
-    AGENTS_DIRNAME=resource_manager.LocalDeclarations.AGENTS_DIRNAME,
-    user_path=resource_manager.LocalDeclarations.user_path,
-    project_path=resource_manager.LocalDeclarations.project_path,
-    user_agents_dir=resource_manager.LocalDeclarations.user_agents_dir,
-    project_agents_dir=resource_manager.LocalDeclarations.project_agents_dir,
+    CONFIG_FILE_OVERRIDE=resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE,
+    DECLARATION_FIELDS=resource_manager.BkAiAgentInfo.DECLARATION_FIELDS,
+    LOCAL_CONFIG_KEYS=resource_manager.BkAiAgentInfo.LOCAL_CONFIG_KEYS,
+    REJECTED_SECRET_KEYS=resource_manager.BkAiAgentInfo.REJECTED_SECRET_KEYS,
+    AGENT_CODE_ENV=resource_manager.BkAiAgentInfo.AGENT_CODE_ENV,
+    AGENTS_DIRNAME=resource_manager.BkAiAgentInfo.AGENTS_DIRNAME,
+    user_path=resource_manager.BkAiAgentInfo.user_path,
+    project_path=resource_manager.BkAiAgentInfo.project_path,
+    user_agents_dir=resource_manager.BkAiAgentInfo.user_agents_dir,
+    project_agents_dir=resource_manager.BkAiAgentInfo.project_agents_dir,
     # LocalConfig 是值对象，刻意留在模块级——句柄里一并带上，使 §1 断言可统一书写。
     LocalConfig=resource_manager.LocalConfig,
 )
 
 
-def _declarations() -> resource_manager.LocalDeclarations:
-    """A fresh ``LocalDeclarations`` collaborator (the §1 owner).
+def _declarations() -> resource_manager.BkAiAgentInfo:
+    """A fresh ``BkAiAgentInfo`` collaborator (the §1 owner).
 
     The §1 assertion set is unchanged from when it exercised the module-level
     ``load_local_config`` / ``save_local_declaration``; only the ACCESS PATH moved —
     the operations now live on the collaborator that owns the concern.
     """
-    return resource_manager.LocalDeclarations()
+    return resource_manager.BkAiAgentInfo()
 
 
 def _pin_single_file(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
@@ -789,8 +800,8 @@ def _pin_single_file(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     ``AGENT_TUI_CONFIG_FILE`` is the single-file override, which short-circuits the
     per-agent two-level scope entirely — the writes in these tests land exactly here.
     """
-    monkeypatch.setenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, str(path))
-    monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+    monkeypatch.setenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, str(path))
+    monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
 
 class TestLocalConfigShape:
@@ -828,7 +839,7 @@ class TestTwoLevelScope:
     """
 
     def test_user_and_project_paths_derive_from_the_constant(self) -> None:
-        from aidev_agent_cli.infrastructure.logging import BKAI_HOME_DIRNAME
+        from aidev_agent_cli.utils.logging import BKAI_HOME_DIRNAME
 
         assert local_config.user_path("code-a").endswith(f"{BKAI_HOME_DIRNAME}/agents/code-a.json")
         assert BKAI_HOME_DIRNAME in local_config.user_path("code-a")
@@ -840,22 +851,22 @@ class TestTwoLevelScope:
         assert "agent.json" not in local_config.user_path("gamma")
 
     def test_project_path_is_omitted_without_a_cwd(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
         assert local_config.project_path("code-a") is None
 
     def test_project_path_follows_the_cwd_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv(resource_manager.LocalDeclarations.CWD_ENV, str(tmp_path))
+        monkeypatch.setenv(resource_manager.BkAiAgentInfo.CWD_ENV, str(tmp_path))
 
-        from aidev_agent_cli.infrastructure.logging import BKAI_HOME_DIRNAME
+        from aidev_agent_cli.utils.logging import BKAI_HOME_DIRNAME
 
         assert local_config.project_path("code-a") == str(tmp_path / BKAI_HOME_DIRNAME / "agents" / "code-a.json")
 
     def test_agents_dirs_are_symmetric_between_scopes(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """用户空间与项目空间对称：都用 ``.bkai/agents``。"""
-        from aidev_agent_cli.infrastructure.logging import BKAI_HOME_DIRNAME
+        from aidev_agent_cli.utils.logging import BKAI_HOME_DIRNAME
 
-        monkeypatch.setenv(resource_manager.LocalDeclarations.CWD_ENV, str(tmp_path))
+        monkeypatch.setenv(resource_manager.BkAiAgentInfo.CWD_ENV, str(tmp_path))
 
         assert local_config.user_agents_dir().endswith(f"{BKAI_HOME_DIRNAME}/agents")
         assert local_config.project_agents_dir() == str(tmp_path / BKAI_HOME_DIRNAME / "agents")
@@ -864,10 +875,10 @@ class TestTwoLevelScope:
         """同一 ``agent_code`` 的用户/项目两份文件，项目覆盖用户。"""
         project_dir = tmp_path / "proj" / ".bkai" / "agents"
         monkeypatch.setattr(
-            resource_manager.LocalDeclarations, "user_agents_dir", classmethod(lambda cls: str(tmp_path / "home"))
+            resource_manager.BkAiAgentInfo, "user_agents_dir", classmethod(lambda cls: str(tmp_path / "home"))
         )
         monkeypatch.setattr(
-            resource_manager.LocalDeclarations, "project_agents_dir", classmethod(lambda cls: str(project_dir))
+            resource_manager.BkAiAgentInfo, "project_agents_dir", classmethod(lambda cls: str(project_dir))
         )
         user = tmp_path / "home" / "code-a.json"
         user.parent.mkdir()
@@ -892,10 +903,10 @@ class TestTwoLevelScope:
         """Nested dict sections merge per key — a project value overrides only its key."""
         project_dir = tmp_path / "proj" / ".bkai" / "agents"
         monkeypatch.setattr(
-            resource_manager.LocalDeclarations, "user_agents_dir", classmethod(lambda cls: str(tmp_path / "home"))
+            resource_manager.BkAiAgentInfo, "user_agents_dir", classmethod(lambda cls: str(tmp_path / "home"))
         )
         monkeypatch.setattr(
-            resource_manager.LocalDeclarations, "project_agents_dir", classmethod(lambda cls: str(project_dir))
+            resource_manager.BkAiAgentInfo, "project_agents_dir", classmethod(lambda cls: str(project_dir))
         )
         user = tmp_path / "home" / "code-a.json"
         user.parent.mkdir()
@@ -933,8 +944,8 @@ class TestTwoLevelScope:
 
     def test_no_code_and_no_path_yields_an_empty_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """per-agent 模型下没有"默认文件"——无 code 且无 path/override 时读空。"""
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, raising=False)
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
         assert _declarations().read() == local_config.LocalConfig()
 
@@ -943,8 +954,8 @@ class TestTwoLevelScope:
         self, code: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """T-261014urj-03: ``agent_code`` 含路径穿越字符时拒绝读取（空配置 + 一行日志）。"""
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, raising=False)
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
         with caplog.at_level("INFO"):
             cfg = _declarations().read(code=code)
@@ -954,8 +965,8 @@ class TestTwoLevelScope:
     @pytest.mark.parametrize("code", ["../escape", "a/b", "a\\b", "..", ".hidden"])
     def test_a_traversing_agent_code_is_rejected_on_write(self, code: str, monkeypatch: pytest.MonkeyPatch) -> None:
         """T-261014urj-03: 含路径穿越的 ``agent_code`` 在写入时**响亮失败**。"""
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, raising=False)
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
         with pytest.raises(ValueError):
             _declarations().write("models", "m", code=code)
@@ -965,33 +976,33 @@ class TestAgentCodeResolution:
     """Environment -> accepted process config -> platform resource default."""
 
     def test_environment_beats_the_config_file(self, monkeypatch):
-        from aidev_agent_cli.infrastructure.settings import TuiConfig
-        from aidev_agent_cli.runtime.auth import ProcessConfig
-        from aidev_agent_cli.runtime.sdk.session import SDKSession
+        from aidev_agent_cli.runtime.settings import BkAiConfig
+        from aidev_agent_cli.runtime.process_config import ProcessConfig
+        from tests._sdk import make_run as SDKSession
         monkeypatch.setenv(local_config.AGENT_CODE_ENV, "from-env")
-        monkeypatch.setattr(TuiConfig, "read", lambda: TuiConfig(agent_code="from-file"))
+        monkeypatch.setattr(BkAiConfig, "read", lambda: BkAiConfig(default_agent_code="from-file"))
         assert SDKSession(agent_code=ProcessConfig().default_agent_code())._resolve_agent_code(SimpleNamespace(get_agent_code=lambda: "platform")) == "from-env"
 
     def test_config_file_beats_the_platform(self, monkeypatch):
-        from aidev_agent_cli.infrastructure.settings import TuiConfig
-        from aidev_agent_cli.runtime.auth import ProcessConfig
-        from aidev_agent_cli.runtime.sdk.session import SDKSession
+        from aidev_agent_cli.runtime.settings import BkAiConfig
+        from aidev_agent_cli.runtime.process_config import ProcessConfig
+        from tests._sdk import make_run as SDKSession
         monkeypatch.delenv(local_config.AGENT_CODE_ENV, raising=False)
-        monkeypatch.setattr(TuiConfig, "read", lambda: TuiConfig(agent_code="from-file"))
+        monkeypatch.setattr(BkAiConfig, "read", lambda: BkAiConfig(default_agent_code="from-file"))
         assert SDKSession(agent_code=ProcessConfig().default_agent_code())._resolve_agent_code(SimpleNamespace(get_agent_code=lambda: "platform")) == "from-file"
 
     def test_the_platform_fallback_is_last(self, monkeypatch):
-        from aidev_agent_cli.infrastructure.settings import TuiConfig
-        from aidev_agent_cli.runtime.sdk.session import SDKSession
+        from aidev_agent_cli.runtime.settings import BkAiConfig
+        from tests._sdk import make_run as SDKSession
         monkeypatch.delenv(local_config.AGENT_CODE_ENV, raising=False)
-        monkeypatch.setattr(TuiConfig, "read", lambda: TuiConfig())
+        monkeypatch.setattr(BkAiConfig, "read", lambda: BkAiConfig())
         assert SDKSession()._resolve_agent_code(SimpleNamespace(get_agent_code=lambda: "platform")) == "platform"
 
     def test_missing_everywhere_is_empty(self, monkeypatch):
-        from aidev_agent_cli.infrastructure.settings import TuiConfig
-        from aidev_agent_cli.runtime.sdk.session import SDKSession
+        from aidev_agent_cli.runtime.settings import BkAiConfig
+        from tests._sdk import make_run as SDKSession
         monkeypatch.delenv(local_config.AGENT_CODE_ENV, raising=False)
-        monkeypatch.setattr(TuiConfig, "read", lambda: TuiConfig())
+        monkeypatch.setattr(BkAiConfig, "read", lambda: BkAiConfig())
         assert SDKSession()._resolve_agent_code(None) == ""
 
 
@@ -1246,10 +1257,10 @@ class TestPerAgentWriteCreatesItsDirectory:
         monkeypatch.setenv("HOME", str(home))
         # 多平台：``Path.home()`` 在 POSIX 上读 HOME。同时清掉单文件 override 与
         # CWD，使解析真正走推导的 per-agent 路径。
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, raising=False)
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
-        target = resource_manager.LocalDeclarations.user_path("code-a")
+        target = resource_manager.BkAiAgentInfo.user_path("code-a")
         assert not Path(target).parent.exists(), "the agents dir must NOT pre-exist"
 
         _declarations().write("models", "m1", code="code-a")
@@ -1264,11 +1275,11 @@ class TestPerAgentWriteCreatesItsDirectory:
         """
         home = tmp_path / "home"
         monkeypatch.setenv("HOME", str(home))
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, raising=False)
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
         # ``agents`` 位置上放一个**文件**（而非目录），于是 makedirs 必然失败。
-        agents_dir = Path(resource_manager.LocalDeclarations.user_path("code-a")).parent
+        agents_dir = Path(resource_manager.BkAiAgentInfo.user_path("code-a")).parent
         agents_dir.parent.mkdir(parents=True, exist_ok=True)
         agents_dir.write_text("not a directory", encoding="utf-8")
 
@@ -1925,7 +1936,7 @@ def _real_session(
     返回 ``(state, rm, counts)``——``counts["platform"]`` 计平台拉取次数，
     ``counts["workspace"]`` 计工作区扫描次数。
     """
-    from aidev_agent_cli.runtime.sdk.session import SDKSession as Session
+    from tests._sdk import make_run as Session
 
     monkeypatch.chdir(tmp_path)
     for name in files:
@@ -3089,11 +3100,11 @@ class TestPerAgentIsolation:
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
         monkeypatch.setattr(
-            resource_manager.LocalDeclarations, "user_agents_dir", classmethod(lambda cls: str(agents_dir))
+            resource_manager.BkAiAgentInfo, "user_agents_dir", classmethod(lambda cls: str(agents_dir))
         )
-        monkeypatch.setattr(resource_manager.LocalDeclarations, "project_agents_dir", classmethod(lambda cls: None))
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CONFIG_FILE_OVERRIDE, raising=False)
-        monkeypatch.delenv(resource_manager.LocalDeclarations.CWD_ENV, raising=False)
+        monkeypatch.setattr(resource_manager.BkAiAgentInfo, "project_agents_dir", classmethod(lambda cls: None))
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CONFIG_FILE_OVERRIDE, raising=False)
+        monkeypatch.delenv(resource_manager.BkAiAgentInfo.CWD_ENV, raising=False)
 
         return agents_dir
 

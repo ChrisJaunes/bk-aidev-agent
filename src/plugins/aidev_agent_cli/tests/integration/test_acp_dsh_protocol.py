@@ -93,14 +93,18 @@ class Client:
 def start(tmp_path: Path) -> Iterator[Callable[..., Client]]:
     processes: list[subprocess.Popen] = []
 
-    def _start(hook_answer: HookAnswer | None = None) -> Client:
+    def _start(hook_answer: HookAnswer | None = None, hooks: dict[str, Any] | None = None) -> Client:
         env = dict(os.environ)
         env["MESSAGE_HANDLER_TYPE"] = "inmemory"
         env["PYTHONPATH"] = os.pathsep.join([str(PLUGIN_ROOT), str(AGENT_ROOT), env.get("PYTHONPATH", "")])
         env["AGENT_TUI_TUI_CONFIG_FILE"] = str(tmp_path / "bkai_tui.json")
         env["BKAI_TUI_LOG_PATH"] = str(tmp_path / "worker.log")
         env["ACP_DSH_TOOL_RECORD"] = str(tmp_path / "tool_calls.txt")
-        for key in ("AGENT_TUI_CWD", "BKAI_TUI_ACCESS_TOKEN"):
+        env["ACP_DSH_PREWARM"] = "1"
+        env.pop("ACP_DSH_HOOKS", None)
+        if hooks is not None:
+            env["ACP_DSH_HOOKS"] = json.dumps(hooks)
+        for key in ("AGENT_TUI_CWD",):
             env.pop(key, None)
         process = subprocess.Popen(
             [PYTHON, "-u", str(ENTRY)],
@@ -176,18 +180,18 @@ def test_hooks_round_trip_and_deny_blocks_tool(start, tmp_path: Path) -> None:
     def answer(params: dict[str, Any]) -> dict[str, Any]:
         if params["point"] == "tool_pre":
             return {"decision": "deny", "reason": "不许"}
-        if params["point"] == "session_start":
+        if params["point"] == "turn_start":
             return {"context": ""}
         return {"decision": "accept"}
 
     with FakeLLMServer(["好的"], tool_calls=[[{"name": "fake_tool", "args": {"q": "x"}, "id": "call_1"}]]) as llm:
-        client = start(answer)
-        sid = _new(client, llm, hooks={"timeout_ms": 5000})
+        client = start(answer, hooks={"timeout_ms": 5000})
+        sid = _new(client, llm)
         reply = _prompt(client, sid, "用工具")
 
     assert reply["result"]["_meta"]["aidev"]["status"] == "finished"
     points = [r["params"]["point"] for r in client.hook_requests]
-    assert points[:2] == ["session_start", "tool_pre"]
+    assert points[:2] == ["turn_start", "tool_pre"]
     pre = client.hook_requests[1]["params"]
     assert pre["sessionId"] == sid and pre["payload"]["tool_name"] == "fake_tool"
     assert _tool_calls(tmp_path) == []
@@ -205,8 +209,8 @@ def test_ask_interrupts_then_resume_runs_tool(start, tmp_path: Path) -> None:
         return {}
 
     with FakeLLMServer(["完成"], tool_calls=[[{"name": "fake_tool", "args": {"q": "y"}, "id": "call_9"}]]) as llm:
-        client = start(answer)
-        sid = _new(client, llm, hooks={"timeout_ms": 5000, "points": ["tool_pre"]})
+        client = start(answer, hooks={"timeout_ms": 5000, "points": ["tool_pre"]})
+        sid = _new(client, llm)
         first = _prompt(client, sid, "用工具")
         meta = first["result"]["_meta"]["aidev"]
         assert meta["status"] == "interrupt"

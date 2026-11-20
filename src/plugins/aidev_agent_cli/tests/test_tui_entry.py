@@ -18,7 +18,7 @@ def test_package_import_does_not_initialize_sdk_or_logging():
             "-c",
             "import sys, logging; import aidev_agent_cli; "
             "assert 'aidev_agent.config' not in sys.modules; "
-            "assert 'aidev_agent_cli.adapters.acp_dsh' not in sys.modules; "
+            "assert 'aidev_agent_cli.adapters.acp' not in sys.modules; "
             "assert 'aidev_agent_cli.adapters.agui' not in sys.modules; "
             "assert not logging.getLogger('aidev_agent_cli').handlers",
         ],
@@ -42,8 +42,8 @@ def test_tui_bootstraps_config_before_sdk_import_and_recovers_bad_input(tmp_path
     }
     env.pop("BK_AIDEV_AGENT_APP_CODE", None)
     code = (
-        "import asyncio; from aidev_agent_cli.infrastructure.startup import install_startup_hooks; install_startup_hooks(); from aidev_agent_cli.adapters import agui as runtime; "
-        "from aidev_agent_cli.runtime.service import build_runtime; asyncio.run(runtime.run_agui(build_runtime('agui', resources=('injected',)))); from aidev_agent.config import settings; "
+        "import asyncio; from aidev_agent_cli.bootstrap.startup import install_startup_hooks; from aidev_agent_cli.runtime.settings import BkAiConfig; from aidev_agent_cli.utils.runs import LaunchOptions; from aidev_agent_cli.runtime.process_config import ProcessConfig; bkai = BkAiConfig.read(); install_startup_hooks(bkai.env); from aidev_agent_cli.adapters import agui as runtime; "
+        "from aidev_agent_cli.runtime.service import build_runtime; from aidev_agent_cli.adapters.streams import ProtocolChannel; asyncio.run(runtime.run_agui(build_runtime('agui', ProcessConfig(bkai=bkai, launch=LaunchOptions(resources=('injected',)))), ProtocolChannel.stdio())); from aidev_agent.config import settings; "
         "assert settings.APP_CODE == 'headless-startup-test'"
     )
     result = subprocess.run(
@@ -59,6 +59,4 @@ def test_tui_bootstraps_config_before_sdk_import_and_recovers_bad_input(tmp_path
     assert [frame["kind"] for frame in frames] == ["ready", "error", "result"]
     assert frames[1]["error"]["code"] == "PARSE_ERROR"
     assert frames[2]["id"] == "stop"
-    import aidev_agent
-
-    assert frames[0]["sdk_file"] == aidev_agent.__file__
+    assert "sdk_file" not in frames[0]

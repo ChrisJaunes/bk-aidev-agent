@@ -1,16 +1,22 @@
-"""``adapters.agui.FrameWriter`` 的序列化 NDJSON writer 测试（D-07，主测 ``adapters``）。"""
+"""``adapters.agui.AguiTransport`` 的序列化 NDJSON writer 测试（D-07，主测 ``adapters``）。"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import errno
+import io
 import json
 from typing import Any
 
 import pytest
 
-from aidev_agent_cli.adapters.agui import _QUEUE_MAX, FrameWriter
+from aidev_agent_cli.adapters.agui import AguiTransport
+from aidev_agent_cli.adapters.streams import ProtocolChannel
+
+
+def _writer(stream: Any, **options: Any) -> AguiTransport:
+    return AguiTransport(ProtocolChannel(io.BytesIO(), stream, **options))
 
 
 class _BrokenPipeStream:
@@ -37,8 +43,7 @@ async def test_concurrent_writes_never_interleave() -> None:
     import io
 
     stream = io.StringIO()
-    writer = FrameWriter(stream, maxsize=_QUEUE_MAX)
-    await writer.start()
+    writer = _writer(stream)
 
     n = 50
     # A multi-byte Chinese string forces ensure_ascii=False behaviour and makes
@@ -66,8 +71,7 @@ async def test_concurrent_writes_never_interleave() -> None:
 async def test_peer_gone_on_broken_pipe() -> None:
     """A write that raises BrokenPipeError flags peer-gone without raising."""
     stream = _BrokenPipeStream()
-    writer = FrameWriter(stream)
-    await writer.start()
+    writer = _writer(stream)
 
     assert await writer.send({"v": 1, "id": "x", "kind": "ready"}) is True
 
@@ -90,8 +94,7 @@ async def test_serialization_error_reraises() -> None:
     import io
 
     stream = io.StringIO()
-    writer = FrameWriter(stream)
-    await writer.start()
+    writer = _writer(stream)
 
     with pytest.raises(TypeError):
         await writer.send({"v": 1, "id": "bad", "bad": object()})
@@ -104,13 +107,9 @@ async def test_serialization_error_reraises() -> None:
 
 async def test_bounded_queue() -> None:
     """The queue is bounded so a huge tool output applies back-pressure."""
-    import io
-
-    writer = FrameWriter(io.StringIO())
-    assert writer.queue.maxsize == 256
-    assert _QUEUE_MAX == 256
-    await writer.start()
-    await writer.close()
+    channel = ProtocolChannel(io.BytesIO(), io.StringIO())
+    assert channel._writer.queue.maxsize == 256
+    await channel.close()
 
 
 # ---------------------------------------------------------------- drain thread
@@ -143,10 +142,9 @@ async def test_the_event_loop_keeps_running_while_the_drain_is_blocked() -> None
 
     read_fd, write_fd = os.pipe()
     stream = os.fdopen(write_fd, "w", buffering=1, encoding="utf-8", errors="replace")
-    writer = FrameWriter(stream)
+    writer = _writer(stream)
 
     try:
-        await writer.start()
 
         ticks = 0
 
@@ -192,16 +190,11 @@ async def test_a_wedged_drain_does_not_hang_the_sender_forever(monkeypatch: pyte
     """
     import os
 
-    import aidev_agent_cli.adapters.agui as writer_mod
-
-    monkeypatch.setattr(writer_mod, "_ENQUEUE_TIMEOUT_SECONDS", 0.2)
-
     read_fd, write_fd = os.pipe()
     stream = os.fdopen(write_fd, "w", buffering=1, encoding="utf-8", errors="replace")
-    writer = FrameWriter(stream)
+    writer = _writer(stream, write_timeout=0.2)
 
     try:
-        await writer.start()
 
         async def flood() -> bool:
             for i in range(5000):
@@ -228,10 +221,9 @@ async def test_peer_gone_returns_false_and_is_not_an_exception() -> None:
 
     read_fd, write_fd = os.pipe()
     stream = os.fdopen(write_fd, "w", buffering=1, encoding="utf-8", errors="replace")
-    writer = FrameWriter(stream)
+    writer = _writer(stream)
 
     try:
-        await writer.start()
         # Close the READ end: the next flush raises EPIPE.
         os.close(read_fd)
         read_fd = -1
@@ -273,8 +265,7 @@ async def test_close_re_raises_a_fatal_drain_failure() -> None:
         def flush(self) -> None:
             return None
 
-    writer = FrameWriter(_HostProblem())
-    await writer.start()
+    writer = _writer(_HostProblem())
 
     # Enough to get the frame to the drain.
     await writer.send({"v": 1, "id": "x", "kind": "event", "payload": {}})
@@ -290,7 +281,7 @@ async def test_close_re_raises_a_fatal_drain_failure() -> None:
 async def test_frame_methods_preserve_envelopes_and_send_result(accepted: bool) -> None:
     from unittest.mock import AsyncMock
 
-    writer = FrameWriter(None)
+    writer = AguiTransport(None)
     writer.send = AsyncMock(return_value=accepted)
     cases = [
         (

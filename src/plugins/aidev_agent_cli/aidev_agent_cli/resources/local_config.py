@@ -2,7 +2,7 @@
 
 本模块只装两件事，以及一个环境开关：
 
-* :class:`LocalConfig` / :class:`LocalDeclarations` —— per-agent 声明式配置的读写；
+* :class:`LocalConfig` / :class:`BkAiAgentInfo` —— per-agent 声明式配置的读写；
 * :class:`McpConfig` / :class:`McpResolver` —— ``mcp.json`` 的定位、读取、合并与 mtime 读缓存；
 * :func:`platform_mcp_disabled` —— 丢弃平台 MCP 绑定的逃生开关（读环境变量，不属于解析）。
 
@@ -17,7 +17,7 @@
 ``LocalResourceManager``（在 ``platform.py``）在自己的 ``__init__`` 里装配 loader 链，而链首的
 ``PlatformConfigLoader`` 又必须回指那个 manager 取 per-call 的 ``agent_code`` / ``version``。
 同一个文件时那只是模块内引用；拆包后就是模块级循环 import。因此按**被依赖方向**切：
-本模块不 import ``loaders`` / ``platform`` / ``runtime``，只 import ``infrastructure``。
+本模块不 import ``loaders`` / ``platform`` / ``runtime``，只 import ``utils``。
 
 这条纪律由 AST 断言强制（见 ``tests/test_layer_graph.py``），不是口头约定。
 
@@ -32,7 +32,7 @@ token 纪律（不变）
 ``LocalConfig`` 的字段面**不含**任何 token 类键——因此「把 token 放进 per-agent 配置」在结构上
 做不到（字段面由 :attr:`LocalConfig.FIELD_ALIASES` 的键集推导，写入载荷只由白名单构造）。
 唯一放行 token 落盘的位置是 ``bkai_tui.json`` 的 ``auth.access_token``
-（:class:`aidev_agent_cli.infrastructure.settings.TuiConfig`）。
+（:class:`aidev_agent_cli.runtime.settings.BkAiConfig`）。
 """
 
 from __future__ import annotations
@@ -45,14 +45,14 @@ from logging import getLogger
 from pathlib import Path
 from typing import Any
 
-from ..infrastructure.logging import BKAI_HOME_DIRNAME
+from ..utils.logging import BKAI_HOME_DIRNAME
 
 logger = getLogger(__name__)
 
 # ============================================================================
 # §1  本地声明层 —— <BKAI_HOME>/agents/${agent_code}.json（per-agent，用户空间与项目空间两级）
 #     承载平台 AgentConfig 的**全量形状**，由 worker 读，部分由 TUI 写（/models /mcps 等）。
-#     所有者：LocalDeclarations。
+#     所有者：BkAiAgentInfo。
 # ============================================================================
 
 """本地声明式配置：**每个 agent 一个**、由 worker 读写的 JSON 文件。
@@ -67,7 +67,7 @@ base，它知道应用实际绑定了什么。本文件只是让本地用户能�
 本层曾经只有一个固定文件名 ``agent.json``（用户/项目两级）。261014-urj 判定那混淆了
 "进程级 TUI 配置"与"per-agent 配置"两个概念，于是：
 
-* **TUI 配置（进程级）** 迁往 :class:`aidev_agent_cli.config.TuiConfig`（``bkai_tui.json``）——
+* **TUI 配置（进程级）** 迁往 :class:`aidev_agent_cli.runtime.settings.BkAiConfig`（``bkai_tui.json``）——
   只管"主 Agent 是谁"（``agent_code``）与身份认证（``auth``）。
 * **per-agent 配置（本层）** 改为按 ``agent_code`` 逐文件读取：
   ``~/.bkai/agents/${code}.json`` 与 ``<AGENT_TUI_CWD>/.bkai/agents/${code}.json``
@@ -107,12 +107,12 @@ worker 自行解析的本地文件——因此并非本代码库中的新概念�
 *无法*承载 token：:class:`LocalConfig` 没有 token 字段（其字段面完全由
 :attr:`LocalConfig.FIELD_ALIASES` 的键集推导，因此“加 token 字段”会在
 ``TestLocalConfigShape`` 上立刻失败），因此文件中的 token 无法进入返回值；
-:meth:`LocalDeclarations.write` 只从白名单键构造写入载荷，因此 token 也无法被写回。
-见 :attr:`LocalDeclarations.REJECTED_SECRET_KEYS` 与
-:attr:`LocalDeclarations.DECLARATION_FIELDS`。
+:meth:`BkAiAgentInfo.write` 只从白名单键构造写入载荷，因此 token 也无法被写回。
+见 :attr:`BkAiAgentInfo.REJECTED_SECRET_KEYS` 与
+:attr:`BkAiAgentInfo.DECLARATION_FIELDS`。
 
 **261014-urj 的 D4 只放行了 ``bkai_tui.json`` 的 ``auth.access_token``**（见
-:class:`aidev_agent_cli.config.TuiConfig`），**未触及本层**——agent 级配置仍结构性拒绝 token。
+:class:`aidev_agent_cli.runtime.settings.BkAiConfig`），**未触及本层**——agent 级配置仍结构性拒绝 token。
 
 这种非对称是有意为之：**读取**失败静默降级（平台配置继续可用），而**写入**失败
 抛异常。因为用户输入 ``/models <code>`` 却得不到“什么也没保存”的反馈，正是应当
@@ -181,7 +181,7 @@ class LocalConfig:
         return True
 
 
-class LocalDeclarations:
+class BkAiAgentInfo:
     """per-agent ``agents/${agent_code}.json`` 的所有者：读取、合并、写入与
     :class:`LocalConfig` 的收窄。
 
@@ -197,7 +197,7 @@ class LocalDeclarations:
     （:attr:`CONFIG_FILE_OVERRIDE` / :attr:`AGENTS_DIRNAME` /
     :attr:`AGENT_CONFIG_SUFFIX` / :attr:`REJECTED_SECRET_KEYS` /
     :attr:`DECLARATION_FIELDS`）是**本节的配置面**，因此是类属性而非模块常量；测试
-    相应按 ``LocalDeclarations.X`` monkeypatch。
+    相应按 ``BkAiAgentInfo.X`` monkeypatch。
     """
 
     #: 指向备用配置文件的环境变量（单文件语义）。设置后只读该文件。
@@ -225,7 +225,7 @@ class LocalDeclarations:
 
     #: 看起来像凭据、因此即使用户写入也会被拒绝的键。见模块常量
     #: :data:`REJECTED_SECRET_KEYS` 的理由说明。**agent 级配置仍拒绝 token**——
-    #: D4 只放行了 ``bkai_tui.json``（:class:`aidev_agent_cli.config.TuiConfig`），未触及此处。
+    #: D4 只放行了 ``bkai_tui.json``（:class:`aidev_agent_cli.runtime.settings.BkAiConfig`），未触及此处。
     REJECTED_SECRET_KEYS = REJECTED_SECRET_KEYS
 
     #: 单数资源族 → （``LocalConfig`` 字段, 是否为集合）。写入入口的分发表——使用
@@ -459,7 +459,7 @@ class LocalDeclarations:
 
         for key, value in overlay.items():
             if isinstance(value, dict) and isinstance(merged.get(key), dict):
-                merged[key] = LocalDeclarations._merge_dict(merged[key], value)
+                merged[key] = BkAiAgentInfo._merge_dict(merged[key], value)
             else:
                 merged[key] = value
 
@@ -705,7 +705,7 @@ transport/url/command，既不必要求平台改动，也不必把该结构放�
 
 **1. 文件缺失或损坏不致命。**
 
-与 :meth:`LocalDeclarations.read` 和 ``aidev_agent_cli.config.load_env_file`` 相同的约定：每个
+与 :meth:`BkAiAgentInfo.read` 和 ``aidev_agent_cli.config.load_env_file`` 相同的约定：每个
 候选路径被独立读取，缺失、不可读或无法解析的文件只贡献**一行** stderr 而不贡献
 任何内容，其他候选照常加载。文件不存在是常态——多数用户从不创建这些文件，而平台
 自身的 MCP 绑定没有它们也完全可用。若抛异常，用户忘记的某个 JSON 文件中的笔误
@@ -878,7 +878,7 @@ class McpResolver:
     CWD_ENV = "AGENT_TUI_CWD"
 
     #: 项目空间内存放 ``mcp.json`` 的子目录（``<project>/.bkai/``）——与
-    #: :class:`TuiConfig <aidev_agent_cli.config.TuiConfig>` 的两级作用域同构。
+    #: :class:`BkAiConfig <aidev_agent_cli.runtime.settings.BkAiConfig>` 的两级作用域同构。
     PROJECT_DIRNAME = BKAI_HOME_DIRNAME
 
     #: 在 :attr:`PROJECT_DIRNAME` 内查找的文件名。

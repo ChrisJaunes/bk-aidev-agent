@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """协议 adapter 的流 I/O 故障行为（主测 ``adapters``）。
 
-从 ``tests/infrastructure/test_protocol_streams.py`` 按断言目标拆出：那一侧只留
-``infrastructure.streams.LineReader`` / ``LineWriter`` / ``until_stopped`` 的背压、限长与
+从 ``tests/adapters/test_protocol_streams.py`` 按断言目标拆出：那一侧只留
+``adapters.streams.LineReader`` / ``LineWriter`` / ``until_stopped`` 的背压、限长与
 写出确认单元测试（含 SIGTERM 子进程回归）；本文件承载协议 adapter 在**输出侧故障**时
-如何收尾——``adapters.acp._StdioTransport`` 的 pending/断管与 ``adapters.agui.run_agui``
+如何收尾——``adapters.acp.AcpTransport`` 的 pending/断管与 ``adapters.agui.run_agui``
 的空闲输入唤醒 + service 关闭。
 """
 
@@ -16,6 +16,8 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+
+from aidev_agent_cli.adapters.streams import ProtocolChannel
 
 
 class SlowStream:
@@ -35,11 +37,10 @@ class SlowStream:
 
 
 async def test_acp_pending_is_settled_only_after_flush(monkeypatch: pytest.MonkeyPatch) -> None:
-    from aidev_agent_cli.adapters.acp import _StdioTransport
+    from aidev_agent_cli.adapters.acp import AcpTransport
 
-    monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=io.BytesIO()))
     stream = SlowStream()
-    transport = _StdioTransport(stream)
+    transport = AcpTransport(ProtocolChannel(io.BytesIO(), stream))
     transport._pending_requests.add(1)
     sending = asyncio.create_task(transport.send({"id": 1, "result": {}}))
     try:
@@ -55,7 +56,7 @@ async def test_acp_pending_is_settled_only_after_flush(monkeypatch: pytest.Monke
 
 
 async def test_acp_output_failure_exits_with_stdin_still_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    from aidev_agent_cli.adapters.acp import _StdioTransport
+    from aidev_agent_cli.adapters.acp import AcpTransport
 
     release = threading.Event()
 
@@ -68,8 +69,7 @@ async def test_acp_output_failure_exits_with_stdin_still_open(monkeypatch: pytes
         def write(self, _: str) -> int:
             raise BrokenPipeError()
 
-    monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=OpenInput()))
-    transport = _StdioTransport(BrokenOutput())
+    transport = AcpTransport(ProtocolChannel(OpenInput(), BrokenOutput()))
     receiving = asyncio.create_task(transport.receive())
     try:
         await asyncio.sleep(0.01)
@@ -97,13 +97,11 @@ async def test_agui_output_failure_wakes_idle_input_and_closes_service(monkeypat
         def write(self, _: str) -> int:
             raise BrokenPipeError()
 
-    monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=OpenInput()))
     monkeypatch.setattr(agui, "async_shutdown_event", asyncio.Event)
     monkeypatch.setattr(agui, "use_daemon_default_executor", lambda *_: None)
-    monkeypatch.setattr(agui, "protocol_out", BrokenOutput)
     service = SimpleNamespace(close_all=AsyncMock())
     try:
-        assert await asyncio.wait_for(agui.run_agui(service), 1) == 0
+        assert await asyncio.wait_for(agui.run_agui(service, ProtocolChannel(OpenInput(), BrokenOutput())), 1) == 0
         service.close_all.assert_awaited_once()
         assert not any(task.get_name() in {"agui-shutdown", "agui-output-stop"} for task in asyncio.all_tasks())
     finally:

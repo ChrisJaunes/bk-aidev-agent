@@ -12,7 +12,7 @@
 ------------
 * **真** ACP 服务端：``adapters.acp.run_acp_server`` + ``acp`` SDK 的 ``AgentSideConnection``
   + stdin/stdout NDJSON；
-* **真** 生命周期：``RuntimeService`` → ``SDKRunner`` → ``SDKRunner`` →
+* **真** 生命周期：``RuntimeService`` → ``RunQueue`` → ``execute_turn`` →
   ``Session``（含 ``_resolve_agent_code``）；
 * 只有两处在**进程内**被替身化：
   1. 平台管理器：``LocalResourceManager.build`` 返回一个内存替身（不触达平台）；
@@ -129,7 +129,7 @@ class _CancellableAgent:
 
 def install_fake_sdk():
     """Install the deterministic SDK execution face inside the spawned child."""
-    from aidev_agent_cli.runtime.sdk.session import SDKSession
+    from aidev_agent_cli.sdk.executor import AgentRun as SDKSession
 
     SDKSession.ensure_platform_session = lambda self: None
     SDKSession._event_handler = lambda self: self.writer
@@ -147,14 +147,19 @@ async def main() -> int:
     from dataclasses import replace
 
     from aidev_agent_cli.adapters.acp import run_acp_server
-    from aidev_agent_cli.infrastructure.startup import install_startup_hooks
-    from aidev_agent_cli.runtime.auth import AuthManager
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.process_config import ProcessConfig
+    from aidev_agent_cli.runtime.settings import BkAiConfig
+    from aidev_agent_cli.bootstrap.startup import install_startup_hooks
+    from aidev_agent_cli.adapters.streams import ProtocolChannel
     from aidev_agent_cli.runtime.service import build_runtime
 
     # 与真实入口同一条启动路径：日志 / guard / 环境 / OTel 都在建 runtime 之前就位。
     # 少了它，本进程的诊断只会落到 stderr，日志文件里的 cwd 断言就成了空断言。
-    install_startup_hooks()
-    service = build_runtime("acp", resources=("injected",), auth=AuthManager(access_token="fake-token"))
+    bkai = BkAiConfig.read()
+    install_startup_hooks(bkai.env)
+    bkai.auth["access_token"] = "fake-token"
+    service = build_runtime("acp", ProcessConfig(bkai=bkai, launch=LaunchOptions(resources=("injected",))))
     original_create = service.new_session
 
     async def create(options=None):
@@ -163,7 +168,7 @@ async def main() -> int:
 
     service.new_session = create
 
-    return await run_acp_server(service)
+    return await run_acp_server(service, ProtocolChannel.stdio())
 
 
 if __name__ == "__main__":

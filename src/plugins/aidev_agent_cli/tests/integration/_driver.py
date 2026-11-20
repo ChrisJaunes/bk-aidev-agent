@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""测试驱动：注入式后端（``SDKRunner`` / ``ProcessWorker``）的进程内 NDJSON 驱动。
+"""测试驱动：注入式后端（``execute_turn`` / ``ProcessWorker``）的进程内 NDJSON 驱动。
 
 原 ``adapters/headless.py`` 的线上协议已由 ``--protocol acp-dsh`` 取代并从产品代码中删除；
 这里只保留它的分发逻辑，作为 runtime 注入式后端行为用例（hook / 中断 / 并发 / 账本）的驱动，
@@ -15,7 +15,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
-from aidev_agent_cli.infrastructure.errors import (
+from aidev_agent_cli.utils.errors import (
     AGENT_BUILD_FAILED,
     AGENT_INTERNAL_ERROR,
     PROTOCOL_INVALID_JSON,
@@ -23,12 +23,12 @@ from aidev_agent_cli.infrastructure.errors import (
     PROTOCOL_UNKNOWN_METHOD,
     HeadlessError,
 )
-from aidev_agent_cli.infrastructure.process import install_shutdown_signals
-from aidev_agent_cli.infrastructure.stdio import protocol_out
-from aidev_agent_cli.runtime.contracts import ResumeRequest, RunRequest, SessionOptions
-from aidev_agent_cli.runtime.errors import RuntimeFault
-from aidev_agent_cli.runtime.inputs import ChatInput, ContextInput, ResumeInterrupt
-from aidev_agent_cli.runtime.models import HookReply
+from aidev_agent_cli.utils.process import install_shutdown_signals
+from aidev_agent_cli.utils.stdio import protocol_out
+from aidev_agent_cli.utils.runs import ResumeRequest, RunRequest, SessionOptions
+from aidev_agent_cli.utils.errors import RuntimeFault
+from aidev_agent_cli.utils.inputs import ChatInput, ContextInput, ResumeInterrupt
+from aidev_agent_cli.hooks.models import HookReply
 from aidev_agent_cli.runtime.service import CANCEL_GRACE_SECONDS
 
 METHOD_CREATE = "create"
@@ -119,7 +119,7 @@ def require_param(
 def encode_event(request_id: str, event: Any) -> str:
     """把一条 AG-UI 事件编码为事件行。
 
-    事件可以是 SDK 模型，也可以是线上 JSON 载荷（``runtime.terminal`` 产出的终止事件就是
+    事件可以是 SDK 模型，也可以是线上 JSON 载荷（``utils.terminal`` 产出的终止事件就是
     纯字典——父进程不装载 SDK，形状由 ``model_dump(...)`` 等价保证）。
     """
     payload = event if isinstance(event, dict) else event.model_dump(mode="json", by_alias=True)
@@ -190,9 +190,20 @@ def _optional_messages(params: dict[str, Any]) -> list[dict] | None:
     return value
 
 
+class _DriverHooks:
+    """测试协议的进程级 hook：配置来自首个 create，应答走本 AguiAdapter 的 hook 请求行。"""
+
+    def __init__(self, config: Any, reply: Any) -> None:
+        self.config = config
+        self._reply = reply
+
+    async def __call__(self, request: Any, token: Any) -> Any:
+        return await self._reply(request, token)
+
+
 def _optional_hooks(params: dict[str, Any]) -> Any:
     """解析 ``create.params.hooks``；不传即完全关闭 hook 层（REQ-19）。"""
-    from aidev_agent_cli.runtime.sdk.hooks import HookConfig
+    from aidev_agent_cli.sdk.hooks import HookConfig
 
     value = params.get("hooks")
     if value is None:
@@ -217,7 +228,7 @@ logger = logging.getLogger("aidev_agent_cli")
 
 
 def configure_logging() -> None:
-    """把本包的诊断指向 stderr（文件日志由 ``infrastructure.logging`` 在导入时配好）。
+    """把本包的诊断指向 stderr（文件日志由 ``utils.logging`` 在导入时配好）。
 
     只处理"标准库 logging 的 root 与 loguru 也改道 stderr"这一件事。语义与合并前一致：
     stdout 只承载协议行，任何诊断都不得落进去。
@@ -283,7 +294,7 @@ class HostReplies:
             self.pending.pop(line_id, None)
 
 
-class Dispatcher:
+class AguiAdapter:
     """NDJSON → ``RuntimeService`` 的翻译器。
 
     **不持第二份运行状态**：``turn`` / ``resume`` 都走 ``service.start`` / ``service.resume``，
@@ -297,21 +308,17 @@ class Dispatcher:
     """
 
     def __init__(self, *, stream: TextIO, service: Any = None, defaults: Any = None) -> None:
-        from aidev_agent_cli.runtime.contracts import LaunchOptions
+        from aidev_agent_cli.utils.runs import LaunchOptions
 
         self._stream = stream
         #: 命令行默认值（-m / -s / --resources）。
         self._defaults = defaults or LaunchOptions()
         self._write_lock = threading.Lock()
         self.hook_router = HostReplies()
-        if service is None:
-            from aidev_agent_cli.runtime.auth import ProcessConfig
-            from aidev_agent_cli.runtime.service import RuntimeService
-
-            service = RuntimeService(
-                config=ProcessConfig(defaults=self._defaults), busy_mode="queue",
-            )
-        self.service = service
+        #: hook 是 RuntimeService 的进程级依赖；本协议的 hooks 写在 create 上，所以 service
+        #: 延迟到第一次 create 再组装（同一 AguiAdapter 内各会话必须使用同一份 hooks 配置）。
+        self._service = service
+        self._service_hooks: Any = None
         self._transports = {}
         self._workers: list[threading.Thread] = []
         self._workers_lock = threading.Lock()
@@ -469,10 +476,9 @@ class Dispatcher:
             starter = self.service.start
         loop = self._session_loop(session_code)
         with self._queue_lock:
-            sink, hooks = self._transports[session_code]
+            sink = self._transports[session_code]
             handle = asyncio.run_coroutine_threadsafe(
-                starter(run_request, sink or self._event_sink(request.id),
-                        hooks=hooks, hook_handler=self._hook_reply if hooks else None), loop,
+                starter(run_request, sink or self._event_sink(request.id)), loop,
             ).result()
 
         return loop, handle
@@ -602,7 +608,7 @@ class Dispatcher:
         ).result()
         environment = info
         if environment is None:
-            from aidev_agent_cli.infrastructure.errors import SESSION_NOT_FOUND
+            from aidev_agent_cli.utils.errors import SESSION_NOT_FOUND
 
             raise HeadlessError(SESSION_NOT_FOUND, f"未知会话：{session_code}", {"session_code": session_code})
 
@@ -651,7 +657,8 @@ class Dispatcher:
 
         )
 
-        self._transports[session_code] = (params.get("event_sink"), _optional_hooks(params))
+        self._bind_hooks(_optional_hooks(params))
+        self._transports[session_code] = params.get("event_sink")
         loop = self._session_loop(session_code)
         async def create():
             await self.service.new_session(options)
@@ -663,6 +670,33 @@ class Dispatcher:
             raise HeadlessError(outcome.error_code or AGENT_BUILD_FAILED, outcome.error_message)
 
         return {"session_code": session_code, "created": True}
+
+    @property
+    def service(self) -> Any:
+        if self._service is None:
+            self._service = self._build_service(None)
+        return self._service
+
+    def _build_service(self, hooks: Any) -> Any:
+        from aidev_agent_cli.runtime.process_config import ProcessConfig
+        from aidev_agent_cli.runtime.service import RuntimeService
+
+        self._service_hooks = hooks
+        return RuntimeService(
+            config=ProcessConfig(launch=self._defaults),
+            busy_mode="queue",
+            hooks=_DriverHooks(hooks, self._hook_reply) if hooks is not None else None,
+        )
+
+    def _bind_hooks(self, hooks: Any) -> None:
+        """首个 create 决定进程级 hooks；之后的 create 只能与它一致。"""
+        if self._service is None:
+            self._service = self._build_service(hooks)
+            return
+        current = self._service_hooks.snapshot() if self._service_hooks is not None else None
+        wanted = hooks.snapshot() if hooks is not None else None
+        if current != wanted:
+            raise HeadlessError(PROTOCOL_INVALID_PARAMS, "同一进程内各会话的 hooks 配置必须一致", {"fields": ["hooks"]})
 
     def _cancel(self, request: Request) -> dict:
         """请求取消当前轮。**在运行所在的事件循环上**执行（取消是循环内动作）。
@@ -723,7 +757,7 @@ class Dispatcher:
 
     def _respond_error(self, request_id: str, error: HeadlessError) -> None:
         """先写一条 RUN_ERROR 事件，再写结构化错误响应。"""
-        from aidev_agent_cli.runtime.terminal import build_error_event
+        from aidev_agent_cli.utils.terminal import build_error_event
 
         self._write(encode_event(request_id, build_error_event(error.message)))
         self._write(encode_error(request_id, HeadlessError(error.code, error.message, error.detail)))
@@ -761,7 +795,7 @@ class ServiceRegistryView:
         ).result()
         environment = info
         if environment is None:
-            from aidev_agent_cli.infrastructure.errors import SESSION_NOT_FOUND
+            from aidev_agent_cli.utils.errors import SESSION_NOT_FOUND
 
             raise HeadlessError(SESSION_NOT_FOUND, f"未知会话：{session_code}", {"session_code": session_code})
 
@@ -787,7 +821,7 @@ def serve(stdin: TextIO | None = None, stdout: TextIO | None = None, *, defaults
     # ``protocol_out()`` 在 guard 未装时回退到原始 stdout，因此嵌入式调用（宿主显式传
     # ``stdout``）与直接 ``serve()`` 两种形态都成立。
     stdout = stdout if stdout is not None else protocol_out()
-    dispatcher = Dispatcher(stream=stdout, defaults=defaults)
+    dispatcher = AguiAdapter(stream=stdout, defaults=defaults)
     try:
         for raw_line in stdin:
             line = raw_line.strip()

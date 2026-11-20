@@ -2,17 +2,17 @@
 """Hook 纯值契约与协议点位 → SDK hook 点位的映射。
 
 ``HookConfig`` / 点位名 / 降级原因 / ``hook_degraded`` 事件名住在纯 stdlib 的
-:mod:`aidev_agent_cli.runtime.hook_contract`（父进程解析 ``hooks`` 配置、写 worker 快照，
-不需要 SDK）。协议点位经 ``runtime.sdk.hooks.build_hook_set`` 挂到 SDK 的 ``HookSet``：
-``session_start`` → ``turn_start``，``tool_pre`` / ``tool_post`` → 同名点位。
+:mod:`aidev_agent_cli.hooks.contract`（父进程解析 ``hooks`` 配置、写 worker 快照，
+不需要 SDK）。协议点位经 ``sdk.hooks.build_hook_set`` 挂到 SDK 的 ``HookSet``：
+``turn_start`` / ``tool_pre`` / ``tool_post`` 映射到同名 SDK 点位。
 """
 
 from __future__ import annotations
 
 import pytest
 from aidev_agent.core.hook import HookPoint
-from aidev_agent_cli.runtime import hook_contract
-from aidev_agent_cli.runtime.sdk.hooks import HOOK_SET_GRACE_SECONDS, HeadlessHookBus, build_hook_set
+from aidev_agent_cli.hooks import contract as hook_contract
+from aidev_agent_cli.sdk.hooks import HOOK_SET_GRACE_SECONDS, HeadlessHookBus, build_hook_set
 
 
 def _bus(points: set[str], timeout_ms: int = 2000) -> HeadlessHookBus:
@@ -36,7 +36,7 @@ def test_default_timeout_is_used_when_hooks_are_omitted() -> None:
 @pytest.mark.parametrize(
     "points, expected",
     [
-        ({"session_start"}, {HookPoint.TURN_START}),
+        ({"turn_start"}, {HookPoint.TURN_START}),
         ({"tool_pre"}, {HookPoint.TOOL_PRE}),
         # tool_post 需要 tool_pre 处理器记录本次调用的 tool_input
         ({"tool_post"}, {HookPoint.TOOL_PRE, HookPoint.TOOL_POST}),

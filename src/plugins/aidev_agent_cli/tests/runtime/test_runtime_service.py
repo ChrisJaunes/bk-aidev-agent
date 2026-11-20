@@ -6,7 +6,7 @@
 ``create -> start -> busy 拒绝 -> cancel 命中 -> cancel 未知 = False -> close 幂等 ->
 close_all`` 这串不变量对**两者**都要成立，且语义一致。
 
-统一执行路径下只有一个策略（``SDKRunner``）；参数化的是两种资源形状（含平台来源 /
+统一执行路径下只有一个策略（``execute_turn``）；参数化的是两种资源形状（含平台来源 /
 无平台来源），会话 agent 换成脚本替身（``tests/integration/_scripted.py``，与 dispatch 测试同一注入缝）。
 """
 
@@ -22,8 +22,8 @@ import pytest
 
 from aidev_agent_cli import __main__ as entry
 from aidev_agent_cli.resources.sources import PLATFORM_SOURCES
-from aidev_agent_cli.runtime.contracts import RunOutcome, RunRequest, SessionOptions
-from aidev_agent_cli.runtime.inputs import ChatInput
+from aidev_agent_cli.utils.runs import RunOutcome, RunRequest, SessionOptions
+from aidev_agent_cli.utils.inputs import ChatInput
 from aidev_agent_cli.runtime.service import RuntimeService
 
 
@@ -51,9 +51,9 @@ async def _slow_platform_run(params: dict[str, Any], is_cancelled: Any) -> Async
 
 
 def _scripted_service(resources: tuple[str, ...]) -> RuntimeService:
-    from aidev_agent_cli.runtime.auth import ProcessConfig
-    from aidev_agent_cli.runtime.contracts import LaunchOptions
-    return RuntimeService(config=ProcessConfig(defaults=LaunchOptions(resources=resources)))
+    from aidev_agent_cli.runtime.process_config import ProcessConfig
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    return RuntimeService(config=ProcessConfig(launch=LaunchOptions(resources=resources)))
 
 
 def _platform_service() -> RuntimeService:
@@ -84,7 +84,7 @@ async def test_create_registers_the_session_and_unknown_sessions_are_rejected(ma
     assert (await service.session_info("s1")) is not None
     assert (await service.session_info("nope")) is None
 
-    from aidev_agent_cli.runtime.errors import RuntimeFault
+    from aidev_agent_cli.utils.errors import RuntimeFault
     with pytest.raises(RuntimeFault) as exc:
         await service.start(RunRequest(session_code="nope", input=ChatInput("hi")), _RecordingSink())
     assert exc.value.code == "session.not_found"
@@ -97,6 +97,7 @@ async def test_create_registers_the_session_and_unknown_sessions_are_rejected(ma
 # ============================================================================
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("make_service", STRATEGIES)
 async def test_a_second_run_on_the_same_session_settles_while_the_first_is_live(make_service: Any) -> None:
     service = make_service()
@@ -178,6 +179,7 @@ async def test_close_is_idempotent_and_reports_the_second_call(make_service: Any
     await service.close_all("test")
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("make_service", STRATEGIES)
 async def test_close_all_is_idempotent_and_settles_live_runs(make_service: Any) -> None:
     service = make_service()
@@ -246,8 +248,8 @@ async def test_two_sessions_keep_their_own_agent_code(monkeypatch: pytest.Monkey
     assert second.options.agent_code == "code-b"
 
     # 解析结果跟着**各自的**会话走（同一个解析函数，两条不同的答案）。
-    assert service._snapshot("start", first, RunRequest("s1"), None).session.agent_code == "code-a"
-    assert service._snapshot("start", second, RunRequest("s2"), None).session.agent_code == "code-b"
+    assert service._snapshot("start", first, RunRequest("s1")).agent.agent_code == "code-a"
+    assert service._snapshot("start", second, RunRequest("s2")).agent.agent_code == "code-b"
 
     # 进程环境全程干净：会话不得写它。
     assert "AGENT_TUI_AGENT_CODE" not in os.environ
@@ -261,9 +263,9 @@ async def test_the_session_agent_code_wins_over_the_process_environment(monkeypa
     await service.new_session(SessionOptions( session_code="s1", agent_code="explicit"))
     await service.new_session(SessionOptions( session_code="s2"))
 
-    assert service._snapshot("start", service._sessions.get("s1"), RunRequest("s1"), None).session.agent_code == "explicit"
+    assert service._snapshot("start", service._sessions.get("s1"), RunRequest("s1")).agent.agent_code == "explicit"
     # 没有会话级值时，进程环境仍然有效（兼容用户 export）。
-    assert service._snapshot("start", service._sessions.get("s2"), RunRequest("s2"), None).session.agent_code == "from-env"
+    assert service._snapshot("start", service._sessions.get("s2"), RunRequest("s2")).agent.agent_code == "from-env"
 
 
 
@@ -273,14 +275,17 @@ async def test_the_session_agent_code_wins_over_the_process_environment(monkeypa
 )
 def test_build_runtime_is_the_single_assembly_point(protocol: str, busy_mode: str, resources: str) -> None:
     """入口唯一的组装点：命令行默认值进 ProcessConfig，协议默认值（busy / 资源兜底）只在这一张表里。"""
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.settings import BkAiConfig
+    from aidev_agent_cli.runtime.process_config import ProcessConfig
     from aidev_agent_cli.runtime.service import build_runtime
 
-    given = entry.resolve_resources(resources)
+    given = entry.parse_resources(resources)
 
-    service = build_runtime(protocol, model="m1", session="s1", resources=given, env={})
+    service = build_runtime(protocol, ProcessConfig(bkai=BkAiConfig(), launch=LaunchOptions(model="m1", session="s1", resources=given)))
 
     assert service.defaults.model == "m1"
     assert service.defaults.session == "s1"
     assert service.defaults.resources == given
     assert service._sessions._defaults is service.defaults
-    assert service._scheduler._busy_mode == busy_mode
+    assert service._queue._busy_mode == busy_mode

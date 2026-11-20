@@ -28,13 +28,19 @@ PLATFORM_SOURCES = ("platform", *OVERLAY_SOURCES)
 PRESETS: dict[str, tuple[str, ...]] = {"default": PLATFORM_SOURCES}
 
 
-def parse_resources(names: Iterable[str]) -> tuple[str, ...]:
+def parse_resources(names: str | Iterable[str] | None) -> tuple[str, ...]:
     """展开预设、去重、校验来源名；非法时抛 ValueError（信息可直接给用户看）。
+
+    ``None``（省略 ``--resources``）取 ``default`` 预设；字符串按逗号切分（命令行形态）。
 
     ``names`` 里的每一项要么是一个预设字符串（命中 :data:`PRESETS` 则展开成一组来源名），
     要么是一个普通来源名。展开完成后再去重（保序），然后校验每个名字合法性、底座位置。
     ``platform`` / ``injected`` 都是普通来源名，不是预设。
     """
+    if names is None:
+        names = ("default",)
+    elif isinstance(names, str):
+        names = names.split(",")
     expanded: list[str] = []
     for raw in names:
         item = str(raw).strip()

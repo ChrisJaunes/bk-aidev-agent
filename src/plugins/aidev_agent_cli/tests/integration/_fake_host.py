@@ -57,11 +57,11 @@ class FakeHost:
 
 
 def allow_all(decision: str = "allow") -> HookResponder:
-    """一律返回最宽松裁决（``session_start`` 不注入、``tool_pre=allow``、``tool_post=accept``）。"""
+    """一律返回最宽松裁决（``turn_start`` 不注入、``tool_pre=allow``、``tool_post=accept``）。"""
 
     def _responder(request: dict) -> dict[str, Any]:
         point = (request.get("params") or {}).get("point")
-        if point == "session_start":
+        if point == "turn_start":
             return {"id": request["id"], "ok": True, "result": {"context": ""}}
         if point == "tool_pre":
             return {"id": request["id"], "ok": True, "result": {"decision": decision}}

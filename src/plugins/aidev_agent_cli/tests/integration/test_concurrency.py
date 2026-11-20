@@ -61,6 +61,7 @@ def test_same_session_turns_are_serialised(slow_llm):
     assert slow_llm.max_concurrency == 1
 
 
+@pytest.mark.slow
 def test_different_sessions_run_concurrently(slow_llm):
     harness = Harness()
     _create(harness, slow_llm, "s1", "c1")
@@ -78,6 +79,7 @@ def test_different_sessions_run_concurrently(slow_llm):
     assert slow_llm.max_concurrency >= 2, f"未观测到跨会话并发，耗时 {elapsed:.2f}s"
 
 
+@pytest.mark.slow
 def test_cancel_ends_the_turn_with_cancel_terminal_events(slow_llm):
     harness = Harness()
     _create(harness, slow_llm, "s1", "c1")
@@ -107,6 +109,7 @@ def test_cancel_ends_the_turn_with_cancel_terminal_events(slow_llm):
     assert session.closed is False
 
 
+@pytest.mark.slow
 def test_cancel_without_active_turn_is_noop(slow_llm):
     harness = Harness()
     _create(harness, slow_llm, "s1", "c1")

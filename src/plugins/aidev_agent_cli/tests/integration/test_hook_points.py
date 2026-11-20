@@ -62,7 +62,7 @@ def _create(harness: Harness, llm: FakeLLMServer, *, tools, **extra):
 
 def _run(harness: Harness, llm: FakeLLMServer, hooks_result: dict, *, tools=None):
     _create(harness, llm, tools=tools or [fake_tool])
-    with FakeHost(harness, by_point({"session_start": {"context": ""}, **hooks_result})):
+    with FakeHost(harness, by_point({"turn_start": {"context": ""}, **hooks_result})):
         harness.send("t1", "turn", session_code="s1", input="请执行")
         harness.wait()
     return harness.result("t1")
@@ -75,7 +75,7 @@ def test_tool_pre_deny_skips_body_and_reports_reason(llm):
     harness = Harness()
     _create(harness, llm, tools=[fake_tool])
     with FakeHost(
-        harness, by_point({"session_start": {"context": ""}, "tool_pre": {"decision": "deny", "reason": "危险命令"}})
+        harness, by_point({"turn_start": {"context": ""}, "tool_pre": {"decision": "deny", "reason": "危险命令"}})
     ):
         harness.send("t1", "turn", session_code="s1", input="请执行")
         harness.wait()
@@ -95,7 +95,7 @@ def test_tool_pre_allow_still_triggers_itsm_approval():
     ) as approval_llm:
         harness = Harness()
         _create(harness, approval_llm, tools=[approval_tool])
-        with FakeHost(harness, by_point({"session_start": {"context": ""}, "tool_pre": {"decision": "allow"}})):
+        with FakeHost(harness, by_point({"turn_start": {"context": ""}, "tool_pre": {"decision": "allow"}})):
             harness.send("t1", "turn", session_code="s1", input="请执行")
             harness.wait()
 
@@ -125,7 +125,7 @@ def test_tool_post_block_hides_original_result(llm):
         harness,
         by_point(
             {
-                "session_start": {"context": ""},
+                "turn_start": {"context": ""},
                 "tool_pre": {"decision": "allow"},
                 "tool_post": {"decision": "block", "reason": "结果含敏感信息"},
             }
@@ -148,7 +148,7 @@ def test_tool_post_content_replaces_result(llm):
         harness,
         by_point(
             {
-                "session_start": {"context": ""},
+                "turn_start": {"context": ""},
                 "tool_pre": {"decision": "allow"},
                 "tool_post": {"decision": "content", "content": "改写后的结果"},
             }
@@ -170,7 +170,7 @@ def test_tool_post_context_appears_in_next_model_request(llm):
         harness,
         by_point(
             {
-                "session_start": {"context": ""},
+                "turn_start": {"context": ""},
                 "tool_pre": {"decision": "allow"},
                 "tool_post": {"decision": "context", "context": "追加的背景补充"},
             }
@@ -191,7 +191,7 @@ def test_tool_post_context_appears_in_next_model_request(llm):
 def test_tool_pre_unknown_decision_degrades_and_executes(llm):
     harness = Harness()
     _create(harness, llm, tools=[fake_tool])
-    with FakeHost(harness, by_point({"session_start": {"context": ""}, "tool_pre": {"decision": "whatever"}})):
+    with FakeHost(harness, by_point({"turn_start": {"context": ""}, "tool_pre": {"decision": "whatever"}})):
         harness.send("t1", "turn", session_code="s1", input="请执行")
         harness.wait()
 
@@ -208,14 +208,14 @@ def test_three_points_all_fire_in_one_turn(llm):
     with FakeHost(
         harness,
         by_point(
-            {"session_start": {"context": "C"}, "tool_pre": {"decision": "allow"}, "tool_post": {"decision": "accept"}}
+            {"turn_start": {"context": "C"}, "tool_pre": {"decision": "allow"}, "tool_post": {"decision": "accept"}}
         ),
     ) as host:
         harness.send("t1", "turn", session_code="s1", input="请执行")
         harness.wait()
 
     points = [item["params"]["point"] for item in host.requests]
-    assert points == ["session_start", "tool_pre", "tool_post"]
+    assert points == ["turn_start", "tool_pre", "tool_post"]
     assert [item["id"] for item in host.requests] == ["t1#h1", "t1#h2", "t1#h3"]
     assert harness.result("t1")["status"] == "finished"
 

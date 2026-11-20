@@ -7,7 +7,7 @@ from logging import getLogger
 from typing import Any
 
 from .base import ResourceLoader
-from ..local_config import LocalConfig, LocalDeclarations
+from ..local_config import LocalConfig, BkAiAgentInfo
 
 logger = getLogger(__name__)
 
@@ -15,12 +15,12 @@ logger = getLogger(__name__)
 class LocalAgentConfigLoader(ResourceLoader):
     """per-agent 本地声明的加载器：``agents/${agent_code}.json`` 的全部字段 → 平台 raw dict。
 
-    适配协作者：:class:`LocalDeclarations`——**复用**它读出的
+    适配协作者：:class:`BkAiAgentInfo`——**复用**它读出的
     :class:`LocalConfig`，不重实现 per-agent 两级读取。
 
     命名（261014-urj D3）：原名 ``LocalConfigLoader``，改名 ``LocalAgentConfigLoader``
     以体现它读的是**单个 agent** 的配置（``agents/${code}.json``），与进程级的 TUI 配置
-    （:class:`aidev_agent_cli.config.TuiConfig`）区分。``agent.json`` 这个固定文件名已退役。
+    （:class:`aidev_agent_cli.runtime.settings.BkAiConfig`）区分。``agent.json`` 这个固定文件名已退役。
 
     本加载器拥有 ``agents/${code}.json`` 贡献的一切，因为它就是那个文件的内容：
 
@@ -41,14 +41,14 @@ class LocalAgentConfigLoader(ResourceLoader):
       :class:`KnowledgebaseLoader` 都读同一个 ``${code}.json``，若本加载器也处理
       ``knowledgebases`` 就会**双写**。
     * ``mcp_server_config``：**ENVELOPED 直通**（§6 顶部 E 节）。取
-      :meth:`LocalDeclarations._mcp_servers` 得到 FLAT 映射，与
+      :meth:`BkAiAgentInfo._mcp_servers` 得到 FLAT 映射，与
       ``raw["mcp_server_config"]["mcpServers"]`` 做 :meth:`LocalResourceManager.
       _merge_mcp_add_only`（ADD-only，用户裁决、mw9 定案，**不得回退为 REPLACE
       或普通 dict 覆盖**），包回 ``{"mcpServers": ...}`` 写回。
 
     读取（:meth:`read_config`，**注入缝**）
     --------------------------------------
-    默认经 :meth:`LocalDeclarations.read` 按 per-agent 两级读取。这是 D1 的**正式注入缝**
+    默认经 :meth:`BkAiAgentInfo.read` 按 per-agent 两级读取。这是 D1 的**正式注入缝**
     （代替已删除的构造参数）：``__init__`` 仍只收 ``rm``，测试可
     ``monkeypatch.setattr(type(loader), "read_config", lambda self, code: LocalConfig(...))``
     或对实例打补丁来注入声明，而不新增构造参数。
@@ -74,14 +74,14 @@ class LocalAgentConfigLoader(ResourceLoader):
     def read_config(self, agent_code: str) -> LocalConfig:
         """读取该 ``agent_code`` 的 per-agent 本地声明（注入缝）。
 
-        默认经 :meth:`LocalDeclarations.read` 的两级读取（用户空间 → 项目空间，项目覆盖
+        默认经 :meth:`BkAiAgentInfo.read` 的两级读取（用户空间 → 项目空间，项目覆盖
         用户）。``agent_code`` 为空或含路径穿越字符时返回空 :class:`LocalConfig`（由
-        :meth:`LocalDeclarations.read` 处理）。
+        :meth:`BkAiAgentInfo.read` 处理）。
         """
         if not agent_code:
             return LocalConfig()
 
-        return LocalDeclarations().read(code=agent_code)
+        return BkAiAgentInfo().read(code=agent_code)
 
     def declared_prompt_settings(self, local: LocalConfig) -> dict:
         """本地 ``prompt_setting`` section 的内容（空 section 时为 ``{}``）。
@@ -95,7 +95,7 @@ class LocalAgentConfigLoader(ResourceLoader):
 
     def declared_servers(self, local: LocalConfig) -> dict[str, dict]:
         """``agents/${code}.json`` 的 ``mcp_server_config.mcpServers``（两级已合并）。"""
-        return LocalDeclarations._mcp_servers(local)
+        return BkAiAgentInfo._mcp_servers(local)
 
     def apply(self, raw: dict[str, Any]) -> dict[str, Any]:
         # per-agent 读取（裁决 (b) 后无门控）：raw 自带本次拉取的 agent_code，据此读

@@ -1,7 +1,7 @@
-"""``adapters.agui`` 的 ``Dispatcher`` / ``run_agui`` 路由、并发与关闭测试（主测 ``adapters``）。
+"""``adapters.agui`` 的 ``AguiAdapter`` / ``run_agui`` 路由、并发与关闭测试（主测 ``adapters``）。
 
 注：文件末尾 ``test_eof_shutdown`` / ``test_sigterm_shutdown_exits_within_5s`` 是真子进程
-入口 smoke，断言 ``run_agui`` 的信号/EOF 进程生命周期；它们与 Dispatcher 断言共用替身，
+入口 smoke，断言 ``run_agui`` 的信号/EOF 进程生命周期；它们与 AguiAdapter 断言共用替身，
 按职责分层时保留在本文件，不另起第三个目的地。
 """
 
@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from aidev_agent_cli.adapters import agui as writer_mod
-from aidev_agent_cli.adapters.agui import Dispatcher, FrameWriter
+from aidev_agent_cli.adapters.agui import AguiAdapter, AguiTransport
 from tests.integration._paths import AGENT_ROOT
 
 #: 子进程 cwd 语义沿用迁移前的 ``src/agent``（.env / AGENT_TUI_CWD / ~/.bkai）。
@@ -27,7 +27,7 @@ AGENT_TUI_DIR = str(AGENT_ROOT)
 VENV_PYTHON = sys.executable
 
 
-class _RecordingWriter(FrameWriter):
+class _RecordingWriter(AguiTransport):
     """Captures every frame sent, preserving order."""
 
     def __init__(self) -> None:
@@ -44,52 +44,87 @@ class _RecordingWriter(FrameWriter):
 
 def _service() -> Any:
     """测试用运行时：与入口同一个组装点（``build_runtime("agui")``）。"""
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.process_config import ProcessConfig
+    from aidev_agent_cli.runtime.settings import BkAiConfig
     from aidev_agent_cli.runtime.service import build_runtime
 
-    return build_runtime("agui", resources=("injected",), env={})
+    return build_runtime("agui", ProcessConfig(bkai=BkAiConfig(), launch=LaunchOptions(resources=("injected",))))
 
 
-async def _install_stub(dispatcher: Dispatcher, impl: Any) -> None:
+def _handle(dispatcher: AguiAdapter, run_id: str) -> Any:
+    for bucket in dispatcher._service.run_handles().values():
+        if run_id in bucket:
+            return bucket[run_id]
+    raise KeyError(run_id)
+
+
+def _task(dispatcher: AguiAdapter, run_id: str) -> asyncio.Task[Any]:
+    return _handle(dispatcher, run_id).task
+
+
+def _tasks(dispatcher: AguiAdapter) -> dict[str, asyncio.Task[Any]]:
+    return {
+        run_id: handle.task
+        for bucket in dispatcher._service.run_handles().values()
+        for run_id, handle in bucket.items()
+        if handle.task is not None
+    }
+
+
+async def _install_stub(dispatcher: AguiAdapter, impl: Any) -> None:
     """把两参替身装成**会话 agent**（统一执行路径下唯一的注入缝，见 ``tests/integration/_scripted.py``）。
 
     之后打开的每个会话都用脚本替身；终止事件补齐、sink 线程桥、取消与结果都是生产实现。
     """
-    from aidev_agent_cli.runtime.contracts import RunOutcome, SessionOptions
-    from aidev_agent_cli.runtime.runner import _call_sink
+    from aidev_agent_cli.utils.runs import RunOutcome, SessionOptions
+    from aidev_agent_cli.runtime.runs import _call_sink
     from tests.integration._scripted import _payload
 
-    if await dispatcher.service.session_info("s1") is None:
-        await dispatcher.service.new_session(SessionOptions(session_code="s1"))
+    if await dispatcher._service.session_info("s1") is None:
+        await dispatcher._service.new_session(SessionOptions(session_code="s1"))
 
     class StubRunner:
         async def execute(self, *, handle, snapshot, sink, session, **kwargs):
-            params = {"reqId": snapshot.correlation_id or handle.run_id, "runId": handle.run_id,
-                      "input": snapshot.input.text, "sessionCode": snapshot.session.session_code,
-                      "executeKwargs": snapshot.execute_options}
+            params = {
+                "reqId": snapshot.correlation_id or handle.run_id,
+                "runId": handle.run_id,
+                "input": snapshot.input.text,
+                "sessionCode": snapshot.agent.session_code,
+                "executeKwargs": snapshot.execute_options,
+            }
             async for chunk in impl(params, handle.token.is_cancelled):
                 event = _payload(chunk)
                 if event is not None:
                     await _call_sink(sink, event)
-            return RunOutcome(status="cancelled" if handle.token.cancelled else "finished",
-                              run_id=handle.run_id, session_code=snapshot.session.session_code)
+            return RunOutcome(
+                status="cancelled" if handle.token.cancelled else "finished",
+                run_id=handle.run_id,
+                session_code=snapshot.agent.session_code,
+            )
 
-    dispatcher.service._scheduler._runner = StubRunner()
+    dispatcher._service._queue._execute = StubRunner().execute
 
 
 async def _install_state(dispatcher, state):
-    from aidev_agent_cli.runtime.contracts import SessionOptions
-    if await dispatcher.service.session_info("s1") is None:
-        await dispatcher.service.new_session(SessionOptions(session_code="s1"))
+    from aidev_agent_cli.utils.runs import SessionOptions
+
+    if await dispatcher._service.session_info("s1") is None:
+        await dispatcher._service.new_session(SessionOptions(session_code="s1"))
     if hasattr(state, "set_local_declaration"):
+
         async def set_declaration(code, kind, value):
             state.set_local_declaration(kind, value)
-        dispatcher.service.set_local_declaration = set_declaration
+
+        dispatcher._service.set_local_declaration = set_declaration
     for name in ("describe_agent_config", "list_llms", "describe_config_snapshot"):
         if hasattr(state, name):
             method = getattr(state, name)
+
             async def query(code, _method=method):
                 return _method()
-            setattr(dispatcher.service, name, query)
+
+            setattr(dispatcher._service, name, query)
 
 
 async def _slow_run(params: dict[str, Any], is_cancelled):
@@ -105,7 +140,7 @@ async def _slow_run(params: dict[str, Any], is_cancelled):
 async def test_chat_start_returns_immediately() -> None:
     """D-06: handle() must return before the run completes."""
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, _slow_run)
 
     await dispatcher.handle("session.start", {"input": "hi"}, "req-1")
@@ -119,7 +154,7 @@ async def test_chat_start_returns_immediately() -> None:
     assert run_id.startswith("run-")
 
     # The run task is registered and still pending — handle() did not await it.
-    task = dispatcher.runs[run_id]
+    task = _task(dispatcher, run_id)
     assert not task.done(), "session.start must not block until the run finishes"
 
     # Clean up.
@@ -128,17 +163,17 @@ async def test_chat_start_returns_immediately() -> None:
 
 async def test_cancel_sets_flag_and_cancels() -> None:
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, _slow_run)
 
     await dispatcher.handle("session.start", {"input": "hi"}, "req-1")
     run_id = writer.frames[0]["runId"]
-    task = dispatcher.runs[run_id]
+    task = _task(dispatcher, run_id)
     assert not task.done()
 
     await dispatcher.handle("session.cancel", {"runId": run_id}, "req-2")
 
-    assert run_id in dispatcher.cancelled
+    assert _handle(dispatcher, run_id).token.cancelled
 
     # The cancel result frame is emitted.
     result_frames = [f for f in writer.frames if f["kind"] == "result"]
@@ -156,7 +191,7 @@ async def test_cancel_sets_flag_and_cancels() -> None:
 
 async def test_unknown_method_errors() -> None:
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
 
     await dispatcher.handle("definitely.not.a.method", {}, "req-9")
 
@@ -169,7 +204,7 @@ async def test_unknown_method_errors() -> None:
 
 async def test_cancel_unknown_run_reports_not_cancelled() -> None:
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
 
     await dispatcher.handle("session.cancel", {"runId": "nope"}, "req-3")
 
@@ -180,7 +215,7 @@ async def test_cancel_unknown_run_reports_not_cancelled() -> None:
 async def test_agent_info_returns_the_platform_payload() -> None:
     """agent.info answers with a single `result` frame carrying the raw config."""
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, _slow_run)
 
     class _StubState:
@@ -207,7 +242,7 @@ async def test_agent_info_returns_the_platform_payload() -> None:
 async def test_agent_llms_returns_the_platform_list() -> None:
     """agent.llms answers with a single `result` frame wrapping the model list."""
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, _slow_run)
 
     class _StubState:
@@ -229,7 +264,7 @@ async def test_agent_llms_returns_the_platform_list() -> None:
 async def test_unknown_method_still_errors() -> None:
     """T-02-01: adding the agent.* branch must not open the fallthrough."""
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
 
     await dispatcher.handle("agent.definitely.not.a.method", {}, "req-x")
 
@@ -260,7 +295,7 @@ async def test_chat_start_forwards_execute_kwargs_to_the_runner() -> None:
         seen.append(params)
         yield json.dumps({"type": "RUN_FINISHED"})
 
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, recording_run)
 
     await dispatcher.handle(
@@ -270,7 +305,7 @@ async def test_chat_start_forwards_execute_kwargs_to_the_runner() -> None:
     )
 
     run_id = writer.frames[0]["runId"]
-    task = dispatcher.runs[run_id]
+    task = _task(dispatcher, run_id)
     await asyncio.wait_for(task, timeout=3)
 
     assert len(seen) == 1, "the run impl was not reached"
@@ -290,13 +325,13 @@ async def test_chat_start_without_execute_kwargs_passes_none() -> None:
         seen.append(params)
         yield json.dumps({"type": "RUN_FINISHED"})
 
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, recording_run)
 
     await dispatcher.handle("session.start", {"sessionCode": "s1", "input": "hi"}, "req-1")
 
     run_id = writer.frames[0]["runId"]
-    await asyncio.wait_for(dispatcher.runs[run_id], timeout=3)
+    await asyncio.wait_for(_task(dispatcher, run_id), timeout=3)
 
     assert seen[0]["executeKwargs"] == {}
 
@@ -310,7 +345,7 @@ async def test_files_index_method_is_gone_and_does_not_fall_through() -> None:
     ``files.<anything>`` still takes the UNKNOWN_METHOD path.
     """
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
 
     await dispatcher.handle("files.definitely.not.a.method", {}, "req-f3")
 
@@ -402,14 +437,14 @@ async def test_agent_info_carries_the_local_file_rows_on_the_resources_key(monke
     """
     from aidev_agent_cli.resources.manager import LocalResourceManager
     from aidev_agent_cli.resources.sources import PLATFORM_SOURCES
-    from aidev_agent_cli.runtime.sdk.session import SDKSession as Session
+    from tests._sdk import make_run as Session
 
     (tmp_path / "src").mkdir()
     (tmp_path / "README.md").write_text("x")
     monkeypatch.chdir(tmp_path)
 
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, _slow_run)
 
     state = Session(resources=PLATFORM_SOURCES)
@@ -445,10 +480,10 @@ class TestAuthDispatch:
     async def test_login_sets_the_token_and_replies_without_echoing_it(self) -> None:
         """The reply is `{ok, hasToken}` — never the token itself (T-03-07)."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("auth.login", {"token": "SECRET-TOK"}, "req-1")
 
@@ -468,7 +503,7 @@ class TestAuthDispatch:
     async def test_no_frame_ever_carries_the_token_across_a_full_flow(self) -> None:
         """Whole-flow leak check: login, logout, config.info — no frame holds it."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         await _install_state(dispatcher, _AuthStubState())
 
         await dispatcher.handle("auth.login", {"token": "SECRET-TOK"}, "req-1")
@@ -481,10 +516,10 @@ class TestAuthDispatch:
     async def test_login_without_a_token_is_tolerated_not_an_error(self) -> None:
         """A missing `token` param yields `{ok: False}`, not an error frame."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("auth.login", {}, "req-1")
 
@@ -496,10 +531,10 @@ class TestAuthDispatch:
     async def test_empty_token_is_a_noop_and_does_not_clear_an_existing_token(self) -> None:
         """UI-SPEC §规划注意事项 #5: an empty submit must NOT drop a valid token."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("auth.login", {"token": "tok"}, "req-1")
         await dispatcher.handle("auth.login", {"token": ""}, "req-2")
@@ -511,10 +546,10 @@ class TestAuthDispatch:
     async def test_logout_clears_the_token(self) -> None:
         """D-13: logout drops the token and returns to pure app state."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("auth.login", {"token": "tok"}, "req-1")
         await dispatcher.handle("auth.logout", {}, "req-2")
@@ -526,10 +561,10 @@ class TestAuthDispatch:
     async def test_logout_does_not_clear_the_config_snapshot(self) -> None:
         """D-13 scopes logout to the TOKEN — the bound config is not the token's."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("auth.login", {"token": "tok"}, "req-1")
         await dispatcher.handle("auth.logout", {}, "req-2")
@@ -546,10 +581,10 @@ class TestConfigDispatch:
 
     async def test_config_info_returns_the_snapshot(self) -> None:
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("config.info", {}, "req-1")
 
@@ -568,10 +603,10 @@ class TestConfigDispatch:
         still reach two different state methods.
         """
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("config.info", {}, "req-1")
         await dispatcher.handle("agent.info", {}, "req-2")
@@ -582,10 +617,10 @@ class TestConfigDispatch:
     async def test_config_set_writes_the_declaration_and_echoes_it_back(self) -> None:
         """D-08: the switch writes the local declaration via set_local_declaration."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("config.set", {"kind": "models", "value": "gpt-4"}, "req-1")
 
@@ -595,10 +630,10 @@ class TestConfigDispatch:
     async def test_config_set_rejects_an_unknown_kind_without_writing(self) -> None:
         """An unknown kind answers `{ok: False}` and must not touch the file."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("config.set", {"kind": "bogus", "value": "x"}, "req-1")
 
@@ -608,10 +643,10 @@ class TestConfigDispatch:
 
     async def test_config_set_rejects_a_missing_value_without_writing(self) -> None:
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
         stub = _AuthStubState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("config.set", {"kind": "agents"}, "req-1")
 
@@ -622,10 +657,10 @@ class TestConfigDispatch:
         """All four families route through the SAME method — `kind` is the discriminant."""
         for kind in ("models", "agents", "mcps", "knowledge"):
             writer = _RecordingWriter()
-            dispatcher = Dispatcher(writer, _service())
+            dispatcher = AguiAdapter(_service(), writer)
             stub = _AuthStubState()
             await _install_state(dispatcher, stub)
-            dispatcher.service._auth = stub  # type: ignore[assignment]
+            dispatcher._service._auth = stub  # type: ignore[assignment]
 
             await dispatcher.handle("config.set", {"kind": kind, "value": "v"}, "req-1")
 
@@ -638,7 +673,7 @@ class TestConfigDispatch:
         labelled `local`: the lie D-08's observable-switch requirement forbids.
         """
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
 
         class _InvalidatingState(_AuthStubState):
             """Mirrors Session: set_local_declaration drops the cached snapshot."""
@@ -661,7 +696,7 @@ class TestConfigDispatch:
 
         stub = _InvalidatingState()
         await _install_state(dispatcher, stub)
-        dispatcher.service._auth = stub  # type: ignore[assignment]
+        dispatcher._service._auth = stub  # type: ignore[assignment]
 
         await dispatcher.handle("config.info", {}, "req-1")
         await dispatcher.handle("config.set", {"kind": "models", "value": "gpt-4"}, "req-2")
@@ -672,7 +707,7 @@ class TestConfigDispatch:
     async def test_config_methods_do_not_fall_through_to_unknown_method(self) -> None:
         """T-02-01: the new branches must not widen the allowlist."""
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
 
         await dispatcher.handle("config.definitely.not.a.method", {}, "req-x")
 
@@ -681,7 +716,7 @@ class TestConfigDispatch:
 
     async def test_auth_methods_do_not_fall_through_to_unknown_method(self) -> None:
         writer = _RecordingWriter()
-        dispatcher = Dispatcher(writer, _service())
+        dispatcher = AguiAdapter(_service(), writer)
 
         await dispatcher.handle("auth.definitely.not.a.method", {}, "req-x")
 
@@ -712,47 +747,18 @@ async def test_ready_frame_advertises_the_auth_and_config_capabilities() -> None
     assert "auth" in advertised and "config" in advertised
 
 
-async def test_ready_frame_reports_the_resolved_sdk_path_when_supplied() -> None:
-    """Phase 5 D-10: which aidev_agent tree is patched must be observable, not inferred.
-
-    PITFALLS.md Pitfall 6: this environment resolves one of several `aidev_agent`
-    trees through the installed `.pth`, so "we patched a different tree than you
-    think" is a real failure mode. The handshake is where it becomes visible.
-
-    Two things are pinned here, and the SECOND is the one that protects the wire:
-    the field is present when supplied, and it is ABSENT when not — so an older
-    caller's frame is byte-for-byte what it was and `test_ready_frame_advertises_*`
-    above keeps passing unchanged.
-    """
-    pinned = "/tmp/fake/aidev_agent/__init__.py"
-
-    writer = _RecordingWriter()
-    assert await writer.send_ready_frame(sdk_file=pinned)
-    frame = writer.frames[-1]
-
-    assert frame["sdk_file"] == pinned
-    # Still a sibling key, NOT a capability: `capabilities` is the fixed D-09 method set.
-    assert "sdk_file" not in frame["capabilities"]
-    assert frame["capabilities"] == writer_mod.DEFAULT_CAPABILITIES
-
-    # ADDITIVE degradation: omitting the argument leaves the frame exactly as before.
-    assert await writer.send_ready_frame()
-    assert "sdk_file" not in writer.frames[-1]
-
-
 async def test_parse_error_does_not_crash_loop() -> None:
     """A malformed line yields an error frame; a following valid frame works."""
-    from aidev_agent_cli.adapters.agui import _process_line
 
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
 
-    await _process_line("not json", dispatcher)
+    await dispatcher.process_line("not json")
     assert writer.frames[0]["kind"] == "error"
     assert writer.frames[0]["error"]["code"] == "PARSE_ERROR"
 
     # The loop is still alive: a valid frame after the bad one is processed.
-    await _process_line(json.dumps({"v": 1, "id": "r1", "method": "session.list", "params": {}}), dispatcher)
+    await dispatcher.process_line(json.dumps({"v": 1, "id": "r1", "method": "session.list", "params": {}}))
     assert writer.frames[1]["kind"] == "result"
     assert writer.frames[1]["id"] == "r1"
 
@@ -767,11 +773,10 @@ async def test_a_raising_handler_does_not_crash_loop() -> None:
     ``except Exception: break`` — killing the worker for the rest of the session
     (every following interaction, e.g. a plain ``hello``, went unanswered).
 
-    Driven through the REAL ``_process_line`` so the production path is pinned:
+    Driven through the REAL ``process_line`` so the production path is pinned:
     a handler exception must become ONE correlated error frame, and the next
     frame must still be handled.
     """
-    from aidev_agent_cli.adapters.agui import _process_line
 
     class _RaisingState:
         """Mirrors the production failure: the per-agent write raises."""
@@ -783,13 +788,12 @@ async def test_a_raising_handler_does_not_crash_loop() -> None:
             return {"currentModel": "m"}
 
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_state(dispatcher, _RaisingState())
 
-    # The bad request: it must NOT raise out of _process_line.
-    await _process_line(
+    # The bad request: it must NOT raise out of process_line.
+    await dispatcher.process_line(
         json.dumps({"v": 1, "id": "bad-1", "method": "config.set", "params": {"kind": "models", "value": "gpt-4"}}),
-        dispatcher,
     )
 
     assert writer.frames[0]["kind"] == "error"
@@ -798,9 +802,8 @@ async def test_a_raising_handler_does_not_crash_loop() -> None:
     assert "agent_code" in writer.frames[0]["error"]["message"]
 
     # The loop is still alive: a following valid frame is still processed.
-    await _process_line(
+    await dispatcher.process_line(
         json.dumps({"v": 1, "id": "after-1", "method": "config.info", "params": {}}),
-        dispatcher,
     )
     assert writer.frames[1]["kind"] == "result"
     assert writer.frames[1]["id"] == "after-1"
@@ -810,7 +813,7 @@ async def test_process_shutdown_invokes_callback_and_result() -> None:
     writer = _RecordingWriter()
     called = asyncio.Event()
 
-    dispatcher = Dispatcher(writer, _service(), shutdown_cb=called.set)
+    dispatcher = AguiAdapter(_service(), writer, shutdown_cb=called.set)
     await dispatcher.handle("process.shutdown", {}, "r1")
 
     assert writer.frames[0]["kind"] == "result"
@@ -821,22 +824,22 @@ async def test_process_shutdown_invokes_callback_and_result() -> None:
 async def test_shutdown_cancels_all_runs() -> None:
     """D-04: shutdown cancels every outstanding run, then closes the writer."""
     writer = _RecordingWriter()
-    dispatcher = Dispatcher(writer, _service())
+    dispatcher = AguiAdapter(_service(), writer)
     await _install_stub(dispatcher, _slow_run)
 
     await dispatcher.handle("session.start", {"input": "a"}, "r1")
-    from aidev_agent_cli.runtime.contracts import SessionOptions
+    from aidev_agent_cli.utils.runs import SessionOptions
 
-    await dispatcher.service.new_session(SessionOptions(session_code="s2"))
+    await dispatcher._service.new_session(SessionOptions(session_code="s2"))
     await dispatcher.handle("session.start", {"sessionCode": "s2", "input": "b"}, "r2")
-    assert len(dispatcher.runs) == 2
+    assert len(_tasks(dispatcher)) == 2
 
     await dispatcher.shutdown()
 
     assert writer.closed is True
-    assert len(dispatcher.runs) == 2
-    assert all(task.done() for task in dispatcher.runs.values())
-    assert not any(dispatcher.service.has_live_runs(code) for code in dispatcher.service.run_handles())
+    assert len(_tasks(dispatcher)) == 2
+    assert all(task.done() for task in _tasks(dispatcher).values())
+    assert not any(dispatcher._service.has_live_runs(code) for code in dispatcher._service.run_handles())
 
 
 @pytest.mark.slow
@@ -918,7 +921,7 @@ def test_sigterm_shutdown_exits_within_5s(tmp_path) -> None:
     probe = """
 import asyncio
 import time
-from aidev_agent_cli.infrastructure import stdio as _stdio
+from aidev_agent_cli.utils import stdio as _stdio
 _stdio.install_stdout_guard()
 from aidev_agent_cli.adapters import agui as runtime
 from aidev_agent_cli.runtime.session import Session
@@ -928,10 +931,15 @@ def slow_build(*args, **kwargs):
 
 Session.build_agent = slow_build
 Session.ensure_platform_session = lambda *args, **kwargs: None
-from aidev_agent_cli.infrastructure.startup import install_startup_hooks
-install_startup_hooks()
+from aidev_agent_cli.bootstrap.startup import install_startup_hooks
+from aidev_agent_cli.runtime.settings import BkAiConfig
+from aidev_agent_cli.utils.runs import LaunchOptions
+from aidev_agent_cli.runtime.process_config import ProcessConfig
+bkai = BkAiConfig.read()
+install_startup_hooks(bkai.env)
 from aidev_agent_cli.runtime.service import build_runtime
-asyncio.run(runtime.run_agui(build_runtime("agui", resources=("injected",))))
+from aidev_agent_cli.adapters.streams import ProtocolChannel
+asyncio.run(runtime.run_agui(build_runtime("agui", ProcessConfig(bkai=bkai, launch=LaunchOptions(resources=("injected",)))), ProtocolChannel.stdio()))
 """
     proc = subprocess.Popen(
         [VENV_PYTHON, "-u", "-c", probe],
@@ -995,7 +1003,7 @@ async def test_shutdown_closes_writer_when_service_close_fails() -> None:
 
     writer = _RecordingWriter()
     service = SimpleNamespace(close_all=AsyncMock(side_effect=RuntimeError("close failed")))
-    dispatcher = Dispatcher(writer, service)
+    dispatcher = AguiAdapter(service, writer)
     with pytest.raises(RuntimeError, match="close failed"):
         await dispatcher.shutdown()
     assert writer.closed
@@ -1012,14 +1020,10 @@ async def test_run_agui_cleanup_and_exit_reasons(monkeypatch: Any) -> None:
     for mode in ("eof", "read_error", "crash", "signal", "rpc"):
         log = Mock()
         monkeypatch.setattr(agui, "logger", log)
-        writer = _RecordingWriter()
-        writer.start = AsyncMock()
-        writer.stopped = asyncio.Event()
         service = SimpleNamespace(close_all=AsyncMock())
         signal_event = asyncio.Event()
         monkeypatch.setattr(agui, "async_shutdown_event", lambda: signal_event)
         monkeypatch.setattr(agui, "use_daemon_default_executor", lambda *_: None)
-        monkeypatch.setattr(agui, "FrameWriter", lambda *_: writer)
 
         async def read() -> bytes | None:
             if mode == "read_error":
@@ -1033,10 +1037,16 @@ async def test_run_agui_cleanup_and_exit_reasons(monkeypatch: Any) -> None:
                 return b'{"id":"shutdown","method":"process.shutdown"}\n'
             return None
 
-        reader = SimpleNamespace(receive=read, close=Mock())
-        monkeypatch.setattr(agui, "LineReader", lambda *args, **kwargs: reader)
-        assert await agui.run_agui(service) == 0
-        assert writer.closed
+        channel = SimpleNamespace(
+            receive=read,
+            send=AsyncMock(return_value=True),
+            close=AsyncMock(),
+            stopped=asyncio.Event(),
+            peer_gone=False,
+            failure=None,
+        )
+        assert await agui.run_agui(service, channel) == 0
+        channel.close.assert_awaited_once()
         service.close_all.assert_awaited_once()
         assert not any(task.get_name() == "agui-shutdown" for task in asyncio.all_tasks())
         expected = {
@@ -1054,8 +1064,9 @@ async def test_cancel_inactive_result_has_same_payload(monkeypatch: Any) -> None
     from unittest.mock import AsyncMock
 
     writer = _RecordingWriter()
-    service = SimpleNamespace(cancel=AsyncMock(return_value=SimpleNamespace(cancelled=False)))
-    dispatcher = Dispatcher(writer, service)
-    monkeypatch.setattr(dispatcher, "_session_of", lambda _: "session")
+    service = SimpleNamespace(
+        cancel=AsyncMock(return_value=SimpleNamespace(cancelled=False)), session_of_run=lambda _: "session"
+    )
+    dispatcher = AguiAdapter(service, writer)
     await dispatcher.handle("session.cancel", {"runId": "run"}, "req")
     assert writer.frames[0]["payload"] == {"runId": "run", "cancelled": False, "reason": "no active run"}

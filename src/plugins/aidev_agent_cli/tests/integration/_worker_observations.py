@@ -61,7 +61,7 @@ def probe_tool_factory():
     from langchain_core.tools import tool
 
     from aidev_agent_cli.resources.manager import LocalResourceManager
-    from aidev_agent_cli.runtime.sdk.session import SDKSession
+    from aidev_agent_cli.sdk.executor import AgentRun as SDKSession
 
     observations = WorkerRecords("RUNTIME_TEST_PLATFORM")
     for name in ("get_client", "create_tool_approval"):

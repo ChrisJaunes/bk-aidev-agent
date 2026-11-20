@@ -14,6 +14,7 @@ token 契约作废**（不恢复旧入口、不做 shim），ACP 必须用 ``--p
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from collections.abc import Iterator
@@ -22,8 +23,9 @@ from pathlib import Path
 import pytest
 
 from aidev_agent_cli import __main__ as entry
-from aidev_agent_cli.infrastructure import startup
-from aidev_agent_cli.infrastructure.settings import TuiConfig
+from aidev_agent_cli.bootstrap import startup
+from aidev_agent_cli.runtime.settings import BkAiConfig
+from aidev_agent_cli.resources.sources import parse_resources
 from tests.integration._paths import AGENT_ROOT, PLUGIN_ROOT, PYTHON
 
 
@@ -35,16 +37,17 @@ def _isolated_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
     yield
 
 
-def _env(config_file: str, log_file: str, **extra: str) -> dict[str, str]:
+def _env(config_file: str, log_file: str, access_token: str = "", **extra: str) -> dict[str, str]:
     env = dict(os.environ)
     env["MESSAGE_HANDLER_TYPE"] = "inmemory"
     env.pop("RABBITMQ_HOST", None)
     env.pop("REDIS_URL", None)
     env["PYTHONPATH"] = os.pathsep.join([str(PLUGIN_ROOT), str(AGENT_ROOT), env.get("PYTHONPATH", "")])
-    env.pop("BKAI_TUI_ACCESS_TOKEN", None)
     # 配置与日志都重定向到 tmp：**不依赖开发机 ~/.bkai 里是否留着 token**，
     # 否则「缺 token」的用例会因为本机登录态而变成「握手成功」。
-    env[TuiConfig.CONFIG_FILE_OVERRIDE] = config_file
+    env[BkAiConfig.CONFIG_FILE_OVERRIDE] = config_file
+    if access_token:
+        Path(config_file).write_text(json.dumps({"auth": {"access_token": access_token}}), encoding="utf-8")
     env["BKAI_TUI_LOG_PATH"] = log_file
     env.pop("AGENT_TUI_CWD", None)
     env.update(extra)
@@ -118,7 +121,7 @@ def test_the_default_is_the_default_preset() -> None:
     assert parsed.resources is None
     assert parsed.model == ""
     assert parsed.session == ""
-    assert entry.resolve_resources(parsed.resources) == PLATFORM_SOURCES
+    assert parse_resources(parsed.resources) == PLATFORM_SOURCES
 
 
 def test_short_and_long_options_are_equivalent() -> None:
@@ -139,18 +142,18 @@ def test_omitting_resources_equals_writing_the_default_preset(protocol: str) -> 
     omitted = entry._parser().parse_args(["--protocol", protocol])
     written = entry._parser().parse_args(["--protocol", protocol, "--resources", "default"])
 
-    assert entry.resolve_resources(omitted.resources) == entry.resolve_resources(written.resources)
+    assert parse_resources(omitted.resources) == parse_resources(written.resources)
 
 
 def test_tui_and_agui_have_the_same_default_resources() -> None:
-    assert entry.resolve_resources(None) == entry.resolve_resources(None)
+    assert parse_resources(None) == parse_resources(None)
 
 
 def test_preset_expands_and_dedups() -> None:
     """default 预设展开成完整链；重复来源在展开后去重，不会二次加载。"""
-    from aidev_agent_cli.resources.sources import PLATFORM_SOURCES, parse_resources
+    from aidev_agent_cli.resources.sources import PLATFORM_SOURCES
 
-    assert entry.resolve_resources(None) == PLATFORM_SOURCES
+    assert parse_resources(None) == PLATFORM_SOURCES
     assert parse_resources(("default",)) == PLATFORM_SOURCES
     assert parse_resources(("default", "platform")) == PLATFORM_SOURCES
     assert parse_resources(("default", "mcp")) == PLATFORM_SOURCES
@@ -158,14 +161,14 @@ def test_preset_expands_and_dedups() -> None:
 
 
 def test_explicit_resources_stack_in_the_given_order() -> None:
-    assert entry.resolve_resources("injected,local,mcp,runtime") == ("injected", "local", "mcp", "runtime")
-    assert entry.resolve_resources("platform,mcp") == ("platform", "mcp")
+    assert parse_resources("injected,local,mcp,runtime") == ("injected", "local", "mcp", "runtime")
+    assert parse_resources("platform,mcp") == ("platform", "mcp")
 
 
 @pytest.mark.parametrize("bad", ["foo", "", "platform,injected", "local,platform"])
 def test_invalid_resources_are_rejected(bad: str) -> None:
     with pytest.raises(ValueError):
-        entry.resolve_resources(bad)
+        parse_resources(bad)
 
 
 @pytest.mark.slow
@@ -199,28 +202,18 @@ def test_an_invalid_resource_fails_before_the_protocol_starts() -> None:
 # ============================================================================
 
 
-@pytest.mark.slow
-def test_missing_token_fails_before_binding_the_connection() -> None:
-    """缺 token 必须**在任何 ACP 连接之前**失败：非零退出、stdout 无半帧。"""
-    result = _run(
-        ["-m", "aidev_agent_cli", "--protocol", "acp", "--resources", "platform"],
-        config_file=os.environ["ACP_TEST_CONFIG_FILE"],
-        log_file=os.environ["ACP_TEST_LOG_FILE"],
-    )
-
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "BKAI_TUI_ACCESS_TOKEN" in result.stderr
-
-
 def test_the_missing_extra_message_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     """未安装 ``acp`` extra 时的文案必须是「请安装 aidev-agent-cli[acp]」，不是 ImportError 栈。
 
-    可选 extra 的装载点是 ``entry._load_optional_acp_adapters``（经
-    ``importlib.import_module``）：这里把它的结果置空，等价于"探测发现 acp 缺失"，
+    可选 extra 的装载点是 ``entry.resolve_adapter``（经
+    ``importlib.import_module``）：这里让它抛 acp 缺失的 ImportError，等价于"未装 extra"，
     比卸包干净，也不依赖 ``sys.modules`` 的负缓存形态。
     """
-    monkeypatch.setattr(entry, "_ACP_ADAPTERS", None)
+
+    def missing(name: str):
+        raise ImportError(f"No module named '{name}'", name="acp")
+
+    monkeypatch.setattr(entry.importlib, "import_module", missing)
 
     assert entry.main(["--protocol", "acp", "--resources", "platform"]) == 2
 
@@ -288,20 +281,19 @@ def test_the_acp_branch_installs_the_guard_before_importing_the_adapter() -> Non
     """D4 的顺序不可颠倒：先 guard（保护导入窗口），再导入在顶层拉 SDK 的 adapters.acp。"""
     import inspect
 
-    hooks = inspect.getsource(startup.install_startup_hooks)
+    hooks = inspect.getsource(startup._install)
     hooks_at = hooks.index("install_stdout_guard()")
     assert "protocol_out" not in hooks[:hooks_at]
 
     main = inspect.getsource(entry.main)
-    hooks_at = main.index("install_startup_hooks()")
-    # adapter 经 ``_import_adapter`` 解析，且它只在启动钩子之后才被调用。
+    hooks_at = main.index("install_startup_hooks(bkai.env)")
+    # adapter 经 ``resolve_adapter`` 解析，且它只在启动钩子之后才被调用。
     assert "adapters." not in main
-    assert hooks_at < main.index("_import_adapter(protocol)")
+    assert hooks_at < main.index("resolve_adapter(protocol)")
     # ``agui`` 在入口模块顶层（无导入期副作用）；acp 是可选 extra，只在装载点里出现。
     assert "from .adapters.agui import run_agui" in inspect.getsource(entry)
-    importer = inspect.getsource(entry._load_optional_acp_adapters)
-    for adapter in ("aidev_agent_cli.adapters.acp_dsh", "aidev_agent_cli.adapters.acp"):
-        assert adapter in importer
+    importer = inspect.getsource(entry.resolve_adapter)
+    assert "aidev_agent_cli.adapters.acp" in importer
 
 
 # ============================================================================
@@ -339,7 +331,7 @@ def test_acp_entry_answers_initialize_with_protocol_version_one_and_no_ready_fra
         _initialize_line(),
         config_file=os.environ["ACP_TEST_CONFIG_FILE"],
         log_file=os.environ["ACP_TEST_LOG_FILE"],
-        BKAI_TUI_ACCESS_TOKEN="dummy-token",
+        access_token="dummy-token",
     )
 
     assert result.returncode == 0, result.stderr[-2000:]
@@ -359,7 +351,7 @@ def test_protocol_output_never_mixes_with_diagnostics() -> None:
         _initialize_line(),
         config_file=os.environ["ACP_TEST_CONFIG_FILE"],
         log_file=os.environ["ACP_TEST_LOG_FILE"],
-        BKAI_TUI_ACCESS_TOKEN="dummy-token",
+        access_token="dummy-token",
     )
 
     for line in result.stdout.splitlines():
@@ -385,7 +377,7 @@ def test_initialize_response_can_be_written_to_a_regular_file(tmp_path: Path, pr
             env=_env(
                 os.environ["ACP_TEST_CONFIG_FILE"],
                 os.environ["ACP_TEST_LOG_FILE"],
-                BKAI_TUI_ACCESS_TOKEN="dummy-token",
+                access_token="dummy-token",
             ),
         )
 

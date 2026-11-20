@@ -30,7 +30,7 @@ CHILD_SCRIPT = textwrap.dedent(
 
     from tests.integration._worker_observations import WorkerRecords
     from aidev_agent_cli.resources import manager as rm_module
-    from tests.integration._driver import Dispatcher
+    from tests.integration._driver import AguiAdapter
     from tests.integration._driver import Request
 
     calls = {"get_client": 0}
@@ -44,7 +44,7 @@ CHILD_SCRIPT = textwrap.dedent(
 
     base_url, model, secret = sys.argv[1], sys.argv[2], sys.argv[3]
     out = io.StringIO()
-    dispatcher = Dispatcher(stream=out)
+    dispatcher = AguiAdapter(stream=out)
     dispatcher.handle_request(
         Request(
             id="c1",

@@ -53,8 +53,8 @@ aidev-agent = { path = "../../agent", editable = true }
 
 [dependency-groups]
 dev = [
-    # checkpoint / 追踪 / ACP 是跑通全部用例的前置：checkpoint 相关用例（tests/infrastructure、
-    # tests/runtime）需要 sqlite saver，install_otel 的测试（tests/infrastructure）需要 SDK 的
+    # checkpoint / 追踪 / ACP 是跑通全部用例的前置：checkpoint 相关用例（
+    # tests/runtime）需要 sqlite saver，install_otel 的测试（tests/runtime）需要 SDK 的
     # OTel 实现，ACP 相关用例（tests/adapters、tests/integration）需要真实的 agent-client-protocol。
     # 直接复用同一组 extras，避免两份清单漂移。
     "aidev-agent-cli[checkpoint,opentelemetry,acp]",
@@ -101,7 +101,7 @@ relative-imports-order = "closest-to-furthest"
 timeout = 60
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
-addopts = "-vvv --maxfail=2 -s"
+addopts = "-vvv --maxfail=2 -s -m \"not slow\""
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

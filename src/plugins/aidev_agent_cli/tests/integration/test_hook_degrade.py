@@ -7,9 +7,8 @@ import time
 
 import pytest
 
-from aidev_agent_cli.infrastructure.errors import HOOK_VALUE_INVALID
-from aidev_agent_cli.runtime.errors import RuntimeFault
-from aidev_agent_cli.runtime.sdk.hooks import DEFAULT_TIMEOUT_MS, HookConfig
+from aidev_agent_cli.utils.errors import HOOK_VALUE_INVALID, HeadlessError
+from aidev_agent_cli.sdk.hooks import DEFAULT_TIMEOUT_MS, HookConfig
 from tests.integration._fake_host import FakeHost, allow_all, silent
 from tests.integration._fake_llm import FakeLLMServer
 from tests.integration._harness import Harness
@@ -46,7 +45,7 @@ def _degraded_events(harness: Harness, request_id: str) -> list[dict]:
 def test_hook_config_defaults():
     config = HookConfig.parse(None)
     assert config.timeout_ms == DEFAULT_TIMEOUT_MS == 10000
-    assert config.points() == frozenset({"session_start", "tool_pre", "tool_post"})
+    assert config.points() == frozenset({"turn_start", "tool_pre", "tool_post"})
 
 
 def test_hook_config_subset_and_clamp():
@@ -70,7 +69,7 @@ def test_hook_config_subset_and_clamp():
     ],
 )
 def test_hook_config_invalid_values(raw):
-    with pytest.raises(RuntimeFault) as excinfo:
+    with pytest.raises(HeadlessError) as excinfo:
         HookConfig.parse(raw)
     assert excinfo.value.code == HOOK_VALUE_INVALID
 
@@ -106,7 +105,7 @@ def test_timeout_degrades_once_and_turn_finishes(llm):
     assert harness.result("t1")["status"] == "finished"
     degraded = _degraded_events(harness, "t1")
     assert len(degraded) == 1, degraded
-    assert degraded[0]["value"] == {"point": "session_start", "reason": "timeout"}
+    assert degraded[0]["value"] == {"point": "turn_start", "reason": "timeout"}
     assert elapsed < 5, "降级不得引入可观延迟"
 
 
@@ -140,7 +139,7 @@ def test_invalid_result_shape_degrades_and_turn_finishes(llm):
     assert [event["value"]["reason"] for event in _degraded_events(harness, "t1")] == ["invalid_shape"]
 
 
-def test_session_start_context_must_be_string(llm):
+def test_turn_start_context_must_be_string(llm):
     harness = Harness()
     _create(harness, llm, hooks={"timeout_ms": 2000})
 
@@ -200,5 +199,5 @@ def test_disabled_point_is_not_requested(llm):
         harness.send("t1", "turn", session_code="s1", input="你好")
         harness.wait()
 
-    assert host.hook_requests() == [], "未启用的 session_start 不得产生请求行"
+    assert host.hook_requests() == [], "未启用的 turn_start 不得产生请求行"
     assert harness.result("t1")["status"] == "finished"

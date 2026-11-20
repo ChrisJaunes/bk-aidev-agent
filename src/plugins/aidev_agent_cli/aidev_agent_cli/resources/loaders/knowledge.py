@@ -7,7 +7,7 @@ from logging import getLogger
 from typing import Any
 
 from .base import ResourceLoader
-from ..local_config import LocalConfig, LocalDeclarations
+from ..local_config import LocalConfig, BkAiAgentInfo
 
 logger = getLogger(__name__)
 
@@ -16,7 +16,7 @@ class KnowledgebaseLoader(ResourceLoader):
     """知识库的加载器：per-agent 声明增量追加到
     ``raw["knowledgebase_settings"]["knowledgebases"]``。
 
-    适配协作者：:class:`LocalDeclarations`（**per-agent**，``agents/${code}.json``）。
+    适配协作者：:class:`BkAiAgentInfo`（**per-agent**，``agents/${code}.json``）。
     只追加平台尚无的名称、保持平台顺序在前——这是「本地资源叠加在 agent 配置之上」的
     读法，也是重构前的逐字语义。
 
@@ -48,7 +48,7 @@ class KnowledgebaseLoader(ResourceLoader):
         if not agent_code:
             return LocalConfig()
 
-        return LocalDeclarations().read(code=agent_code)
+        return BkAiAgentInfo().read(code=agent_code)
 
     def declared_knowledgebases(self, agent_code: str) -> list[str]:
         """per-agent ``knowledgebase_settings.knowledgebases`` 名称列表。"""

@@ -7,7 +7,7 @@ from aidev_agent.enums import AgentBuildType
 from aidev_agent.services.agent.factory import AgentInstanceFactory, DefaultAgentFactory, agent_factory
 from langgraph.checkpoint.memory import MemorySaver
 
-from aidev_agent_cli.runtime.sdk.session import SDKSession
+from tests._sdk import make_run as SDKSession
 from tests.integration._fake_llm import FakeLLMServer
 from tests.integration._harness import EventSink, Harness
 from tests.integration._worker_observations import WorkerRecords

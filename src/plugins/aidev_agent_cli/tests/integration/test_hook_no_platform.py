@@ -24,7 +24,7 @@ CHILD_SCRIPT = textwrap.dedent(
     from tests.integration._worker_observations import WorkerRecords
 
     from aidev_agent_cli.resources import manager as rm_module
-    from tests.integration._driver import Dispatcher
+    from tests.integration._driver import AguiAdapter
     from tests.integration._driver import Request
 
     calls = {"get_client": 0, "create_tool_approval": 0}
@@ -46,10 +46,10 @@ CHILD_SCRIPT = textwrap.dedent(
 
     base_url, model, secret = sys.argv[1], sys.argv[2], sys.argv[3]
     out = io.StringIO()
-    dispatcher = Dispatcher(stream=out)
+    dispatcher = AguiAdapter(stream=out)
 
     HOST_RESULTS = {
-        "session_start": {"context": "宿主上下文-{}".format(secret[:4])},
+        "turn_start": {"context": "宿主上下文-{}".format(secret[:4])},
         "tool_pre": {"decision": "ask", "reason": "需要人工确认"},
         "tool_post": {"decision": "accept"},
     }

@@ -4,13 +4,11 @@ import os
 
 import pytest
 
-from aidev_agent_cli.runtime.worker import ProcessWorker, WorkerSpec
+from aidev_agent_cli.runtime.worker import ProcessWorker
 
 
 def worker(**snapshot):
-    return ProcessWorker(
-        WorkerSpec("tests.runtime.worker_fixtures:build", snapshot), cancel_grace=0.05, join_grace=0.05
-    )
+    return ProcessWorker(snapshot, entry="tests.runtime.worker_fixtures:build", cancel_grace=0.05, join_grace=0.05)
 
 
 async def discard(event):
@@ -114,16 +112,17 @@ async def test_slow_hook_cannot_prevent_worker_kill():
     assert_reaped(instance)
 
 
-@pytest.mark.parametrize("spec", [WorkerSpec("missing", {}), WorkerSpec("module:factory", {"object": object()})])
-async def test_invalid_spec_does_not_spawn(spec):
-    instance = ProcessWorker(spec)
+@pytest.mark.parametrize("entry,snapshot", [("missing", {}), ("module:factory", {"object": object()})])
+async def test_invalid_spec_does_not_spawn(entry, snapshot):
+    instance = ProcessWorker(snapshot, entry=entry)
     with pytest.raises((ValueError, TypeError)):
         await instance.run(event_sink=discard, request_handler=reply)
     assert instance.pid is None
 
 
 async def test_result_wait_timeout_preserves_shared_future():
-    from aidev_agent_cli.runtime.contracts import CancelToken, RunHandle, RunOutcome
+    from aidev_agent_cli.runtime.handles import CancelToken, RunHandle
+    from aidev_agent_cli.utils.runs import RunOutcome
 
     handle = RunHandle(run_id="run-test", session_code="session-test", token=CancelToken())
     with pytest.raises(asyncio.TimeoutError):

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Lightweight CLI entry; SDK execution lives in spawned runtime.sdk workers.
+"""Lightweight CLI entry; SDK execution lives in spawned aidev_agent_cli.sdk workers.
 
 本模块的导入开销必须是**零副作用**且**不加载 SDK**：
 
-* 不发生日志文件 / 目录创建（``infrastructure.logging`` 不在导入期配置日志）；
+* 不发生日志文件 / 目录创建（``utils.logging`` 不在导入期配置日志）；
 * 不加载 ``ag_ui`` / ``aidev_agent`` / ``pydantic`` / 协议 SDK ``acp``；
 * 不加载任何 ``runtime`` / ``adapters`` / ``resources`` 子模块。
 

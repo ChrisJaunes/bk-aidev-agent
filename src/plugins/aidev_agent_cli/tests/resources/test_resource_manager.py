@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 from aidev_agent.packages.resource_manager.registry import ResourceManagerProtocol
 
-from aidev_agent_cli.infrastructure.errors import HeadlessUnsupportedError
+from aidev_agent_cli.utils.errors import HeadlessUnsupportedError
 from aidev_agent_cli.resources.manager import HeadlessLedger, LocalResourceManager
 
 PROTOCOL_METHODS = [

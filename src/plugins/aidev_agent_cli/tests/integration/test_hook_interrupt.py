@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import pytest
-from aidev_agent_cli.runtime.hook_contract import HOOK_ASK_REASON
+from aidev_agent_cli.hooks.contract import HOOK_ASK_REASON
 from langchain_core.tools import tool
 
 from tests.integration._fake_host import FakeHost, by_point
@@ -39,7 +39,7 @@ def llm():
 
 
 HOOK_RESULTS = {
-    "session_start": {"context": ""},
+    "turn_start": {"context": ""},
     "tool_pre": {"decision": "ask", "reason": "请人工确认"},
     "tool_post": {"decision": "accept"},
 }

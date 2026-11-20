@@ -1,4 +1,4 @@
-"""``runtime.runner.SDKRunner`` / ``runtime.sdk.session.SDKSession`` 的驱动契约（主测 ``runtime``）。
+"""``runtime.runs.execute_turn`` / ``sdk.executor.AgentRun`` 的驱动契约（主测 ``runtime``）。
 
 这些用例跑在替身 agent（覆写 ``AgentRunner._run``）之上，而非 SDK：SDK 需要活模型与
 已配置环境，而这里的断言只关心**帧行为**（事件如何到达 sink、终态是什么），与产生事件的
@@ -31,26 +31,68 @@ from typing import Any
 
 import pytest
 
-from aidev_agent_cli.adapters.agui import FrameWriter
-from aidev_agent_cli.infrastructure import environment
-from aidev_agent_cli.infrastructure import settings as config
-from aidev_agent_cli.infrastructure.errors import AGENT_INTERNAL_ERROR as AGENT_ERROR_CODE
-from aidev_agent_cli.infrastructure.errors import RESUME_INTERRUPT_NOT_FOUND
+from aidev_agent_cli.adapters.agui import AguiTransport
+from aidev_agent_cli.bootstrap import startup
+from aidev_agent_cli.runtime import settings as config
+from aidev_agent_cli.utils.errors import AGENT_INTERNAL_ERROR as AGENT_ERROR_CODE
+from aidev_agent_cli.utils.errors import RESUME_INTERRUPT_NOT_FOUND
 from aidev_agent_cli.resources.loaders import ResourceOverrides
 from aidev_agent_cli.resources.local_config import McpResolver
 from aidev_agent_cli.resources.manager import LocalResourceManager
-from aidev_agent_cli.runtime.auth import ProcessConfig
-from aidev_agent_cli.runtime.inputs import ChatInput
-from aidev_agent_cli.runtime.sdk import factory as agent_factory
-from aidev_agent_cli.runtime.sdk.session import SDKSession as Session
+from aidev_agent_cli.runtime.process_config import ProcessConfig
+from aidev_agent_cli.utils.inputs import ChatInput
+from aidev_agent_cli.sdk import factory as agent_factory
+from aidev_agent_cli.runtime.process_config import CHECKPOINT_FILE_ENV
+from aidev_agent_cli.sdk.executor import AgentRun
+from aidev_agent_cli.sdk.spec import AgentSpec
+from tests._sdk import ChannelPorts
 from tests.integration._paths import PLUGIN_ROOT
 from tests.integration._scripted import script_session, strip_sse_shell, thread_safe_sink
 
 FIXTURE = Path(__file__).resolve().parent / "ag-ui-events.ndjson"
 
 
+class Session(AgentRun):
+    """测试侧单轮运行：把进程级 ``ProcessConfig`` 绑在运行上，身份与凭据每次现读。
+
+    生产路径里 runtime 每轮从 ``ProcessConfig`` 取身份与凭据写进快照，再交给 worker 的
+    ``AgentRun``（sdk 不依赖 runtime）。这里用同一份 config 现读，模拟"登录后下一轮生效"。
+    """
+
+    def __init__(
+        self,
+        *,
+        config: ProcessConfig | None = None,
+        state: Any = None,
+        ledger: Any = None,
+        checkpointer: Any = None,
+        hook_channel: Any = None,
+        **spec_fields: Any,
+    ) -> None:
+        self.config = config or ProcessConfig()
+        self.auth = self.config.auth
+        if "checkpoint_path" not in spec_fields:
+            spec_fields["checkpoint_path"] = os.environ[CHECKPOINT_FILE_ENV]
+        super().__init__(
+            AgentSpec(**spec_fields), state, ChannelPorts(hook_channel), ledger=ledger, checkpointer=checkpointer
+        )
+
+    @property
+    def spec(self) -> AgentSpec:
+        """身份与凭据每次从 config 现读（生产中由 runtime 每轮写进快照）。"""
+        spec = self._spec
+        spec.access_token = self.auth.access_token
+        spec.credentials = self.config.credentials()
+        spec.username = self._username or self.auth.username
+        return spec
+
+    @spec.setter
+    def spec(self, value: AgentSpec) -> None:
+        self._spec = value
+        self._username = value.username
+
 class _StringIO:
-    """Minimal stand-in for the writer's stream, for the FrameWriter tests."""
+    """Minimal stand-in for the writer's stream, for the AguiTransport tests."""
 
     def __init__(self) -> None:
         self.parts: list[str] = []
@@ -66,7 +108,7 @@ class _StringIO:
         return "".join(self.parts)
 
 
-class _RecordingWriter(FrameWriter):
+class _RecordingWriter(AguiTransport):
     """Captures every frame sent, preserving order.
 
     ``peer_gone`` is present (as the real writer has it) so the runner exercises
@@ -103,6 +145,16 @@ def load_fixture_lines() -> list[str]:
     return [f"data: {ln}\n\n" for ln in lines]
 
 
+_ORIGINAL_READ = config.BkAiConfig.read
+
+
+def _tester_config(path: str | None = None) -> config.BkAiConfig:
+    """真实读取（落盘目标仍是隔离的临时文件），只把用户名固定为 tester。"""
+    cfg = _ORIGINAL_READ(path)
+    cfg.auth["username"] = "tester"
+    return cfg
+
+
 @pytest.fixture(autouse=True)
 def _isolate_tui_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """把 ``bkai_tui.json`` 指到临时文件，**每个**测试都隔离。
@@ -112,13 +164,13 @@ def _isolate_tui_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     ``~/.bkai/bkai_tui.json``——token 泄漏进测试、测试写脏真机配置，两个方向都是
     事故。测试体内自行 ``setenv`` 同名变量时覆盖本值（后设者胜）。
     """
-    import aidev_agent_cli.infrastructure.settings as config_mod
+    import aidev_agent_cli.runtime.settings as config_mod
 
-    monkeypatch.setenv(config_mod.TuiConfig.CONFIG_FILE_OVERRIDE, str(tmp_path / "bkai_tui.json"))
+    monkeypatch.setenv(config_mod.BkAiConfig.CONFIG_FILE_OVERRIDE, str(tmp_path / "bkai_tui.json"))
 
 
 class AgentRunner:
-    """测试侧的单轮驱动：统一执行路径（``SDKRunner`` + ``Session``）加脚本化 agent。
+    """测试侧的单轮驱动：统一执行路径（``execute_turn`` + ``Session``）加脚本化 agent。
 
     保留旧 runner 的调用面 ``run(req_id=, run_id=, session_code=, input_text=, state=, sink=,
     is_cancelled=, execute_kwargs=)``，让断言聚焦在「事件怎么到达 sink、终态是什么」。
@@ -139,12 +191,12 @@ class AgentRunner:
         is_cancelled: Any = None,
         execute_kwargs: Any = None,
     ) -> Any:
-        from aidev_agent_cli.runtime.contracts import RunRequest
+        from aidev_agent_cli.utils.runs import RunRequest
 
         if self._impl is not None:
             script_session(state, self._impl)
         if session_code:
-            state.session_code = session_code
+            state.spec.session_code = session_code
             state.writer.set_session_code(session_code)
         handle = SimpleNamespace(
             run_id=run_id,
@@ -153,7 +205,8 @@ class AgentRunner:
         request = RunRequest(session_code=session_code, input=ChatInput(input_text), execute_options=execute_kwargs or {}, correlation_id=req_id)
         from dataclasses import replace
 
-        state.bind_cancel_token(handle.token)
+        ports = state._ports
+        state._ports = ChannelPorts(getattr(ports, "_channel", None), handle.token.is_cancelled)
         deliver = thread_safe_sink(sink, asyncio.get_running_loop())
         try:
             outcome = await asyncio.to_thread(
@@ -162,7 +215,7 @@ class AgentRunner:
             )
             return replace(outcome, run_id=run_id)
         finally:
-            state.bind_cancel_token(None)
+            state._ports = ports
 
 
 def make_runner(writer: _RecordingWriter, run_impl: Any, **kwargs: Any) -> tuple[AgentRunner, Session]:
@@ -175,14 +228,14 @@ def make_runner(writer: _RecordingWriter, run_impl: Any, **kwargs: Any) -> tuple
 
 
 def application_for(state):
-    from aidev_agent_cli.runtime.contracts import SessionOptions
+    from aidev_agent_cli.utils.runs import SessionOptions
     from aidev_agent_cli.runtime.service import RuntimeService
 
-    service = RuntimeService(config=state.config, auth=state.auth)
+    service = RuntimeService(config=state.config)
     asyncio.run(service.new_session(SessionOptions(
-        session_code="selection-test", resources=state.resources or ("injected",),
+        session_code="selection-test", resources=state.spec.resources or ("injected",),
         agent_code=state._resolve_agent_code(state._resource_manager) or "app-code",
-        model=state.current_model or "",
+        model=state.spec.model or "",
     )))
     return service
 
@@ -190,7 +243,7 @@ def application_for(state):
 def worker_for(service):
     options = service._sessions.get("selection-test").options
     return Session(
-        session_code=options.session_code, config=service._config, auth=service._auth,
+        session_code=options.session_code, config=service._config,
         agent_code=options.agent_code, resources=options.resources, model=options.model,
     )
 
@@ -198,7 +251,7 @@ def worker_for(service):
 class _RunEventSink:
     """本次运行的**事件出口**：把每个 payload 包成 ``event`` 帧写进记录的 writer。
 
-    与 ``adapters.agui.RunEventSink`` 同形（那里是真正的帧构造）；测试只需要能断言"一事件
+    与 ``adapters.agui.AguiSink`` 同形（那里是真正的帧构造）；测试只需要能断言"一事件
     一帧、payload 逐字"。``runId`` 由这一轮的结果补上——生产侧 AG-UI 的帧构造同样从运行时
     拿到 ``runId``，这里因此有一个最小等价物。
     """
@@ -428,7 +481,7 @@ def test_no_message_storage() -> None:
     from aidev_agent_cli.runtime.session import SessionRegistry
 
     service = RuntimeService()
-    registry = SessionRegistry(service.defaults)
+    registry = SessionRegistry(service.defaults, service._config.history_path)
     registry.new_session()
 
     forbidden_substrings = ("message", "history", "conversation", "transcript")
@@ -515,13 +568,16 @@ async def test_run_forwards_execute_kwargs_into_the_run_params() -> None:
     assert seen[0]["executeKwargs"] == {"stream": True, "trace": "trace-1"}
 
 
+@pytest.mark.slow
 async def test_a_resume_in_execute_kwargs_is_routed_and_unknown_ids_fail():
-    from aidev_agent_cli.runtime.contracts import ResumeRequest, RunRequest, SessionOptions
-    from aidev_agent_cli.runtime.errors import RuntimeFault
-    from aidev_agent_cli.runtime.inputs import ResumeInterrupt
+    from aidev_agent_cli.utils.runs import ResumeRequest, RunRequest, SessionOptions
+    from aidev_agent_cli.utils.errors import RuntimeFault
+    from aidev_agent_cli.utils.inputs import ResumeInterrupt
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.settings import BkAiConfig
     from aidev_agent_cli.runtime.service import build_runtime
 
-    service = build_runtime("acp-dsh", resources=("injected",), env={})
+    service = build_runtime("acp-dsh", ProcessConfig(bkai=BkAiConfig(), launch=LaunchOptions(resources=("injected",))))
     try:
         await service.new_session(SessionOptions("s1", resources=("injected",)))
         with pytest.raises(RuntimeFault) as exc:
@@ -584,8 +640,10 @@ def test_execute_kwargs_without_carried_values_keep_the_base_keys() -> None:
 
 
 async def test_a_resume_inside_execute_kwargs_routes_to_the_resume_path():
-    from aidev_agent_cli.runtime.contracts import ResumeRequest, RunOutcome, SessionOptions
-    from aidev_agent_cli.runtime.inputs import ResumeInterrupt
+    from aidev_agent_cli.utils.runs import ResumeRequest, RunOutcome, SessionOptions
+    from aidev_agent_cli.utils.inputs import ResumeInterrupt
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.settings import BkAiConfig
     from aidev_agent_cli.runtime.service import build_runtime
 
     seen = []
@@ -593,8 +651,8 @@ async def test_a_resume_inside_execute_kwargs_routes_to_the_resume_path():
         async def execute(self, *, handle, snapshot, **kwargs):
             seen.append((snapshot.kind, snapshot.input, snapshot))
             return RunOutcome("finished", handle.run_id, handle.session_code)
-    service = build_runtime("acp-dsh", resources=("injected",), env={})
-    service._scheduler._runner = Recorder()
+    service = build_runtime("acp-dsh", ProcessConfig(bkai=BkAiConfig(), launch=LaunchOptions(resources=("injected",))))
+    service._queue._execute = Recorder().execute
     resume = {"interruptId": "i1", "status": "resolved"}
     try:
         await service.new_session(SessionOptions("s1", resources=("injected",)))
@@ -625,7 +683,7 @@ def test_describe_agent_config_reuses_the_cached_manager(monkeypatch: pytest.Mon
     调用方在外面追加并浅拷贝），因此这里用**真 manager** + 只打桩平台取数：替身无法
     覆盖真实组装，只会把断言变成"替身自己实现了一遍"。
     """
-    import aidev_agent_cli.runtime.sdk.session as runner_mod
+    import aidev_agent_cli.sdk.executor as runner_mod
     from aidev_agent_cli.resources.manager import LocalResourceManager
     from aidev_agent_cli.resources.sources import PLATFORM_SOURCES
 
@@ -658,7 +716,7 @@ def test_describe_agent_config_reuses_the_cached_manager(monkeypatch: pytest.Mon
         return self._resource_manager
 
     runner, state = make_runner(_RecordingWriter(), None)
-    monkeypatch.setattr(runner_mod.SDKSession, "ensure_manager", _ensure)
+    monkeypatch.setattr(runner_mod.AgentRun, "ensure_manager", _ensure)
 
     first = state.describe_agent_config()
     second = state.describe_agent_config()
@@ -810,9 +868,9 @@ class _FakeManager:
 
 def _patch_ensure_manager(monkeypatch: Any, factory: Any) -> None:
     """Install a fake ``Session.ensure_manager`` for the duration of a test."""
-    import aidev_agent_cli.runtime.sdk.session as runner_mod
+    import aidev_agent_cli.sdk.executor as runner_mod
 
-    monkeypatch.setattr(runner_mod.SDKSession, "ensure_manager", factory)
+    monkeypatch.setattr(runner_mod.AgentRun, "ensure_manager", factory)
 
 
 def _patch_manager_build(monkeypatch: Any, factory: Any) -> None:
@@ -855,7 +913,7 @@ def test_set_access_token_invalidates_the_manager(monkeypatch: Any) -> None:
 
 def test_rebuild_after_login_pushes_the_token_onto_the_new_manager(monkeypatch: Any) -> None:
     """The rebuilt manager carries the CURRENT token (D-09/D-10/D-11)."""
-    import aidev_agent_cli.runtime.sdk.session as runner_mod
+    import aidev_agent_cli.sdk.executor as runner_mod
 
     built: list[_FakeManager] = []
 
@@ -869,9 +927,9 @@ def test_rebuild_after_login_pushes_the_token_onto_the_new_manager(monkeypatch: 
     # （from-import 在导入时绑定，patch 原模块不再影响调用点）。
     # 用户名与 token 同源，都读配置文件的 auth 段（resolve_username 已删除）。
     monkeypatch.setattr(
-        config.TuiConfig,
+        config.BkAiConfig,
         "read",
-        classmethod(lambda cls, path=None: config.TuiConfig(username="tester")),
+        classmethod(lambda cls, path=None: _tester_config(path)),
         raising=True,
     )
     _patch_manager_build(monkeypatch, _fake_make)
@@ -895,9 +953,9 @@ def test_logout_returns_to_pure_app_state(monkeypatch: Any) -> None:
     # 261014-w6d 后续：patch 目标改为 ``agent_runner``（名字已在模块顶层绑定）。
     # 用户名与 token 同源，都读配置文件的 auth 段（resolve_username 已删除）。
     monkeypatch.setattr(
-        config.TuiConfig,
+        config.BkAiConfig,
         "read",
-        classmethod(lambda cls, path=None: config.TuiConfig(username="tester")),
+        classmethod(lambda cls, path=None: _tester_config(path)),
         raising=True,
     )
     _patch_manager_build(monkeypatch, lambda creds, username, **_: _FakeManager())
@@ -934,15 +992,15 @@ def test_a_restarted_session_pushes_the_persisted_token_onto_the_manager(
     # 用户名与 token 同源，都读配置文件的 auth 段（resolve_username 已删除）。
     # 这里要在**真实读回**之上叠加 username：本测试的断言依赖重启读回落盘 token，
     # 不能让 patch 顺手清掉它。
-    _original_read = config.TuiConfig.read
+    _original_read = config.BkAiConfig.read
 
-    def _read_with_tester(cls: type, path: str | None = None) -> config.TuiConfig:
+    def _read_with_tester(cls: type, path: str | None = None) -> config.BkAiConfig:
         cfg = _original_read(path)
-        cfg.username = "tester"
+        cfg.auth["username"] = "tester"
 
         return cfg
 
-    monkeypatch.setattr(config.TuiConfig, "read", classmethod(_read_with_tester))
+    monkeypatch.setattr(config.BkAiConfig, "read", classmethod(_read_with_tester))
     _patch_manager_build(monkeypatch, lambda creds, username, **_: _FakeManager())
 
     runner, state = make_runner(_RecordingWriter(), None)
@@ -977,7 +1035,7 @@ def test_ensure_resource_manager_rebinds_only_when_invalidated() -> None:
     assert state.ensure_manager() is seeded
 
     # Invalidation is the ONLY thing that makes it rebuildable.
-    state = Session(resources=state.resources, config=state.config, auth=state.auth)
+    state = Session(resources=state.spec.resources, config=state.config)
     assert state._resource_manager is None
 
 
@@ -1020,9 +1078,9 @@ def _patch_factory_for_mcp(monkeypatch: Any, manager: _FakeManager) -> None:
     # （patch ``agent_factory`` 不再影响调用点——from-import 在导入时已绑定）。
     # 用户名与 token 同源，都读配置文件的 auth 段（resolve_username 已删除）。
     monkeypatch.setattr(
-        config.TuiConfig,
+        config.BkAiConfig,
         "read",
-        classmethod(lambda cls, path=None: config.TuiConfig(username="tester")),
+        classmethod(lambda cls, path=None: _tester_config(path)),
         raising=True,
     )
     _patch_manager_build(monkeypatch, lambda creds, username, **_: manager)
@@ -1138,11 +1196,14 @@ def test_a_manager_missing_a_required_method_fails_loudly(monkeypatch: Any, tmp_
 # ------------------------------------------------------- build deadline
 
 
+@pytest.mark.slow
 async def test_a_hanging_agent_build_fails_the_turn_instead_of_wedging_it(monkeypatch):
-    from aidev_agent_cli.runtime.contracts import RunRequest, SessionOptions
+    from aidev_agent_cli.utils.runs import RunRequest, SessionOptions
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.settings import BkAiConfig
     from aidev_agent_cli.runtime.service import build_runtime
 
-    service = build_runtime("acp-dsh", resources=("injected",), env={})
+    service = build_runtime("acp-dsh", ProcessConfig(bkai=BkAiConfig(), launch=LaunchOptions(resources=("injected",))))
     started = asyncio.Event()
     async def sink(event):
         if event.get("name") == "test_worker":
@@ -1265,7 +1326,7 @@ def test_the_workspace_files_loader_wraps_the_manager_index(monkeypatch: Any) ->
 def test_set_local_agent_preserves_startup_default_and_invalidates_manager(monkeypatch: Any, tmp_path: Any) -> None:
     """当前会话切换 agent 并重建 manager，不修改下一次启动的默认值。"""
     tui_file = tmp_path / "bkai_tui.json"
-    monkeypatch.setenv(config.TuiConfig.CONFIG_FILE_OVERRIDE, str(tui_file))
+    monkeypatch.setenv(config.BkAiConfig.CONFIG_FILE_OVERRIDE, str(tui_file))
 
     managers: list[_FakeManager] = []
 
@@ -1288,7 +1349,7 @@ def test_set_local_agent_preserves_startup_default_and_invalidates_manager(monke
     state = worker_for(service)
 
     assert not tui_file.exists(), "current session selection must not write the startup default"
-    assert state.agent_code == "local-code"
+    assert state.spec.agent_code == "local-code"
     # ② invalidate() 丢弃 manager —— 快照缓存随它一起消失（不再有第二个缓存要清）
     assert state._resource_manager is None
     # ③ the next snapshot builds a NEW manager (and therefore re-reads the local file)
@@ -1309,16 +1370,16 @@ def test_set_local_declaration_appends_collections(monkeypatch: Any, tmp_path: A
     monkeypatch.setenv("AGENT_TUI_AGENT_CODE", "code-a")
 
     runner, state = make_runner(_RecordingWriter(), None)
-    state.agent_code = ProcessConfig().default_agent_code()
+    state.spec.agent_code = ProcessConfig().default_agent_code()
     service = application_for(state)
     manager = _FakeManager()
     # ``ensure_manager`` 返回这个替身，因此写经 ``rm.write_declaration``（替身记录，
     # 不触盘）——真 manager 才落 ``agents/${code}.json``。
     _patch_ensure_manager(monkeypatch, lambda self: manager)
-    from aidev_agent_cli.resources.local_config import LocalDeclarations
+    from aidev_agent_cli.resources.local_config import BkAiAgentInfo
     def record_write(self, kind, value, *, code):
         manager.declaration_writes.append((kind, value, code))
-    monkeypatch.setattr(LocalDeclarations, "write", record_write)
+    monkeypatch.setattr(BkAiAgentInfo, "write", record_write)
 
 
     asyncio.run(service.set_local_declaration("selection-test", "mcps", "mcp-x"))
@@ -1340,13 +1401,13 @@ def test_per_agent_write_falls_back_to_the_platform_agent_code(monkeypatch: Any,
     env 与 ``bkai_tui.json`` 都未设时，写 per-agent 配置必须回退到平台
     ``agent_code``（``BKPAAS_APP_CODE`` / ``rm.get_agent_code()``），而不是解析出空串。
 
-    此前写路径用的是**另一条**链（env → TuiConfig → ``""``，无兜底），于是
+    此前写路径用的是**另一条**链（env → BkAiConfig → ``""``，无兜底），于是
     ``/models`` 按 Enter 会以
     ``ValueError("unsafe agent_code for per-agent config path: ''")`` 失败——而
     **读**路径有兜底，所以 agent 照常构建、``/models`` 照常列出模型，
     症状只在写的那一刻出现。读写两条链必须给出**同一个答案**。
     """
-    monkeypatch.setenv(config.TuiConfig.CONFIG_FILE_OVERRIDE, str(tmp_path / "absent.json"))
+    monkeypatch.setenv(config.BkAiConfig.CONFIG_FILE_OVERRIDE, str(tmp_path / "absent.json"))
     monkeypatch.delenv("AGENT_TUI_AGENT_CODE", raising=False)
 
     runner, state = make_runner(_RecordingWriter(), None)
@@ -1355,10 +1416,10 @@ def test_per_agent_write_falls_back_to_the_platform_agent_code(monkeypatch: Any,
 
     manager = _FakeManager()
     _patch_ensure_manager(monkeypatch, lambda self: manager)
-    from aidev_agent_cli.resources.local_config import LocalDeclarations
+    from aidev_agent_cli.resources.local_config import BkAiAgentInfo
     def record_write(self, kind, value, *, code):
         manager.declaration_writes.append((kind, value, code))
-    monkeypatch.setattr(LocalDeclarations, "write", record_write)
+    monkeypatch.setattr(BkAiAgentInfo, "write", record_write)
 
 
     asyncio.run(service.set_local_declaration("selection-test", "models", "m1"))
@@ -1369,38 +1430,38 @@ def test_per_agent_write_falls_back_to_the_platform_agent_code(monkeypatch: Any,
 
 
 def test_agent_code_comes_from_tui_config(monkeypatch: Any, tmp_path: Any) -> None:
-    """261014-urj 裁决 (e)：入口 agent_code 来自 TuiConfig（进程级），不再读 ``rm.local``。
+    """261014-urj 裁决 (e)：入口 agent_code 来自 BkAiConfig（进程级），不再读 ``rm.local``。
 
-    写 ``bkai_tui.json`` 的 ``agent_code`` → 断言 ``_resolve_agent_code`` 返回它。
+    写 ``bkai_tui.json`` 的 ``default_agent_code`` → 断言 ``_resolve_agent_code`` 返回它。
     """
     tui_file = tmp_path / "bkai_tui.json"
-    monkeypatch.setenv(config.TuiConfig.CONFIG_FILE_OVERRIDE, str(tui_file))
+    monkeypatch.setenv(config.BkAiConfig.CONFIG_FILE_OVERRIDE, str(tui_file))
     monkeypatch.delenv("AGENT_TUI_AGENT_CODE", raising=False)
-    config.TuiConfig().write_agent_code("from-tui")
+    config.BkAiConfig.read().write("default_agent_code", "from-tui")
 
     runner, state = make_runner(_RecordingWriter(), None)
-    state.agent_code = ProcessConfig().default_agent_code()
+    state.spec.agent_code = ProcessConfig().default_agent_code()
     manager = _FakeManager(agent_code="platform-code")
 
     assert state._resolve_agent_code(manager) == "from-tui"
 
 
 def test_agent_code_env_beats_tui_config(monkeypatch: Any, tmp_path: Any) -> None:
-    """env 优先于 TuiConfig 不变（CONTEXT D1：env 在最前）。"""
+    """env 优先于 BkAiConfig 不变（CONTEXT D1：env 在最前）。"""
     tui_file = tmp_path / "bkai_tui.json"
-    monkeypatch.setenv(config.TuiConfig.CONFIG_FILE_OVERRIDE, str(tui_file))
-    config.TuiConfig().write_agent_code("from-tui")
+    monkeypatch.setenv(config.BkAiConfig.CONFIG_FILE_OVERRIDE, str(tui_file))
+    config.BkAiConfig.read().write("default_agent_code", "from-tui")
     monkeypatch.setenv("AGENT_TUI_AGENT_CODE", "from-env")
 
     runner, state = make_runner(_RecordingWriter(), None)
-    state.agent_code = ProcessConfig().default_agent_code()
+    state.spec.agent_code = ProcessConfig().default_agent_code()
 
     assert state._resolve_agent_code(_FakeManager()) == "from-env"
 
 
 def test_agent_code_falls_back_to_the_platform(monkeypatch: Any, tmp_path: Any) -> None:
-    """TuiConfig 未声明 agent_code 时回退平台（``BKPAAS_APP_CODE`` / ``rm.get_agent_code()``）。"""
-    monkeypatch.setenv(config.TuiConfig.CONFIG_FILE_OVERRIDE, str(tmp_path / "absent.json"))
+    """BkAiConfig 未声明 agent_code 时回退平台（``BKPAAS_APP_CODE`` / ``rm.get_agent_code()``）。"""
+    monkeypatch.setenv(config.BkAiConfig.CONFIG_FILE_OVERRIDE, str(tmp_path / "absent.json"))
     monkeypatch.delenv("AGENT_TUI_AGENT_CODE", raising=False)
 
     runner, state = make_runner(_RecordingWriter(), None)
@@ -1457,9 +1518,9 @@ class TestLoginTakesEffectNextTurn:
         # 261014-w6d 后续：patch 目标改为 ``agent_runner``（名字已在模块顶层绑定）。
         # 用户名与 token 同源，都读配置文件的 auth 段（resolve_username 已删除）。
         monkeypatch.setattr(
-            config.TuiConfig,
+            config.BkAiConfig,
             "read",
-            classmethod(lambda cls, path=None: config.TuiConfig(username="tester")),
+            classmethod(lambda cls, path=None: _tester_config(path)),
             raising=True,
         )
         _patch_manager_build(monkeypatch, _fake_make)
@@ -1538,8 +1599,6 @@ async def test_retry_context_and_events_cross_sdk_thread_without_replaying_tools
     from aidev_agent.packages.langchain_core.models.llm_retry import _current_state
     from aidev_agent.utils.async_utils import async_to_sync_generator
 
-    monkeypatch.setenv("AGENT_TUI_LLM_RATE_LIMIT_RETRIES", "6")
-    monkeypatch.setenv("AGENT_TUI_LLM_RATE_LIMIT_WAIT_BUDGET", "1")
     writer = _RecordingWriter()
     executed = []
     bound = []
@@ -1567,6 +1626,7 @@ async def test_retry_context_and_events_cross_sdk_thread_without_replaying_tools
             return None
 
     runner, state = make_runner(writer, None)
+    state.spec.rate_limit_retries, state.spec.rate_limit_wait_budget = 6, 1.0
     state.ensure_platform_session = lambda *args, **kwargs: None  # type: ignore[method-assign]
     state.build_agent = lambda **params: Agent(params.get("event_handler"))  # type: ignore[method-assign]
     state._event_handler = lambda: state.writer  # type: ignore[method-assign]
@@ -1601,8 +1661,6 @@ async def test_a_stop_during_a_retry_wait_ends_the_turn_without_another_request(
     import httpx
     from aidev_agent.packages.langchain_core.models.llm_retry import _current_state
 
-    monkeypatch.setenv("AGENT_TUI_LLM_RATE_LIMIT_RETRIES", "6")
-    monkeypatch.setenv("AGENT_TUI_LLM_RATE_LIMIT_WAIT_BUDGET", "10")
     entered = threading.Event()
     executed = []
 
@@ -1625,6 +1683,7 @@ async def test_a_stop_during_a_retry_wait_ends_the_turn_without_another_request(
 
     writer = _RecordingWriter()
     runner, state = make_runner(writer, None)
+    state.spec.rate_limit_retries, state.spec.rate_limit_wait_budget = 6, 10.0
     state.ensure_platform_session = lambda *args, **kwargs: None  # type: ignore[method-assign]
     state.build_agent = lambda **params: Agent()  # type: ignore[method-assign]
 
@@ -1696,7 +1755,7 @@ class TestBootstrapEnvironment:
         monkeypatch.setenv("DJANGO_SETTINGS_MODULE", "bk_plugin.patch.plugin")
 
         env = {"DJANGO_SETTINGS_MODULE": "bk_plugin.patch.plugin"}
-        environment.bootstrap_environment(env)
+        startup._publish_env(env)
 
         assert "DJANGO_SETTINGS_MODULE" not in os.environ, (
             "DJANGO_SETTINGS_MODULE bootstraps bk_plugin.settings, which imports "
@@ -1707,7 +1766,7 @@ class TestBootstrapEnvironment:
     def test_publishes_the_parsed_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("AGENT_TUI_TEST_MARKER", raising=False)
 
-        environment.bootstrap_environment({"AGENT_TUI_TEST_MARKER": "yes"})
+        startup._publish_env({"AGENT_TUI_TEST_MARKER": "yes"})
 
         assert os.environ["AGENT_TUI_TEST_MARKER"] == "yes"
 
@@ -1715,21 +1774,21 @@ class TestBootstrapEnvironment:
         monkeypatch.delenv("DJANGO_SETTINGS_MODULE", raising=False)
 
         env: dict[str, str] = {}
-        environment.bootstrap_environment(env)
-        environment.bootstrap_environment(env)
+        startup._publish_env(env)
+        startup._publish_env(env)
 
 
-def test_ensure_manager_does_not_re_run_bootstrap_environment() -> None:
+def test_ensure_manager_does_not_re_run_environment_publishing() -> None:
     """环境准备只在 ``__main__`` 启动路径上跑一次，``ensure_manager`` **不**重跑。
 
-    ``bootstrap_environment`` 是进程级的一次性准备（丢弃 ``DJANGO_SETTINGS_MODULE``、
+    环境发布（``startup._publish_env``）是进程级的一次性准备（丢弃 ``DJANGO_SETTINGS_MODULE``、
     发布 env、桥接 bkapi 凭据名），且必须在首个 SDK import 之前完成。``__main__`` 已
     在启动时做过；``ensure_manager`` 再跑一遍是纯冗余——所以它不应出现在那里。
 
     用源码断言钉住这一点（``ensure_manager`` 走真实 manager 构建，单元测试不会驱动到
     生产那一遍），与 ``test_the_shutdown_event_is_created_before_the_loop_is_published``
     同一手法。直接驱动 ``Session`` 的调用方需自行先调
-    ``aidev_agent_cli.infrastructure.environment.bootstrap_environment``。
+    ``aidev_agent_cli.bootstrap.startup.install_startup_hooks``。
     """
     source = inspect.getsource(Session.ensure_manager)
 
@@ -1739,8 +1798,8 @@ def test_ensure_manager_does_not_re_run_bootstrap_environment() -> None:
     code_lines = [line.split("#", 1)[0] for line in source.splitlines()]
     code = "\n".join(code_lines)
 
-    assert "bootstrap_environment(" not in code, (
-        "ensure_manager must NOT re-run bootstrap_environment — __main__ already did "
+    assert "_publish_env(" not in code and "install_startup_hooks(" not in code, (
+        "ensure_manager must NOT re-run environment publishing — __main__ already did "
         "it once at startup; re-running it here is the redundancy this pins away"
     )
 
@@ -1895,7 +1954,7 @@ class TestCurrentModelPersistence:
 
         state = worker_for(service)
 
-        assert state.current_model == "hy3"
+        assert state.spec.model == "hy3"
 
     def test_it_outlives_the_switch_and_is_not_restored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """没有上下文管理器：切换生效后不会在"构建结束"时被还原。"""
@@ -1907,8 +1966,8 @@ class TestCurrentModelPersistence:
         state = worker_for(service)
 
         # 后续任意多次配置读取都看到它——这正是"Agent 被 model 覆盖"。
-        assert state.current_model == "hy3"
-        assert state.current_model == "hy3"
+        assert state.spec.model == "hy3"
+        assert state.spec.model == "hy3"
 
     def test_a_second_switch_replaces_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         state, _rm = _state_with_patched_manager(monkeypatch)
@@ -1920,7 +1979,7 @@ class TestCurrentModelPersistence:
         asyncio.run(service.set_local_declaration("selection-test", "models", "deepseek-v4-flash"))
         state = worker_for(service)
 
-        assert state.current_model == "deepseek-v4-flash"
+        assert state.spec.model == "deepseek-v4-flash"
 
     def test_other_kinds_leave_it_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         state, _rm = _state_with_patched_manager(monkeypatch)
@@ -1932,13 +1991,13 @@ class TestCurrentModelPersistence:
         asyncio.run(service.set_local_declaration("selection-test", "mcps", "some-server"))
         state = worker_for(service)
 
-        assert state.current_model == "hy3"
+        assert state.spec.model == "hy3"
 
     def test_it_starts_unset(self) -> None:
         """未切换时没有覆盖——平台自己的模型生效。"""
         state = Session()
 
-        assert state.current_model is None
+        assert not state.spec.model
 
     def test_there_is_no_model_override_context_manager(self) -> None:
         """反回归：不再有 ``model_override`` 这类作用域包装。
@@ -1960,13 +2019,13 @@ class TestCurrentModelPersistence:
             {"BKPAAS_APP_CODE": "app", "BKPAAS_APP_SECRET": "sec"},
             "judgehuang",
             sources=("injected",),
-            overrides=ResourceOverrides(model=state.current_model or ""),
+            overrides=ResourceOverrides(model=state.spec.model or ""),
         )
 
-        state.current_model = "hy3"
+        state.spec.model = "hy3"
 
         assert rm.overrides.model == "", "已接受的资源快照不随可变Session改变"
-        updated = ResourceOverrides(model=state.current_model)
+        updated = ResourceOverrides(model=state.spec.model)
         assert updated.model == "hy3"
         assert not hasattr(rm, "runtime")
 
@@ -1977,9 +2036,9 @@ def _state_with_patched_manager(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, A
     rm = _FakeManager()
     # 用户名与 token 同源，都读配置文件的 auth 段（resolve_username 已删除）。
     monkeypatch.setattr(
-        config.TuiConfig,
+        config.BkAiConfig,
         "read",
-        classmethod(lambda cls, path=None: config.TuiConfig(username="tester")),
+        classmethod(lambda cls, path=None: _tester_config(path)),
         raising=True,
     )
     _patch_manager_build(monkeypatch, lambda creds, username, **_: rm)
@@ -2044,7 +2103,7 @@ def _ensure_real_manager() -> Any:
 
     state = Session(
         resources=PLATFORM_SOURCES,
-        config=ProcessConfig(env={"BKPAAS_APP_CODE": "app", "BKPAAS_APP_SECRET": "sec"}),
+        config=ProcessConfig(bkai=config.BkAiConfig(env={"BKPAAS_APP_CODE": "app", "BKPAAS_APP_SECRET": "sec"})),
     )
 
     return state.ensure_manager()
@@ -2120,7 +2179,7 @@ class TestAgentFactoryHoistsImports:
         code = (
             "import sys;"
             "sys.path.insert(0, '.');"
-            "import aidev_agent_cli.runtime.sdk.factory as f;"
+            "import aidev_agent_cli.sdk.factory as f;"
             "mods=[m for m in sys.modules if m.startswith('aidev_agent')];"
             "print('SDK_MODULES=' + str(len(mods)))"
         )
@@ -2142,7 +2201,7 @@ def test_the_platform_writer_persists_and_forwards_except_persistence_only_event
     """平台来源的事件处理器：平台回写 writer 收到全部事件；会话 writer 只收协议可见事件。"""
     from aidev_agent.services.event_handlers.agui_writer import AGUISessionWriter
 
-    from aidev_agent_cli.runtime.sdk.events import platform_session_writer
+    from aidev_agent_cli.sdk.events import platform_session_writer
 
     persisted: list[Any] = []
     monkeypatch.setattr(AGUISessionWriter, "__init__", lambda self, **kwargs: None)

@@ -7,7 +7,7 @@ headless NDJSON 协议（已删除）。线上是**标准 ACP v1**（JSON-RPC 2.
 - 显式 `--resources injected` 时不触达平台、不需要 token；省略资源时使用统一 `default` 预设。需要 `aidev-agent-cli[acp]`。
 - 一个进程承载多个会话；同会话的轮次排队串行，不同会话并发。
 - stdout 只承载协议帧，日志走 stderr / 日志文件。
-- 嵌入式接缝：入口脚本可调用 `run_acp_dsh(service, tool_factories=("module:factory",))` 注入 worker 内构造的工具（不传 live 工具）（不是线上协议的一部分）。
+- 嵌入式接缝：入口脚本可调用 `adapters.acp.run_acp(service, ProtocolChannel.stdio(), profile=ACP_DSH, tool_factories=("module:factory",))` 注入 worker 内构造的工具（不传 live 工具）（不是线上协议的一部分）。
 
 ## 1. 方法总览
 

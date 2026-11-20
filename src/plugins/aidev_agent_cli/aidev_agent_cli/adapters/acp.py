@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-"""ACP 服务端：将 RuntimeService 的 AG-UI 事件转换为 ACP 响应与通知。
+"""ACP 服务端（acp / acp-dsh 共用，差异见 ``AcpProfile``）：将 RuntimePort 的 AG-UI 事件转换为 ACP 响应与通知。
 
 会话与运行生命周期由 runtime 管理；每轮独享 sink 和解释器，避免串会话。
 SDK 并发处理请求，因此 prompt 等待终态时仍可接收 cancel。失败抛 AcpError，
@@ -8,16 +7,13 @@ SDK 并发处理请求，因此 prompt 等待终态时仍可接收 cancel。失�
 本模块顶层导入 SDK，入口须先安装 stdout guard 并发布环境。fd 1 仅用于
 JSON-RPC，诊断走 logger。服务退出时始终 await service.close_all。
 
-两处 SDK 边界的区分：``HookReply`` 是**纯值对象**（父进程侧构造回复），取
-``runtime.models``；``HookConfig`` 解析 ``hooks`` 配置（超时上限 + 点位集合），同为纯值，
-取 ``runtime.hook_contract``——点位名是线上契约字符串，父进程解析它不需要 SDK。
+hook 是 ``RuntimePort`` 的进程级依赖；连接建立时为它绑定 ``_aidev/hook`` 回调通道。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import sys
 from collections.abc import Awaitable
 from functools import wraps
 from logging import getLogger
@@ -28,6 +24,7 @@ from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
     AgentThoughtChunk,
+    CloseSessionResponse,
     InitializeResponse,
     NewSessionResponse,
     PromptResponse,
@@ -36,16 +33,22 @@ from acp.schema import (
     ToolCallStart,
 )
 
-from ..infrastructure.errors import PROTOCOL_INVALID_PARAMS, HeadlessError
-from ..infrastructure.process import async_shutdown_event, use_daemon_default_executor
-from ..infrastructure.stdio import protocol_out
-from ..infrastructure.streams import LineReader, LineWriter, until_stopped
-from ..runtime.contracts import ResumeRequest, RunOutcome, RunRequest, SessionOptions, new_session_code
-from ..runtime.errors import RuntimeFault
-from ..runtime.hook_contract import HookConfig
-from ..runtime.inputs import ChatInput, ResumeInterrupt
-from ..runtime.models import HookReply
-from ..runtime.service import RuntimeService
+from ..hooks.handler import ClientHookHandler
+from ..utils.errors import (
+    AGENT_BUILD_FAILED,
+    AGENT_INTERNAL_ERROR,
+    PROTOCOL_INVALID_PARAMS,
+    SESSION_NOT_FOUND,
+    HeadlessError,
+    RuntimeFault,
+)
+from ..utils.inputs import ChatInput, ContextInput, ResumeInterrupt
+from ..infrastructure.ports import RuntimePort
+from ..utils.process import async_shutdown_event, use_daemon_default_executor
+from ..utils.runs import ResumeRequest, RunOutcome, RunRequest, SessionOptions, new_session_code
+from .streams import ProtocolChannel
+
+logger = getLogger(__name__)
 
 # EOF 后已接收请求全部响应时，额外等待输出静默的阈值（秒）。
 EOF_QUIET_SECONDS = 0.2
@@ -134,11 +137,8 @@ EXT_RESUME = "aidev/resume"
 EXT_HOOK_DEGRADED = "aidev/hook_degraded"
 
 
-logger = getLogger(__name__)
-
-
 def translate_runtime_fault(method):
-    """Translate application admission failures at the protocol boundary."""
+    """在协议边界把 RuntimeFault 翻译为 JSON-RPC error。"""
 
     @wraps(method)
     async def translated(*args, **kwargs):
@@ -230,7 +230,8 @@ def _interrupt_line(interrupt: Any) -> str | None:
 class AguiEventInterpreter:
     """将 AG-UI payload 直接转换为 ACP 消息，累积工具参数并降级中断。
 
-    每轮使用独立实例；未知事件仅记日志，不注入内容或打断运行。"""
+    每轮使用独立实例；未知事件仅记日志，不注入内容或打断运行。
+    """
 
     __slots__ = ("_tool_calls",)
 
@@ -374,7 +375,7 @@ def session_options_from_meta(
     session_code: str,
     tool_factories: tuple[str, ...] = (),
 ) -> SessionOptions:
-    """``_meta.aidev`` → ``SessionOptions``（agent / llm / hooks / username 对两个 ACP 协议同义）。"""
+    """``_meta.aidev`` → ``SessionOptions``。"""
     agent = meta.get("agent")
     agent_code = (agent.get("agent_code") or agent.get("agentCode")) if isinstance(agent, dict) else agent
     if agent_code is not None and not isinstance(agent_code, str):
@@ -397,7 +398,7 @@ def session_options_from_meta(
 
 
 def outcome_meta(outcome: RunOutcome) -> dict[str, Any]:
-    """一轮结果的 ``_meta.aidev``：状态 / turnId / 待恢复中断（两个 ACP 协议同形）。"""
+    """一轮结果的 ``_meta.aidev``：状态 / turnId / 待恢复中断。"""
     status = "interrupt" if outcome.status == "interrupted" else outcome.status
     meta: dict[str, Any] = {"status": status, "turnId": outcome.turn_id}
     if outcome.status == "interrupted":
@@ -405,42 +406,10 @@ def outcome_meta(outcome: RunOutcome) -> dict[str, Any]:
     return meta
 
 
-class HookTransport:
-    """Per-run ACP hook request routing; cancellation and timeout release the RPC task."""
-
-    def __init__(self, conn, session_id):
-        self._conn = conn
-        self._session_id = session_id
-
-    async def __call__(self, request, token):
-        params = {"sessionId": self._session_id, "requestId": request.line_id, **request.params}
-
-        async def wait_cancel():
-            while not token.cancelled:
-                await asyncio.sleep(0.01)
-
-        async def ask():
-            return await self._conn.ext_method(EXT_HOOK, params)
-
-        task = asyncio.create_task(ask())
-        cancel = asyncio.create_task(wait_cancel())
-        try:
-            done, _ = await asyncio.wait(
-                {task, cancel}, timeout=request.timeout_ms / 1000, return_when=asyncio.FIRST_COMPLETED
-            )
-            if token.cancelled:
-                return HookReply("cancelled")
-            if task not in done:
-                return HookReply("timeout")
-            try:
-                result = task.result()
-                return HookReply("reply", {"id": request.line_id, "ok": True, "result": result})
-            except Exception:
-                return HookReply("reply", {"id": request.line_id, "ok": False, "error": {"code": "host_failed"}})
-        finally:
-            task.cancel()
-            cancel.cancel()
-            await asyncio.gather(task, cancel, return_exceptions=True)
+def attach_hook_channel(hooks: Any, conn: Any) -> None:
+    """把进程级 hook handler 的回调通道绑到本条 ACP 连接（``_aidev/hook`` 请求）。"""
+    if isinstance(hooks, ClientHookHandler):
+        hooks.attach(lambda params: conn.ext_method(EXT_HOOK, params))
 
 
 async def notify_hook_degraded(conn: Any, session_id: str, payload: dict[str, Any]) -> bool:
@@ -452,15 +421,43 @@ async def notify_hook_degraded(conn: Any, session_id: str, payload: dict[str, An
     return True
 
 
-class _AcpSink:
+class AcpProfile:
+    """协议差异：仅协议名与修订号（同会话并发策略按协议名在 runtime 配置）。"""
+
+    __slots__ = ("name", "revision")
+
+    def __init__(self, name: str, revision: int | None = None) -> None:
+        self.name = name
+        self.revision = revision
+
+
+#: 标准 ACP。
+ACP = AcpProfile("acp")
+
+#: ACP + ``_aidev/*`` 扩展，供 dsh 等宿主驱动。
+ACP_DSH = AcpProfile("acp-dsh", revision=1)
+
+PROFILES = {profile.name: profile for profile in (ACP, ACP_DSH)}
+
+
+def _rpc_error(code: str, message: str, detail: dict | None = None) -> RequestError:
+    """稳定错误码 → JSON-RPC error；``data.code`` 与 headless 错误码同一张表，宿主据此分流。"""
+    rpc_code = -32602 if code == PROTOCOL_INVALID_PARAMS else -32603
+    data: dict[str, Any] = {"code": code, "message": message}
+    if detail:
+        data["detail"] = detail
+    return RequestError(rpc_code, message, data)
+
+
+class AcpSink:
     """每轮独立的事件出口：持有解释器并发送 ACP 更新。失败由 RunOutcome 表达。"""
 
     __slots__ = ("_conn", "_session_id", "_interpreter")
 
-    def __init__(self, conn: Any, session_id: str, interpreter: AguiEventInterpreter) -> None:
+    def __init__(self, conn: Any, session_id: str) -> None:
         self._conn = conn
         self._session_id = session_id
-        self._interpreter = interpreter
+        self._interpreter = AguiEventInterpreter()
 
     async def send(self, payload: dict[str, Any]) -> None:
         """将 AG-UI 事件转换为 ACP 消息并逐条发送 ``session/update``。"""
@@ -475,21 +472,29 @@ class _AcpSink:
 
 
 class AcpAdapter:
-    """ACP 协议翻译层；会话配置与运行状态由 RuntimeService 持有。"""
+    """ACP 协议翻译层（acp / acp-dsh 共用）；会话配置与运行状态由 RuntimePort 持有。"""
 
-    def __init__(self, *, service: RuntimeService) -> None:
+    def __init__(
+        self,
+        service: RuntimePort,
+        profile: AcpProfile = ACP,
+        *,
+        tool_factories: tuple[str, ...] = (),
+    ) -> None:
         self._service = service
-        # -s / --session：首个 session/new 使用它（之后的会话照常新建）。
+        self._profile = profile
+        #: 进程内注入工具（嵌入式接缝：入口脚本可传，不属于线上协议）。
+        self._tool_factories = tuple(tool_factories)
+        # -s / --session：首个未指定 sessionCode 的 session/new 使用它。
         self._default_session = service.defaults.session
         self._conn: Any = None
-        # Transport configuration is adapter-owned; each run gets a new HookTransport.
-        self._hooks = {}
 
     # ACP 生命周期。
 
     def on_connect(self, conn: Any) -> None:
         """SDK 在构造 ``AgentSideConnection`` 期间调用。保存连接，供 ``session/update`` 使用。"""
         self._conn = conn
+        attach_hook_channel(self._service.hooks, conn)
 
     async def initialize(
         self,
@@ -498,23 +503,21 @@ class AcpAdapter:
         client_info: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """声明最小 ACP 能力与扩展方法，不宣告未实现的会话加载或多媒体能力。
-
-        模型选择由会话配置管理，握手不提供独立的模型覆盖入口。
-        """
+        """声明 ACP 能力（含 session/close）与扩展方法，不宣告会话加载或多媒体能力。"""
         logger.info(f"initialize: client requested protocol_version={protocol_version!r}")
+        ext: dict[str, Any] = {"protocol": self._profile.name}
+        if self._profile.revision is not None:
+            ext["revision"] = self._profile.revision
+        ext["agentMethods"] = [f"_{EXT_RESUME}"]
+        ext["clientMethods"] = [f"_{EXT_HOOK}", f"_{EXT_HOOK_DEGRADED}"]
 
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_capabilities=AgentCapabilities(),
-            field_meta={
-                META_KEY: {
-                    "protocol": "acp",
-                    "agentMethods": [f"_{EXT_RESUME}"],
-                    "clientMethods": [f"_{EXT_HOOK}", f"_{EXT_HOOK_DEGRADED}"],
-                }
-            },
+            agent_capabilities=AgentCapabilities.model_validate({"sessionCapabilities": {"close": {}}}),
+            field_meta={META_KEY: ext},
         )
+
+    # 会话。
 
     @translate_runtime_fault
     async def new_session(
@@ -524,118 +527,130 @@ class AcpAdapter:
         mcp_servers: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """建立平台会话，sessionId 即 session_code。
+        """建立并装配平台会话，sessionId 即 session_code；装配失败回滚。
 
-        客户端提供的 cwd 仅作诊断记录，不参与工作区（工作区固定为进程 cwd）；
-        MCP 配置暂不支持，仅使用运行时已有配置。"""
-        session_code = self._default_session or new_session_code()
-        self._default_session = ""
+        客户端提供的 cwd 仅作诊断记录（工作区固定为进程 cwd）；MCP 配置暂不支持。
+        """
+        try:
+            meta = session_meta(kwargs)
+        except HeadlessError as exc:
+            raise _rpc_error(exc.code, exc.message, exc.detail) from exc
+        session_code = meta.get("sessionCode") or self._default_session or new_session_code()
+        if not meta.get("sessionCode"):
+            self._default_session = ""
         logger.info(f"new_session: cwd={cwd!r} session_id={session_code!r}")
-
-        meta = session_meta(kwargs)
-        options = session_options_from_meta(meta, session_code=session_code)
-        raw_hooks = meta.get("hooks")
-        self._hooks[session_code] = HookConfig.parse(raw_hooks) if raw_hooks is not None else None
-        await self._service.new_session(options)
-
+        if await self._service.session_info(session_code) is not None:
+            raise _rpc_error(PROTOCOL_INVALID_PARAMS, f"会话已存在：{session_code}", {"fields": ["sessionCode"]})
         if mcp_servers:
-            logger.info(
-                "new_session: client supplied mcp_servers ignored (minimal set; "
-                "honouring client-supplied MCP servers is a later-phase decision)"
-            )
+            logger.info("new_session: client supplied mcp_servers ignored")
+        try:
+            options = session_options_from_meta(meta, session_code=session_code, tool_factories=self._tool_factories)
+            if not options.agent_code and not await self._service.default_agent_code():
+                raise HeadlessError(PROTOCOL_INVALID_PARAMS, "缺少主 agent 配置", {"fields": ["agent"]})
+            await self._create(options)
+        except HeadlessError as exc:
+            raise _rpc_error(exc.code, exc.message, exc.detail) from exc
 
         return NewSessionResponse(session_id=session_code)
 
+    async def _create(self, options: SessionOptions) -> None:
+        try:
+            await self._service.new_session(options)
+            outcome = await self._service.prepare(options.session_code)
+            if not outcome.ok:
+                raise HeadlessError(AGENT_BUILD_FAILED, outcome.error_message or "装配失败")
+        except Exception:
+            await self._service.close(options.session_code)
+            raise
+
+    async def _require(self, session_id: str) -> AcpSink:
+        info = await self._service.session_info(session_id)
+        if info is None or info.closed:
+            raise _rpc_error(SESSION_NOT_FOUND, "未知或已关闭会话")
+        return AcpSink(self._conn, session_id)
+
+    # 轮次。
+
     @staticmethod
     def _prompt_response(outcome: RunOutcome) -> PromptResponse:
-        """统一转换终态与扩展元数据；失败由 SDK 转为 JSON-RPC error。"""
+        """``RunOutcome`` → prompt 响应；失败 / 被拒一律 JSON-RPC error（不得说成 end_turn）。"""
         if outcome.status in {"failed", "rejected"}:
-            raise RequestError(
-                -32603,
-                outcome.error_message or "the agent run failed",
-                {"code": outcome.error_code or "agent.internal_error", "message": outcome.error_message},
-            )
+            raise _rpc_error(outcome.error_code or AGENT_INTERNAL_ERROR, outcome.error_message or "执行失败")
         stop_reason = STOP_REASON_CANCELLED if outcome.status == "cancelled" else STOP_REASON_END_TURN
         return PromptResponse(stop_reason=stop_reason, field_meta={META_KEY: outcome_meta(outcome)})
 
     @translate_runtime_fault
     async def prompt(self, session_id: str, prompt: Any, **kwargs: Any) -> Any:
-        """驱动一轮并等待终态：文本输入压平，失败抛异常，中断以 end_turn 和元数据返回。"""
-        input_text = _text_of_content_blocks(prompt)
-        sink = _AcpSink(self._conn, session_id, AguiEventInterpreter())
-
-        handle = await self._service.start(
-            RunRequest(session_code=session_id, input=ChatInput(input_text)),
-            sink,
-            hooks=self._hooks.get(session_id),
-            hook_handler=HookTransport(self._conn, session_id),
+        """驱动一轮并等待终态：``_meta.aidev.messages`` 给出上下文时走 ContextInput。"""
+        sink = await self._require(session_id)
+        meta = kwargs.get(META_KEY) if isinstance(kwargs.get(META_KEY), dict) else {}
+        messages = meta.get("messages")
+        text = _text_of_content_blocks(prompt)
+        request = RunRequest(
+            session_code=session_id,
+            input=ContextInput(messages, text) if isinstance(messages, list) else ChatInput(text),
+            correlation_id=new_session_code(),
         )
-        outcome = await handle.result()
+        handle = await self._service.start(request, sink)
 
-        return self._prompt_response(outcome)
+        return self._prompt_response(await handle.result())
 
     @translate_runtime_fault
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """``_aidev/resume``：中断恢复 / 同一会话续轮（与 acp-dsh 同一扩展）。"""
+        """``_aidev/resume``：中断恢复 / 同一会话续轮。"""
         if method != EXT_RESUME:
             raise RequestError.method_not_found(f"_{method}")
         session_id = params.get("sessionId")
         if not isinstance(session_id, str) or not session_id:
-            raise RequestError(-32602, "sessionId is required", {"code": "protocol.invalid_params"})
-        sink = _AcpSink(self._conn, session_id, AguiEventInterpreter())
+            raise _rpc_error(PROTOCOL_INVALID_PARAMS, "缺少必填字段：sessionId", {"fields": ["sessionId"]})
+        sink = await self._require(session_id)
         payload = params.get("resume")
-        hooks = self._hooks.get(session_id)
-        transport = HookTransport(self._conn, session_id)
+        text = params.get("input") or ""
         if payload is None or isinstance(payload, dict) and "interruptId" not in payload:
-            handle = await self._service.start(
-                RunRequest(session_id, ChatInput(params.get("input") or (payload or {}).get("input", ""))),
-                sink,
-                hooks=hooks,
-                hook_handler=transport,
+            request = RunRequest(
+                session_id, ChatInput(text or (payload or {}).get("input", "")), correlation_id=new_session_code()
             )
+            handle = await self._service.start(request, sink)
         else:
-            handle = await self._service.resume(
-                ResumeRequest(session_id, ResumeInterrupt(payload, params.get("input") or "")),
-                sink,
-                hooks=hooks,
-                hook_handler=transport,
-            )
-        outcome = await handle.result()
-        response = self._prompt_response(outcome)
+            request = ResumeRequest(session_id, ResumeInterrupt(payload, text), correlation_id=new_session_code())
+            handle = await self._service.resume(request, sink)
+        response = self._prompt_response(await handle.result())
+
         return response.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
-        logger.info(f"acp: ignoring extension notification _{method}")
+        logger.info(f"{self._profile.name}: ignoring extension notification _{method}")
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         """只取消目标会话；未知或已落定会话是合法 no-op。"""
         outcome = await self._service.cancel(session_id)
-
         if not outcome.cancelled:
             logger.info(f"cancel: no active run for session_id={session_id!r} (no-op)")
-
             return
-
         logger.info(f"cancel: requested for session_id={session_id!r} ({len(outcome.run_ids)} run(s))")
 
+    async def close_session(self, session_id: str, **kwargs: Any) -> Any:
+        """幂等：关闭未知 / 已关会话也是成功。"""
+        if await self._service.session_info(session_id) is not None:
+            if self._service.has_live_runs(session_id):
+                await self._service.cancel(session_id)
+            await self._service.close(session_id)
+        return CloseSessionResponse()
+
     async def load_session(self, *args: Any, **kwargs: Any) -> None:
-        """**不实现**：本期不宣告 ``loadSession`` 能力，SDK 不会调用本方法。"""
-        raise NotImplementedError("loadSession is not implemented (minimal ACP set)")
+        """**不实现**：不宣告 ``loadSession`` 能力，SDK 不会调用本方法。"""
+        raise NotImplementedError("loadSession is not implemented")
 
 
-class _StdioTransport:
-    """通过公共行读写组件传输 NDJSON，阻塞 I/O 不占用事件循环。
+class AcpTransport:
+    """在入口给定的协议通道上收发 JSON-RPC 帧，坏帧跳过。
 
-    协议输出流由调用方显式传入，不依赖全局 stdout；支持普通文件，坏帧跳过。
-    EOF 后等待已接收请求的响应及输出静默窗口，硬上限防止退出无限阻塞。"""
+    EOF 后等待已接收请求的响应及输出静默窗口，硬上限防止退出无限阻塞。
+    """
 
-    def __init__(self, stdout: Any, limit: int = 10 * 1024 * 1024) -> None:
+    def __init__(self, channel: ProtocolChannel) -> None:
         self._loop = asyncio.get_running_loop()
-        self._reader = LineReader(
-            sys.stdin.buffer, limit=limit, on_oversized=lambda: logger.info("acp: oversized frame dropped")
-        )
-        self._writer = LineWriter(stdout)
-        self._writer_started = False
+        self._channel = channel
         self._closed = False
         # 只跟踪协议请求 ID，不复制 runtime 的运行状态。
         self._pending_requests: set[str | int] = set()
@@ -647,7 +662,7 @@ class _StdioTransport:
         while self._loop.time() < deadline:
             if (
                 self._closed
-                or self._writer.stopped.is_set()
+                or self._channel.stopped.is_set()
                 or (not self._pending_requests and self._loop.time() - self._last_activity >= EOF_QUIET_SECONDS)
             ):
                 return
@@ -658,12 +673,9 @@ class _StdioTransport:
         while True:
             if self._closed:
                 return None
-            if not self._writer_started:
-                await self._writer.start()
-                self._writer_started = True
-            raw = await until_stopped(self._reader.receive(), self._writer.stopped)
+            raw = await self._channel.receive()
             if raw is None:
-                if not self._writer.stopped.is_set():
+                if not self._channel.stopped.is_set():
                     await self._wait_for_quiet()
 
                 return None
@@ -691,12 +703,9 @@ class _StdioTransport:
         if self._closed:
             raise ConnectionError("protocol transport closed")
         data = json.dumps(message, separators=(",", ":")) + "\n"
-        if not self._writer_started:
-            await self._writer.start()
-            self._writer_started = True
-        if not await self._writer.write(data, wait_written=True):
-            if self._writer.failure is not None:
-                raise self._writer.failure
+        if not await self._channel.send(data, wait_written=True):
+            if self._channel.failure is not None:
+                raise self._channel.failure
             raise ConnectionError("protocol output disconnected")
         response_id = message.get("id")
         if "method" not in message and isinstance(response_id, (str, int)):
@@ -705,8 +714,7 @@ class _StdioTransport:
 
     async def close(self) -> None:
         self._closed = True
-        self._reader.close()
-        await self._writer.close()
+        await self._channel.close()
 
 
 async def _serve_until_signal(serving: Awaitable[Any]) -> None:
@@ -728,21 +736,36 @@ async def _serve_until_signal(serving: Awaitable[Any]) -> None:
         server.result()
 
 
-async def run_acp_server(service: RuntimeService, *, handle_signals: bool = False) -> int:
-    """使用独立协议流运行服务，保留 stdout guard；退出时始终关闭 runtime。"""
-    adapter = AcpAdapter(service=service)
-
+async def run_acp_server(
+    service: RuntimePort,
+    channel: ProtocolChannel,
+    *,
+    profile: AcpProfile = ACP,
+    tool_factories: tuple[str, ...] = (),
+    handle_signals: bool = False,
+) -> int:
+    """在入口给定的协议通道上运行服务；退出时始终关闭 runtime。"""
+    adapter = AcpAdapter(service, profile, tool_factories=tool_factories)
+    serving = run_agent(adapter, AcpTransport(channel))
     try:
         if handle_signals:
-            await _serve_until_signal(run_agent(adapter, _StdioTransport(protocol_out())))
+            await _serve_until_signal(serving)
         else:
-            await run_agent(adapter, _StdioTransport(protocol_out()))
+            await serving
     finally:
-        await service.close_all("acp eof")
+        await service.close_all(f"{profile.name} eof")
 
     return 0
 
 
-def run_acp(service: RuntimeService) -> int:
-    """ACP 协议入口（``__main__`` 组装好 service 后调用）。"""
-    return asyncio.run(run_acp_server(service, handle_signals=True))
+def run_acp(
+    service: RuntimePort,
+    channel: ProtocolChannel,
+    *,
+    profile: AcpProfile = ACP,
+    tool_factories: tuple[str, ...] = (),
+) -> int:
+    """ACP 协议入口（``__main__`` 组装好 service 与协议通道后调用；仓外入口可注入进程内工具）。"""
+    return asyncio.run(
+        run_acp_server(service, channel, profile=profile, tool_factories=tool_factories, handle_signals=True)
+    )

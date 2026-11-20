@@ -1,68 +1,59 @@
 # -*- coding: utf-8 -*-
-"""Process authentication and platform application configuration.
+"""进程级用户身份。
 
-AuthManager owns user identity; ProcessConfig resolves application credentials
-and launch defaults. Successful login/logout increments identity revision.
-
-RuntimeService captures identity per admission; Sessions do not subscribe or hold clients.
-Interactive login persists the token; ACP startup identity is memory-only. Values are never logged.
+AuthManager 持有 ``bkai_tui.json`` 的 :class:`BkAiConfig`，身份即其 ``auth`` 段；成功的
+login / logout 递增身份版本号。RuntimeService 在每次 admission 捕获身份快照，Session 不订阅。
+交互式登录落盘；ACP 启动身份只在内存生效。取值永不记日志。
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
 from logging import getLogger
 
-from .contracts import LaunchOptions
-from .models import IdentitySnapshot
-from ..infrastructure.environment import get_credentials
-from ..infrastructure.settings import TuiConfig
-from ..resources.local_config import LocalDeclarations
+from ..utils.runs import IdentitySnapshot
+from .settings import BkAiConfig
 
 logger = getLogger(__name__)
 
 
 class AuthManager:
-    """进程级用户身份。
+    """进程级用户身份，取自（并写回）给定的 :class:`BkAiConfig`。"""
 
-    :param access_token: 显式 token（如 acp 启动参数）；``None`` 时从 ``bkai_tui.json`` 读回。
-    :param username: 显式用户名；``None`` 时每次从 ``bkai_tui.json`` 现读（用户可能在外部编辑）。
-    """
-
-    def __init__(self, *, access_token: str | None = None, username: str | None = None) -> None:
-        self._access_token = TuiConfig.read().access_token if access_token is None else access_token
-        self._username = username
+    def __init__(self, config: BkAiConfig) -> None:
+        self._config = config
         self.revision = 0
         self._last_username = self.username
 
     @property
     def access_token(self) -> str:
-        return self._access_token
+        return self._config.auth.get("access_token", "")
 
     @property
     def username(self) -> str:
-        return self._username if self._username is not None else TuiConfig.read().username
+        return self._config.auth.get("username", "")
 
-    def snapshot(self):
+    def snapshot(self) -> IdentitySnapshot:
+        """当前身份；用户名与上次快照不同（配置被改写）时递增版本号。"""
         username = self.username
         if username != self._last_username:
             self._last_username = username
             self.revision += 1
-        return IdentitySnapshot(username, self._access_token, self.revision)
+        return IdentitySnapshot(username, self.access_token, self.revision)
 
     def has_token(self) -> bool:
-        return bool(self._access_token)
+        return bool(self.access_token)
 
     def login(self, token: str, *, persist: bool = True) -> None:
         """替换 token。``persist`` 时先落盘、成功后才更新内存（两者不分叉）。
 
         token 在此不做校验：无效 token 会在下一轮作为平台自身的错误暴露。
         """
+        token = token or ""
         if persist:
-            TuiConfig().write_access_token(token)
-        self._access_token = token or ""
-        logger.info(f"access token {'set' if self._access_token else 'cleared'} (persist={persist})")
+            self._config.write(["auth", "access_token"], token)
+        else:
+            self._config.auth["access_token"] = token
+        logger.info(f"access token {'set' if token else 'cleared'} (persist={persist})")
         self.revision += 1
 
     def logout(self, *, persist: bool = True) -> None:
@@ -70,28 +61,4 @@ class AuthManager:
         self.login("", persist=persist)
 
 
-@dataclass
-class ProcessConfig:
-    """进程级配置。``env`` 是 ``bkai_tui.json`` 的 ``env`` 段（入口启动时已发布到进程环境）。"""
-
-    env: dict[str, str] = field(default_factory=dict)
-    defaults: LaunchOptions = field(default_factory=LaunchOptions)
-
-    def credentials(self) -> dict[str, str]:
-        """平台应用凭据；只返回真正解析到值的键。从不记日志。"""
-        return get_credentials(self.env)
-
-    def default_agent_code(self) -> str:
-        """进程级入口 agent_code：用户显式 export 的环境变量优先，其次 ``bkai_tui.json``。"""
-        env_value = os.environ.get(LocalDeclarations.AGENT_CODE_ENV, "").strip()
-        if env_value:
-            return env_value
-
-        return TuiConfig.read().agent_code
-
-    def write_agent_code(self, agent_code: str) -> None:
-        """切换主 Agent（写 ``bkai_tui.json`` 的 ``agent_code``）。"""
-        TuiConfig().write_agent_code(agent_code)
-
-
-__all__ = ["AuthManager", "ProcessConfig"]
+__all__ = ["AuthManager"]

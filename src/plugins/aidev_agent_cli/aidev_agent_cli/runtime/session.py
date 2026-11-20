@@ -6,19 +6,22 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from .contracts import SessionOptions, new_session_code
-from .errors import RuntimeFault
-from .history import LocalHistory
+from ..utils.runs import SessionInfo, SessionOptions, SessionState, new_session_code
+from ..utils.errors import RuntimeFault
+from ..utils.history import LocalHistory
 
 
 @dataclass
 class Session:
     options: SessionOptions
     revision: int = 0
-    records: list[dict[str, Any]] = field(default_factory=list)
-    pending: list[dict[str, Any]] = field(default_factory=list)
-    turn_count: int = 0
+    #: 最近一次提交的跨轮状态（失败 / 取消的轮次不会改动它）。
+    state: SessionState = field(default_factory=SessionState)
     closed: bool = False
+
+    @property
+    def pending(self) -> list[dict[str, Any]]:
+        return self.state.interrupts
 
     @property
     def session_code(self) -> str:
@@ -31,20 +34,10 @@ class Session:
     def close(self) -> None:
         self.closed = True
 
-@dataclass(frozen=True)
-class SessionInfo:
-    session_code: str
-    created_at: str
-    closed: bool
-    revision: int
-
-    def record(self) -> dict[str, str]:
-        return {"sessionCode": self.session_code, "createdAt": self.created_at}
-
-
 class SessionRegistry:
-    def __init__(self, defaults):
+    def __init__(self, defaults, state_file: str):
         self._defaults = defaults
+        self._state_file = state_file
         self._sessions: dict[str, Session] = {}
         self._created: dict[str, str] = {}
         self._latest: str | None = None
@@ -61,17 +54,12 @@ class SessionRegistry:
             resources=options.resources or self._defaults.resources,
             model=options.model or self._defaults.model,
         )
-        history = LocalHistory()
+        history = LocalHistory(self._state_file)
         try:
-            state = history.load(options.session_code)
+            state = SessionState.from_dict(history.load(options.session_code))
         finally:
             history.close()
-        session = Session(
-            options,
-            records=state.get("records", []),
-            pending=state.get("interrupts", []),
-            turn_count=state.get("turn_count", 0),
-        )
+        session = Session(options, state=state)
         self._sessions[options.session_code] = session
         self._created[options.session_code] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._latest = options.session_code

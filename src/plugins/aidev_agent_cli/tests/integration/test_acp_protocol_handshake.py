@@ -127,15 +127,17 @@ class AcpSession:
             self.process.wait(timeout=10)
 
 
-def _env(tmp_path: Path, **extra: str) -> dict[str, str]:
+def _env(tmp_path: Path, access_token: str = "", **extra: str) -> dict[str, str]:
     env = dict(os.environ)
     env["MESSAGE_HANDLER_TYPE"] = "inmemory"
     env["PYTHONPATH"] = os.pathsep.join([str(PLUGIN_ROOT), str(AGENT_ROOT), env.get("PYTHONPATH", "")])
     env["AGENT_TUI_TUI_CONFIG_FILE"] = str(tmp_path / "bkai_tui.json")
+    if access_token:
+        (tmp_path / "bkai_tui.json").write_text(json.dumps({"auth": {"access_token": access_token}}), encoding="utf-8")
     env["BKAI_TUI_LOG_PATH"] = str(tmp_path / "worker.log")
     env["BKAI_TUI_CHECKPOINT_FILE"] = str(tmp_path / "ckpt.sqlite")
     # 不继承开发机的登录态 / 项目目录：用例必须自洽。
-    for key in ("AGENT_TUI_CWD", "BKAI_TUI_ACCESS_TOKEN", "AGENT_TUI_AGENT_CODE"):
+    for key in ("AGENT_TUI_CWD", "AGENT_TUI_AGENT_CODE"):
         env.pop(key, None)
     # 平台地址指向一个必然连不上的回环端口：**不触达真实平台**，且失败很快。
     env["BKPAAS_APP_CODE"] = "acp-test-app"
@@ -200,7 +202,7 @@ def _initialize(server: AcpSession, request_id: Any = 1) -> dict[str, Any]:
 @pytest.mark.slow
 def test_handshake_advertises_protocol_one_and_no_unimplemented_capability(acp_server: Any) -> None:
     """``initialize`` 必须如实：protocolVersion 1，未实现能力全 false。"""
-    server = acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = acp_server(access_token="dummy-token")
 
     response = _initialize(server)
 
@@ -221,7 +223,7 @@ def test_handshake_advertises_protocol_one_and_no_unimplemented_capability(acp_s
 
 
 @pytest.mark.slow
-def test_two_sessions_keep_their_own_cwd_without_touching_the_process_env(acp_server: Any, tmp_path: Path) -> None:
+def test_two_sessions_keep_their_own_cwd_without_touching_the_process_env(fake_acp_server: Any, tmp_path: Path) -> None:
     """两个不同 cwd 的会话并存，sessionId 互不相同，cwd 仅作诊断记录。
 
     工作区根固定为进程 cwd：客户端 cwd 不再写入 ``SessionOptions`` / 进程环境变量，
@@ -231,11 +233,11 @@ def test_two_sessions_keep_their_own_cwd_without_touching_the_process_env(acp_se
     first.mkdir()
     second.mkdir()
 
-    server = acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = fake_acp_server(access_token="dummy-token")
     _initialize(server)
 
-    one = server.call(2, "session/new", {"cwd": str(first), "mcpServers": []})
-    two = server.call(3, "session/new", {"cwd": str(second), "mcpServers": []})
+    one = server.call(2, "session/new", {"cwd": str(first), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
+    two = server.call(3, "session/new", {"cwd": str(second), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
 
     assert "error" not in one, one
     assert "error" not in two, two
@@ -252,17 +254,17 @@ def test_two_sessions_keep_their_own_cwd_without_touching_the_process_env(acp_se
 
 
 @pytest.mark.slow
-def test_a_session_cwd_does_not_overwrite_the_process_default(acp_server: Any, tmp_path: Path) -> None:
+def test_a_session_cwd_does_not_overwrite_the_process_default(fake_acp_server: Any, tmp_path: Path) -> None:
     """进程级初值是 one；第二个会话显式给 two。cwd 现在只记录、不写 env、不影响工作区。"""
     first = tmp_path / "one"
     second = tmp_path / "two"
     first.mkdir()
     second.mkdir()
 
-    server = acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token", AGENT_TUI_CWD=str(first))
+    server = fake_acp_server(access_token="dummy-token", AGENT_TUI_CWD=str(first))
     _initialize(server)
-    one = server.call(2, "session/new", {"cwd": str(first), "mcpServers": []})
-    two = server.call(3, "session/new", {"cwd": str(second), "mcpServers": []})
+    one = server.call(2, "session/new", {"cwd": str(first), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
+    two = server.call(3, "session/new", {"cwd": str(second), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
 
     assert "error" not in one and "error" not in two
 
@@ -277,20 +279,25 @@ def test_a_session_cwd_does_not_overwrite_the_process_default(acp_server: Any, t
 
 
 @pytest.mark.slow
-def test_a_failed_prompt_is_a_json_rpc_error_not_end_turn(acp_server: Any, tmp_path: Path) -> None:
-    """**B3 回归（线上）**：无可用平台时 ``session/prompt`` 必须回 error 响应。
+def test_a_failed_build_is_a_json_rpc_error_and_the_session_is_unusable(acp_server: Any, tmp_path: Path) -> None:
+    """**B3 回归（线上）**：无可用平台时失败必须如实报成 error，不能被说成成功。
 
-    原实现把错误帧丢掉 → 客户端收到 ``stopReason: end_turn``，以为这轮成功了。
+    ``session/new`` 立即装配：装配失败回 ``agent.build_failed`` 并回滚，之后对该会话的
+    ``session/prompt`` 是 ``session.not_found``，进程继续服务。
     """
-    server = acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = acp_server(access_token="dummy-token")
     _initialize(server)
-    session_id = server.call(2, "session/new", {"cwd": str(tmp_path), "mcpServers": []})["result"]["sessionId"]
+    created = server.call(2, "session/new", {"cwd": str(tmp_path), "mcpServers": [], "_meta": {"aidev": {"sessionCode": "s-fail", "agent": "fake-entry-agent"}}})
 
-    response = server.call(3, "session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "hi"}]})
+    assert "result" not in created, created
+    assert created["error"]["data"]["code"] == "agent.build_failed"
 
-    assert "error" in response, f"失败轮必须是 error 响应，实际：{response}"
-    assert "result" not in response, "失败轮绝不能同时给出成功结果"
-    assert response["error"].get("message")
+    response = server.call(3, "session/prompt", {"sessionId": "s-fail", "prompt": [{"type": "text", "text": "hi"}]})
+    assert "result" not in response, "失败会话绝不能给出成功结果"
+    assert response["error"]["data"]["code"] == "session.not_found"
+
+    again = _initialize(server, request_id=99)
+    assert "error" not in again, again
 
 
 # ============================================================================
@@ -299,11 +306,11 @@ def test_a_failed_prompt_is_a_json_rpc_error_not_end_turn(acp_server: Any, tmp_p
 
 
 @pytest.mark.slow
-def test_cancel_for_an_unknown_session_keeps_the_process_serving(acp_server: Any, tmp_path: Path) -> None:
+def test_cancel_for_an_unknown_session_keeps_the_process_serving(fake_acp_server: Any, tmp_path: Path) -> None:
     """B1 的线上侧：取消未知会话是合法空操作，之后握手仍然正常。"""
-    server = acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = fake_acp_server(access_token="dummy-token")
     _initialize(server)
-    session_id = server.call(2, "session/new", {"cwd": str(tmp_path), "mcpServers": []})["result"]["sessionId"]
+    session_id = server.call(2, "session/new", {"cwd": str(tmp_path), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})["result"]["sessionId"]
 
     server.request(3, "session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": "slow"}]})
     server.notify("session/cancel", {"sessionId": "no-such-session"})
@@ -314,11 +321,8 @@ def test_cancel_for_an_unknown_session_keeps_the_process_serving(acp_server: Any
         if message.get("id") == 3:
             response = message
             break
-    # 这一轮要么被取消（cancelled）要么失败（error）——都必须是**明确结局**。
-    if "result" in response:
-        assert response["result"]["stopReason"] == "cancelled"
-    else:
-        assert "error" in response
+    # 取消别的（未知）会话不得波及本轮：本轮照常结束。
+    assert response["result"]["stopReason"] == "end_turn", response
 
     again = _initialize(server, request_id=99)
     assert "error" not in again, again
@@ -330,16 +334,16 @@ def test_cancel_for_an_unknown_session_keeps_the_process_serving(acp_server: Any
 
 
 @pytest.mark.slow
-def test_eof_exits_zero_runs_close_all_and_releases_the_saver(acp_server: Any, tmp_path: Path) -> None:
+def test_eof_exits_zero_runs_close_all_and_releases_the_saver(fake_acp_server: Any, tmp_path: Path) -> None:
     """**B4 回归**：stdin 关闭后进程 0 退出、日志有 ``close_all``、sqlite 可再次打开。
 
     原入口 ``await run_agent(adapter)`` 之后直接 ``return 0``：不关 session、不关
     owned saver、不 flush。连接仍占着 sqlite 文件就是它的可观测形态。
     """
     checkpoint_file = tmp_path / "ckpt.sqlite"
-    server = acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = fake_acp_server(access_token="dummy-token")
     _initialize(server)
-    server.call(2, "session/new", {"cwd": str(tmp_path), "mcpServers": []})
+    server.call(2, "session/new", {"cwd": str(tmp_path), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
 
     server.close_stdin()
     assert server.wait() == 0
@@ -359,24 +363,6 @@ def test_eof_exits_zero_runs_close_all_and_releases_the_saver(acp_server: Any, t
 # ============================================================================
 # 6. 启动失败不污染 fd 1
 # ============================================================================
-
-
-@pytest.mark.slow
-def test_a_missing_token_exits_non_zero_with_an_empty_stdout(tmp_path: Path) -> None:
-    """init 阶段失败不得在协议流上留下半帧——stdout 必须完全为空。"""
-    result = subprocess.run(
-        [PYTHON, "-u", "-m", "aidev_agent_cli", "--protocol", "acp", "--resources", "platform"],
-        input="",
-        capture_output=True,
-        text=True,
-        timeout=90,
-        cwd=str(AGENT_ROOT),
-        env=_env(tmp_path),
-    )
-
-    assert result.returncode != 0
-    assert result.stdout == "", f"stdout 必须为空，实际：{result.stdout!r}"
-    assert "BKAI_TUI_ACCESS_TOKEN" in result.stderr
 
 
 def test_the_adapter_does_not_take_a_single_shared_value_sink() -> None:
@@ -401,8 +387,8 @@ def test_the_adapter_does_not_take_a_single_shared_value_sink() -> None:
         and node.targets[0].value.id == "self"
     }
 
-    # adapter 只持连接、共享 service、默认会话与 hook 通道，不缓存工作区。
-    assert assigned == {"_conn", "_service", "_default_session", "_hooks"}, assigned
+    # adapter 只持连接、共享 service 与默认会话；hook 是 service 的进程级依赖，不缓存工作区。
+    assert assigned == {"_conn", "_service", "_profile", "_tool_factories", "_default_session"}, assigned
     attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     for forbidden in ("_runner", "_agui", "_runs", "_cancelled", "_writers", "_workspace_roots"):
         assert forbidden not in attributes, forbidden
@@ -506,12 +492,12 @@ def test_cancel_ends_a_waiting_prompt_as_cancelled_and_leaves_the_other_session_
     session_a_dir.mkdir()
     session_b_dir.mkdir()
 
-    server = fake_acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = fake_acp_server(access_token="dummy-token")
 
     _initialize(server)
 
-    session_a = server.call(2, "session/new", {"cwd": str(session_a_dir), "mcpServers": []})["result"]["sessionId"]
-    session_b = server.call(3, "session/new", {"cwd": str(session_b_dir), "mcpServers": []})["result"]["sessionId"]
+    session_a = server.call(2, "session/new", {"cwd": str(session_a_dir), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})["result"]["sessionId"]
+    session_b = server.call(3, "session/new", {"cwd": str(session_b_dir), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})["result"]["sessionId"]
     assert session_a != session_b
 
     # --- A：慢轮。先确认它真的产出了内容，再取消（否则可能在「已取消」之后才启动） ---
@@ -585,11 +571,11 @@ def test_the_fake_backend_keeps_both_sessions_agent_codes_apart(fake_acp_server:
     first.mkdir()
     second.mkdir()
 
-    server = fake_acp_server(BKAI_TUI_ACCESS_TOKEN="dummy-token")
+    server = fake_acp_server(access_token="dummy-token")
 
     _initialize(server)
-    one = server.call(2, "session/new", {"cwd": str(first), "mcpServers": []})
-    two = server.call(3, "session/new", {"cwd": str(second), "mcpServers": []})
+    one = server.call(2, "session/new", {"cwd": str(first), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
+    two = server.call(3, "session/new", {"cwd": str(second), "mcpServers": [], "_meta": {"aidev": {"agent": "fake-entry-agent"}}})
 
     assert "error" not in one and "error" not in two
     assert one["result"]["sessionId"] != two["result"]["sessionId"]

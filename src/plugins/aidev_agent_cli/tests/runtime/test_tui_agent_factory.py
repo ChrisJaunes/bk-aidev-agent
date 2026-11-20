@@ -1,4 +1,4 @@
-"""``WorkspaceAgent`` 的本地文件 runtime 启用（``runtime.sdk.workspace``，261015）。
+"""``WorkspaceAgent`` 的本地文件 runtime 启用（``sdk.workspace``，261015）。
 
 真实组件：``AgentExecutorKwargs`` / ``RuntimeBackendResolver`` / ``FilesystemBackend``
 用真的——断言对象正是"SDK 那几个组件被正确地组合"。替身只有 ``ReActAgentBuilder``
@@ -18,7 +18,7 @@ from aidev_agent.core.tools.runtime_tools.local_backend import FilesystemBackend
 from aidev_agent.pydantic_models import AgentExecutorKwargs
 from aidev_agent.services.common_agent import CommonQAAgent
 
-import aidev_agent_cli.runtime.sdk.workspace as agent_factory
+import aidev_agent_cli.sdk.workspace as agent_factory
 
 
 class _RecordingBuilder:

@@ -8,7 +8,7 @@
 三种运行面同处一个包：**嵌入式会话**不做任何平台调用，**TUI / AG-UI 进程**与 **ACP 服务端**
 在平台支持下运行。它们都用 stdin/stdout 上的 NDJSON / JSON-RPC，诊断一律走 stderr；
 TUI 不再需要单独的 Python `worker` 包。包内模块按**职责**分 4 层
-（`runtime` / `adapters` / `resources` / `infrastructure`，见「目录结构」）。
+（`runtime` / `adapters` / `resources` / `hooks` / `sdk`，另有叶子 `utils` 与端口 `infrastructure`，见「目录结构」）。
 
 ## 安装
 
@@ -47,7 +47,7 @@ MESSAGE_HANDLER_TYPE=inmemory python -u -m aidev_agent_cli
 python -u -m aidev_agent_cli --protocol tui
 
 # ACP 服务端：JSON-RPC over stdio（见 docs/acp-integration.md）
-BKAI_TUI_ACCESS_TOKEN=... python -u -m aidev_agent_cli --protocol acp --resources platform
+python -u -m aidev_agent_cli --protocol acp --resources platform  # token 取自 bkai_tui.json
 ```
 
 `--protocol` 取 `acp-dsh`（默认）/ `agui` / `tui` / `acp`；**`tui` 是 `agui` 的别名**（现网 TUI 注册命令在用）。
@@ -92,43 +92,47 @@ worker 自行打开 checkpoint 与本地历史 SQLite。`BKAI_TUI_CHECKPOINT_FIL
 aidev_agent_cli/
 ├── __init__.py            # 轻量：__version__ / __author__ / main() / serve()（全部延迟导入）
 ├── __main__.py            # 唯一命令入口 + composition root（argv → adapter × resources × runtime）
-├── runtime/               # 三协议共用的进程隔离运行时
-│   ├── contracts.py       # 请求、终态、取消与 shield 结果句柄
-│   ├── service.py         # RuntimeService：create/start/resume/cancel/close/close_all + session→run 索引
-│   ├── session.py         # 父进程跨轮 Session 配置与资源视图
-│   ├── sessions.py        # 具体 SessionRegistry（查询不创建）
-│   ├── run.py             # 单轮 worker / sink / typed 快照所有权
-│   ├── runs.py            # FIFO scheduler、busy、queued cancel 与收尾
-│   ├── runner.py          # SDKRunner：spawn 与 join 后唯一终态
-│   ├── worker.py          # 显式 IPC、合作取消、terminate/kill/join
-│   ├── boundary.py        # IPC 纯常量（帧上限、取消宽限、回调清理）
-│   ├── models.py          # 纯值对象：快照 / hook 请求回复 / event_payload（无 SDK）
-│   ├── terminal.py        # 唯一的 parent→SDK 边：AG-UI 终止事件 builder
-│   ├── sdk/               # worker 侧 SDK 执行边界（父进程只用 models）
-│   │   ├── __init__.py    # 薄导出面：`aidev_agent_cli.runtime.sdk:build` import target
-│   │   ├── executor.py    # SDKExecutor / build：顶部 SDK 依赖 + install_worker_startup
-│   │   └── session.py     # worker 独立 SDK 轮次状态
-│   ├── history.py         # SQLite 历史、pending、memo 与运行事实
+├── runtime/               # 三协议共用的进程隔离运行时；**跨轮状态的唯一所有者**
+│   ├── service.py         # RuntimeService：admission（含 pending 中断校验）、快照、session→run 索引
+│   ├── session.py         # 父进程 Session（持有已提交的 SessionState）+ SessionRegistry
+│   ├── runs.py            # RunQueue + execute_turn：spawn、join、按结局提交或整体回滚会话状态
+│   ├── worker.py          # ProcessWorker + SDK_ENTRY：显式 IPC、取消/构建超时、启动纪律
+│   ├── storage.py         # history / checkpoint 文件位置（默认 ~/.bkai，可经环境变量覆盖）
+│   ├── process_config.py  # 进程级配置聚合（本地配置 / 智能体 / 启动选项 / AuthManager）
+│   ├── settings.py        # bkai_tui.json
+│   └── models.py          # 快照值对象（无 SDK）
+├── bootstrap/             # 进程启动纪律：装载 SDK 之前完成（startup / network_guard / open_telemetry），入口与 worker 共用
+├── sdk/                   # worker 侧：**单轮**组装 aidev_agent 并合并本轮产物（不持久化、不跨轮）
+│   ├── executor.py        # AgentRun（单轮组装、执行与状态合并）+ import target：快照 → AgentSpec，返回 {outcome, state}
+│   ├── spec.py            # AgentSpec（组装配置，全部由上层传入）与 TurnPorts（取消 / hook / 构建阶段）
+│   ├── factory.py         # SDK agent 工厂接线
+│   ├── checkpoints.py     # 按给定路径打开的 SQLite saver
 │   ├── events.py          # AG-UI 事件观察与账本
-│   ├── interrupts.py      # 本地 pending 校验 / hook 问答恢复
-│   └── hooks.py           # 宿主 hook bus / 关联 / 超时 / ask 重放
-│       （events / interrupts / hooks 属 worker 侧，父进程不得模块级引用）
+│   ├── interrupts.py      # 中断归一与恢复输入
+│   ├── hooks.py           # 宿主 hook bus / 关联 / 超时 / ask 重放
+│   └── workspace.py       # 工作区 agent 注入
 ├── adapters/              # 线上协议（只做协议翻译，不持第二份运行状态）
 │   ├── agui.py            # 版本化 NDJSON 12 方法路由 + started/event/completed/result/error 信封
-│   ├── acp.py             # ACP 服务端 + AG-UI→ACP 解释器
-│   └── acp_dsh.py         # acp-dsh：ACP + _aidev/* 扩展，注入式后端（dsh 宿主用）
+│   └── acp.py             # ACP 服务端 + AG-UI→ACP 解释器；acp / acp-dsh 以 AcpProfile 区分
 ├── resources/             # 资源策略（平台 / 注入式，两者的执行实现刻意不合并）
 │   ├── platform.py        # 平台工厂、会话、配置/知识/审批/MCP 接线
 │   ├── injected.py        # 注入 LLM/工具 + 内存账本
 │   ├── local_config.py    # per-agent 声明 + 本地 MCP 声明与 mtime 缓存（叶子）
 │   ├── loaders.py         # loader 链（平台/本地/审批/知识/runtime 覆盖）
 │   └── workspace.py       # 工作区目录投影 + 本地文件 runtime 叠加
-└── infrastructure/        # 与业务无关的进程设施
-    ├── config.py          # 启动配置、凭据 bootstrap、ACP token 解析
-    ├── checkpointer.py    # 同步 SQLite + 异步皮
-    ├── errors.py          # 线上错误码（headless 信封码）；runtime 不 import
-    ├── network_guard.py   # 可选评测出网限制；默认关闭
-    └── logging.py         # BKAI 状态路径与文件/stderr 日志
+├── infrastructure/        # adapter 所见的运行时端口
+│   └── ports.py           # RuntimePort（实现是 runtime.service.RuntimeService）
+└── utils/                 # 叶子：通用工具与跨层值契约，只依赖标准库与自身
+    ├── logging.py         # BKAI 状态路径与文件/stderr 日志
+    ├── process.py         # 信号处理与守护线程执行器
+    ├── stdio.py           # stdout guard、协议流、sys.path 加固
+    ├── errors.py          # 错误码与结构化异常
+    ├── inputs.py / runs.py# typed 输入、请求 / 会话选项 / 终态值对象
+    ├── terminal.py        # 纯 stdlib AG-UI 终止事件 builder（runtime.runs 与 sdk.events 共用）
+    └── history.py         # SQLite 运行事实
+
+（另：adapters/streams.py 为宿主协议通道；runtime/settings.py 为 bkai_tui.json；
+bootstrap/{startup,network_guard,open_telemetry}.py 为装载 SDK 之前的启动纪律。）
 ```
 
 依赖方向由 **AST 脚本强制**（`tests/test_layer_graph.py`），不是口头约定：
@@ -139,9 +143,12 @@ aidev_agent_cli/
 | `adapters/*` → `runtime/*` + `resources/*` + `infrastructure/*` | 允许（adapter 必须能把「哪个策略」交给 `RuntimeService`，那是 composition 的一半） |
 | `runtime/*` → `resources/*`（只经 contracts 的窄接口）+ `infrastructure/*` | 允许；**禁止** `runtime → adapters` |
 | `resources/*` → `infrastructure/*` + `runtime/contracts`（仅类型） | 允许；**禁止** `resources → runtime.{service,session,runner}`（防环） |
-| `infrastructure/*` → 其他层 | **禁止** |
-| `runtime.models` / `runtime.boundary` | 叶子：只允许 stdlib + `contracts` / `inputs`；**不得**到达 `runtime.sdk` |
-| `runtime.terminal` | parent → SDK 的**唯一**有意边（AG-UI 终止事件 builder），只允许 `runner` 引用 |
+| `infrastructure/*` → 其他层（`utils` 除外） | **禁止** |
+| `sdk/*` → `runtime/*` | **禁止**（共用契约在 `utils`，worker 端点按结构协议注入，启动纪律只在 `runtime.worker`） |
+| `utils/*` → 任何其他层 | **禁止** |
+| 跨轮状态 / 持久化路径 | 只在 `runtime`：sdk 收快照里的 `state` 与 `checkpoint_path`，传回合并后的 `state`；失败 / 取消 / 强杀的轮次整体不提交 |
+| `runtime.models` | 叶子：只允许 stdlib + `contracts` / `inputs`；**不得**到达 `runtime.sdk` |
+| `utils.terminal` | 纯 stdlib 的 AG-UI 终止事件 builder，只允许 `runtime.runs` 与 `sdk.events` 引用 |
 
 新增两条更硬的断言：`aidev_agent_cli` 下**函数内 import 为零**（白名单只有 import-target
 边界、stdout guard 之前、可选依赖单点装载、脚本冷路径、re-export），以及核心层
@@ -198,13 +205,12 @@ close_all(reason) -> None                # 有界等待 → 取消 → 关 owned
 
 ## ACP token 与工作区隔离
 
-`BKAI_TUI_ACCESS_TOKEN`（env）> `~/.bkai/bkai_tui.json` 的 `auth.access_token`（文件），**env 优先**。
+所有协议同一条组装路径：身份只来自 `bkai_tui.json` 的 `auth.access_token`（三层合并后的结果），
+不读环境变量。
 
-- ACP 启动路径**从不写盘**：注入的 token 只更新内存并失效 manager，不覆盖交互式登录态
-  （`set_access_token(..., persist=False)`）。
-- token **不进日志、不进响应、不进异常**；日志只记来源（`env` / `file`）。
+- token **不进日志、不进响应、不进异常**。
 - **不接受 argv 传入**（`--token` 不存在）：进程列表对同机用户可读。
-- 两者都空时在**任何连接绑定之前**失败：非零退出 + stderr 一句话，stdout 保持为空。
+- 缺 token 不在启动期拦截，由首次平台调用报错（作为该轮的 JSON-RPC error 返回）。
 
 工作区隔离：`--resources platform` 下 `cwd` 是 **per-session** 的会话选项，ACP 的 `session/new`
 **不再写** `os.environ["AGENT_TUI_CWD"]`（那是全进程的，第二个会话会污染第一个）。
@@ -229,9 +235,10 @@ printf '{"id":"shutdown","method":"process.shutdown","params":{}}\n' \
 期望：`ready` → `result`，退出码 0。stdin EOF 会取消活跃 run 并关闭 writer 与
 checkpoint saver；SIGTERM 走同一关闭路径。进程**从不监听端口，也不是守护进程**。
 
-TUI 配置仍在 `~/.bkai/bkai_tui.json`，工作区覆盖在 `<AGENT_TUI_CWD>/.bkai/`；
+TUI 配置 `bkai_tui.json` 三层深度合并（低 → 高）：`~/.bkai/` → `<AGENT_TUI_CWD>/.bkai/` →
+`$AGENT_TUI_TUI_CONFIG_FILE`；写入落到存在的最高一层（都不存在时为用户层）。
 per-agent 声明与 MCP 合并语义不变。`AGENT_TUI_CWD` 仍是用户工作区，不是 Python 模块目录。
-认证持久化仍由 `TuiConfig` 决定：`auth.login` 写入配置的 auth state，`auth.logout` 清除它；
+认证持久化由 `BkAiConfig` 决定：`auth.login` 写入 `auth.access_token`，`auth.logout` 清除它；
 协议响应**从不回显凭据**（token 只进不出）。
 
 ## 运行期模型重试
@@ -292,7 +299,7 @@ SDK 通过 `[tool.uv.sources]` 以可编辑 path 源装进同一环境（`../../
 make init              # uv sync：dev 组含 checkpoint + 追踪 + ACP 依赖
 make test              # 全套（实测 641 例，不含 slow）
 make test markers=     # 含 slow
-make test path=tests/infrastructure/test_tui_checkpointer.py
+make test path=tests/runtime/test_tui_checkpointer.py
 bash tests/smoke_wheel.sh   # 装 wheel 后做真握手 / EOF 的端到端 smoke
 make build             # 本地构建 wheel，不发布
 ```
@@ -304,7 +311,7 @@ make build             # 本地构建 wheel，不发布
 「少收集却显示全绿」比报错更危险。
 
 测试目录**按职责镜像源码分层**：`tests/runtime` / `tests/adapters` / `tests/resources` /
-`tests/infrastructure` 放各层单元与契约用例，`tests/integration` 放跨层 E2E（T 系列 hook /
+`tests/utils` 放各层单元与契约用例，`tests/integration` 放跨层 E2E（T 系列 hook /
 生命周期 / 真子进程 JSON-RPC）及其共享驱动 helpers；`tests/test_layer_graph.py`、
 `test_entries.py`、`test_package.py` 与 `test_*_entry.py` 是横切的包 / 架构 / 入口 smoke。
 历史上按 UI 场景命名的 `test_tui_*` / `test_acp_*` 文件名保留不改，避免改动测试节点 ID。

@@ -1,22 +1,24 @@
 # -*- coding: utf-8 -*-
-"""headless 进程内测试驱动：复用 ``Dispatcher``，不需要真的起子进程。"""
+"""headless 进程内测试驱动：复用 ``AguiAdapter``，不需要真的起子进程。"""
 
 from __future__ import annotations
+
+import os
 
 import io
 import json
 import threading
 from typing import Any
 
-from tests.integration._driver import Dispatcher, Request
+from tests.integration._driver import AguiAdapter, Request
 
 
 class Harness:
-    """把 NDJSON 请求喂给 ``Dispatcher`` 并收集输出行。"""
+    """把 NDJSON 请求喂给 ``AguiAdapter`` 并收集输出行。"""
 
-    def __init__(self, *, dispatcher: Dispatcher | None = None):
+    def __init__(self, *, dispatcher: AguiAdapter | None = None):
         self.out = io.StringIO()
-        self.dispatcher = dispatcher or Dispatcher(stream=self.out)
+        self.dispatcher = dispatcher or AguiAdapter(stream=self.out)
         self._lock = threading.Lock()
         #: 已被 fake 宿主答复过的 hook 请求 id（跨 FakeHost 实例共享，避免重复处置）
         self.handled_hook_ids: set[str] = set()
@@ -65,9 +67,10 @@ class Harness:
         return response["error"]
 
     def records(self, session_code: str) -> list[dict]:
-        from aidev_agent_cli.runtime.history import LocalHistory
+        from aidev_agent_cli.utils.history import LocalHistory
+        from aidev_agent_cli.runtime.process_config import HISTORY_FILE_ENV
 
-        history = LocalHistory()
+        history = LocalHistory(os.environ[HISTORY_FILE_ENV])
         try:
             return history.load(session_code).get("records", [])
         finally:

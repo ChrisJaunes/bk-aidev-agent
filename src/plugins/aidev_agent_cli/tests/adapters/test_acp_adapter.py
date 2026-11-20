@@ -22,12 +22,13 @@ from acp.exceptions import RequestError
 
 from aidev_agent_cli.adapters.acp import (
     AcpAdapter,
+    AcpSink,
     AguiEventInterpreter,
-    _AcpSink,
     _text_of_content_blocks,
     _tool_kind,
 )
-from aidev_agent_cli.runtime.contracts import RunOutcome, SessionOptions
+from aidev_agent_cli.utils.runs import RunOutcome, SessionOptions
+from aidev_agent_cli.adapters.streams import ProtocolChannel
 from aidev_agent_cli.runtime.service import RuntimeService
 
 
@@ -85,18 +86,18 @@ class _StubRunner:
         self.closed.append(backend)
 
     async def execute(self, *, handle: Any, snapshot: Any, sink: Any, session: Any, **kwargs) -> RunOutcome:
-        plan = self._plans.get(snapshot.session.session_code, {})
+        plan = self._plans.get(snapshot.agent.session_code, {})
         for payload, delay in plan.get("events", []):
             if delay:
                 await asyncio.sleep(delay)
             if handle.token.is_cancelled():
-                return RunOutcome(status="cancelled", run_id=handle.run_id, session_code=snapshot.session.session_code)
+                return RunOutcome(status="cancelled", run_id=handle.run_id, session_code=snapshot.agent.session_code)
             await sink.send(payload)
 
         return RunOutcome(
             status=plan.get("status", "finished"),
             run_id=handle.run_id,
-            session_code=snapshot.session.session_code,
+            session_code=snapshot.agent.session_code,
             error_code=plan.get("error_code", ""),
             error_message=plan.get("error_message", ""),
         )
@@ -125,7 +126,7 @@ async def _adapter(
     """
     strategy = _StubRunner(plans or {})
     service = RuntimeService()
-    service._scheduler._runner = strategy
+    service._queue._execute = strategy.execute
     original_create = service.new_session
 
     async def create(options=None, **kwargs):
@@ -170,7 +171,7 @@ async def test_new_session_maps_acp_session_id_to_the_platform_session_code() ->
     """``sessionId`` 就是平台 ``session_code``——不另立第二个 id 需要同步。"""
     adapter, _conn, strategy, service = await _adapter()
 
-    response = await adapter.new_session(cwd="")
+    response = await adapter.new_session(cwd="", aidev={"agent": "ok"})
 
     assert response.session_id
     assert (await service.session_info(response.session_id)) is not None
@@ -190,8 +191,8 @@ async def test_two_sessions_are_isolated_by_session_code_not_cwd(
     second.mkdir()
 
     adapter, _conn, strategy, _service = await _adapter()
-    one = await adapter.new_session(cwd=str(first))
-    two = await adapter.new_session(cwd=str(second))
+    one = await adapter.new_session(cwd=str(first), aidev={"agent": "ok"})
+    two = await adapter.new_session(cwd=str(second), aidev={"agent": "ok"})
 
     assert one.session_id != two.session_id
     assert [options.session_code for options in strategy.opened] == [one.session_id, two.session_id]
@@ -204,7 +205,7 @@ async def test_a_missing_cwd_is_still_accepted() -> None:
     """不存在的 cwd 只是被记录：不再校验目录、也不影响工作区（固定为进程 cwd）。"""
     adapter, _conn, strategy, _service = await _adapter()
 
-    response = await adapter.new_session(cwd="/definitely/not/a/directory")
+    response = await adapter.new_session(cwd="/definitely/not/a/directory", aidev={"agent": "ok"})
 
     assert [options.session_code for options in strategy.opened] == [response.session_id]
     assert not hasattr(strategy.opened[0], "workspace_root")
@@ -244,7 +245,7 @@ async def test_a_rejected_turn_also_raises() -> None:
     adapter, _conn, _strategy, _service = await _adapter(
         {"s1": {"events": [], "status": "rejected", "error_message": "会话已有进行中的一轮"}}
     )
-    await adapter.new_session(cwd="")
+    await adapter.new_session(cwd="", aidev={"agent": "ok"})
 
     with pytest.raises(RequestError):
         await adapter.prompt("s1", _text_blocks("hello"))
@@ -253,7 +254,7 @@ async def test_a_rejected_turn_also_raises() -> None:
 async def test_the_loop_keeps_serving_after_a_failed_prompt() -> None:
     """失败只影响这一轮：同一 adapter 的下一个 prompt 仍然工作。"""
     adapter, _conn, _strategy, _service = await _adapter({"s1": {"events": [], "status": "finished"}})
-    await adapter.new_session(cwd="")
+    await adapter.new_session(cwd="", aidev={"agent": "ok"})
 
     with pytest.raises(RequestError):
         # 未建立的会话 → 明确失败，而不是一个假的 end_turn。
@@ -423,15 +424,15 @@ def test_only_text_blocks_become_input_text() -> None:
 
 def test_the_sink_holds_its_own_interpreter_per_run() -> None:
     """B2 的结构性证据：两个 sink 不共享解释器（``__slots__`` 里各有一份）。"""
-    one = _AcpSink(_FakeConn(), "s1", AguiEventInterpreter())
-    two = _AcpSink(_FakeConn(), "s2", AguiEventInterpreter())
+    one = AcpSink(_FakeConn(), "s1")
+    two = AcpSink(_FakeConn(), "s2")
 
     assert one._interpreter is not two._interpreter
 
 
 async def test_sink_without_a_connection_is_a_safe_no_op() -> None:
     """尚未 on_connect 时（防御路径）不得抛异常——降级路径本身不能打断运行。"""
-    await _AcpSink(None, "s1", AguiEventInterpreter()).send({"type": "TEXT_MESSAGE_CONTENT", "delta": "x"})
+    await AcpSink(None, "s1").send({"type": "TEXT_MESSAGE_CONTENT", "delta": "x"})
 
 
 # ============================================================================
@@ -472,13 +473,7 @@ async def test_eof_waits_for_a_silent_handler_response(monkeypatch: pytest.Monke
     from aidev_agent_cli.adapters import acp
 
     output = io.StringIO()
-    monkeypatch.setattr(
-        acp.sys,
-        "stdin",
-        SimpleNamespace(
-            buffer=io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}\n')
-        ),
-    )
+    stdin = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}\n')
     monkeypatch.setattr(acp, "EOF_QUIET_SECONDS", 0.01)
     monkeypatch.setattr(acp, "EOF_DRAIN_SECONDS", 1.0)
     adapter, _conn, _strategy, _service = await _adapter()
@@ -491,7 +486,7 @@ async def test_eof_waits_for_a_silent_handler_response(monkeypatch: pytest.Monke
         return await initialize(**kwargs)
 
     monkeypatch.setattr(adapter, "initialize", delayed_initialize)
-    transport = acp._StdioTransport(output)
+    transport = acp.AcpTransport(ProtocolChannel(stdin, output))
     await asyncio.wait_for(run_agent(adapter, transport), timeout=2)
 
     import json
@@ -508,12 +503,9 @@ async def test_eof_drain_has_a_hard_deadline(monkeypatch: pytest.MonkeyPatch) ->
 
     from aidev_agent_cli.adapters import acp
 
-    monkeypatch.setattr(
-        acp.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b'{"id":"pending","method":"session/prompt"}\n'))
-    )
     output = io.StringIO()
     monkeypatch.setattr(acp, "EOF_DRAIN_SECONDS", 0.03)
-    transport = acp._StdioTransport(output)
+    transport = acp.AcpTransport(ProtocolChannel(io.BytesIO(b'{"id":"pending","method":"session/prompt"}\n'), output))
     assert await transport.receive() == {"id": "pending", "method": "session/prompt"}
     assert await asyncio.wait_for(transport.receive(), timeout=0.5) is None
     assert transport._pending_requests == {"pending"}
@@ -527,8 +519,7 @@ async def test_outgoing_hook_request_does_not_settle_an_incoming_request(monkeyp
     from aidev_agent_cli.adapters import acp
 
     output = io.StringIO()
-    monkeypatch.setattr(acp.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b'{"id":1,"method":"initialize"}\n')))
-    transport = acp._StdioTransport(output)
+    transport = acp.AcpTransport(ProtocolChannel(io.BytesIO(b'{"id":1,"method":"initialize"}\n'), output))
     await transport.receive()
     await transport.send({"id": 1, "method": "_aidev/hook", "params": {}})
     assert transport._pending_requests == {1}

@@ -23,10 +23,10 @@ from aidev_agent.packages.langchain_core.tools.base import McpToolsResult
 from aidev_agent.packages.resource_manager.agent import AgentResourceManager
 
 from .loaders import ResourceOverrides, WorkspaceFileLoader, build_loaders, get_loader_class
-from .local_config import LocalDeclarations, McpResolver
+from .local_config import BkAiAgentInfo, McpResolver
 from .sources import parse_resources
 from .workspace import WorkspaceIndex
-from ..infrastructure.errors import HeadlessUnsupportedError
+from ..utils.errors import HeadlessUnsupportedError
 
 logger = getLogger(__name__)
 
@@ -73,8 +73,8 @@ class LocalResourceManager(AgentResourceManager):
 
     **进程级 vs per-agent（261014-urj 的核心概念分离）**：本类负责**单个 agent** 的
     资源与配置，读 ``agents/${agent_code}.json``。**进程级**的 TUI 配置（"主 Agent 是谁"
-    + 身份认证）属 :class:`aidev_agent_cli.config.TuiConfig`（``bkai_tui.json``）。两者唯一的
-    耦合点：per-agent 配置的写入目标是 ``TuiConfig.agent_code`` 所指那个 agent 的文件。
+    + 身份认证）属 :class:`aidev_agent_cli.runtime.settings.BkAiConfig`（``bkai_tui.json``）。两者唯一的
+    耦合点：per-agent 配置的写入目标是 ``BkAiConfig.default_agent_code`` 所指那个 agent 的文件。
 
     ``self.mcp`` 是**解析器**，不是解析结果：把它命名为 ``mcp`` 保持了对调用方的
     既有词汇，同时它内部用 ``.config`` 暴露解析出的 :class:`McpConfig`。
@@ -194,7 +194,7 @@ class LocalResourceManager(AgentResourceManager):
         #: 读由 loader 链现场进行（:class:`LocalAgentConfigLoader`）；本实例只用于写
         #: （:meth:`write_declaration`）。它是 **per-agent** 配置的所有者，因此归本
         #: 管理器——"谁是主 agent"是进程级 TUI 配置的事，不在本类。
-        self.declarations = LocalDeclarations()
+        self.declarations = BkAiAgentInfo()
 
     def set_access_token(self, token: str) -> None:
         """替换会话 token。``/login`` / ``/logout`` 的落点。
@@ -214,14 +214,14 @@ class LocalResourceManager(AgentResourceManager):
 
         ``code`` 由调用方给出（当前主 agent 的 ``agent_code``）——管理器不猜"当前是
         谁"，因为它对应的是**单个 agent**；"谁是主 agent"是进程级 TUI 配置的事
-        （见 :class:`aidev_agent_cli.config.TuiConfig`）。
+        （见 :class:`aidev_agent_cli.runtime.settings.BkAiConfig`）。
 
         同步且阻塞（写文件）。文件不可读/不可写、或 ``code`` 含路径穿越字符时
         **抛异常**：这是用户发起的操作，失败必须暴露（与读取路径的合法静默降级
         相反）。
 
-        ``kind`` 的语义与 ``LocalDeclarations.write`` 一致（标量替换、集合追加），
-        本项目只做转发，使 ``LocalDeclarations`` 的**归属**留在本模块这一侧。
+        ``kind`` 的语义与 ``BkAiAgentInfo.write`` 一致（标量替换、集合追加），
+        本项目只做转发，使 ``BkAiAgentInfo`` 的**归属**留在本模块这一侧。
         """
         self.declarations.write(kind, value, code=code)
 

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""``runtime.sdk.factory.build_agent`` 的 SESSION 构建路径与注入 saver（主测 ``runtime``）。
+"""``sdk.factory.build_agent`` 的 SESSION 构建路径与注入 saver（主测 ``runtime``）。
 
-从 ``tests/infrastructure/test_tui_checkpointer.py`` 按断言目标拆出：那一侧只留
-``runtime.sdk.checkpoints.LoopIndependentSqliteSaver`` 的 saver 本体与源码守卫，本文件承载
+从 ``tests/runtime/test_tui_checkpointer.py`` 按断言目标拆出：那一侧只留
+``sdk.checkpoints.LoopIndependentSqliteSaver`` 的 saver 本体与源码守卫，本文件承载
 「build_agent 如何把 saver / session_code / agent_code 交给 SDK」这一 runtime 契约。
 """
 
@@ -13,9 +13,10 @@ from typing import Any
 
 import pytest
 
-from aidev_agent_cli.runtime.sdk import factory as agent_factory
-from aidev_agent_cli.runtime.sdk import session as agent_runner
-from aidev_agent_cli.runtime.sdk.checkpoints import LoopIndependentSqliteSaver
+from aidev_agent_cli.sdk import factory as agent_factory
+from aidev_agent_cli.sdk import executor as agent_runner
+from tests._sdk import make_run
+from aidev_agent_cli.sdk.checkpoints import LoopIndependentSqliteSaver
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +69,7 @@ class TestBuildAgentInjection:
 
         calls: list[dict[str, Any]] = []
         manager = self._patch_sdk(monkeypatch, calls)
-        state = agent_runner.SDKSession()
+        state = make_run()
         saver = await state.checkpoints.ensure()
 
         agent_factory.build_agent(
@@ -84,7 +85,7 @@ class TestBuildAgentInjection:
     async def test_does_not_pass_session_context_data(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[dict[str, Any]] = []
         manager = self._patch_sdk(monkeypatch, calls)
-        state = agent_runner.SDKSession()
+        state = make_run()
         saver = await state.checkpoints.ensure()
 
         agent_factory.build_agent(
@@ -99,7 +100,7 @@ class TestBuildAgentInjection:
     async def test_injects_the_worker_saver(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[dict[str, Any]] = []
         manager = self._patch_sdk(monkeypatch, calls)
-        state = agent_runner.SDKSession()
+        state = make_run()
         saver = await state.checkpoints.ensure()
 
         agent_factory.build_agent(
@@ -115,7 +116,7 @@ class TestBuildAgentInjection:
         """The regression guard for "not recreated per build"."""
         calls: list[dict[str, Any]] = []
         manager = self._patch_sdk(monkeypatch, calls)
-        state = agent_runner.SDKSession()
+        state = make_run()
         saver = await state.checkpoints.ensure()
 
         agent_factory.build_agent(
@@ -142,7 +143,7 @@ class TestBuildAgentInjection:
         """
         calls: list[dict[str, Any]] = []
         manager = self._patch_sdk(monkeypatch, calls)
-        state = agent_runner.SDKSession()
+        state = make_run()
         saver = await state.checkpoints.ensure()
 
         agent_factory.build_agent(

@@ -8,15 +8,29 @@ import sys
 
 
 def main() -> int:
-    from aidev_agent_cli.infrastructure.startup import install_startup_hooks
+    from aidev_agent_cli.utils.runs import LaunchOptions
+    from aidev_agent_cli.runtime.process_config import ProcessConfig
+    from aidev_agent_cli.runtime.settings import BkAiConfig
+    from aidev_agent_cli.bootstrap.startup import install_startup_hooks
 
-    install_startup_hooks()
+    bkai = BkAiConfig.read()
+    install_startup_hooks(bkai.env)
 
-    from aidev_agent_cli.adapters.acp_dsh import run_acp_dsh
+    if os.environ.get("ACP_DSH_PREWARM") == "1":
+        from tests.integration import _prewarm
+
+        _prewarm.install()
+
+    from aidev_agent_cli.adapters.acp import ACP_DSH, run_acp
+    from aidev_agent_cli.hooks.handler import parse_hooks_option
+    from aidev_agent_cli.adapters.streams import ProtocolChannel
     from aidev_agent_cli.runtime.service import build_runtime
 
-    return run_acp_dsh(
-        build_runtime("acp-dsh", resources=("injected",)),
+    return run_acp(
+        build_runtime("acp-dsh", ProcessConfig(bkai=bkai, launch=LaunchOptions(resources=("injected",))), hooks=parse_hooks_option(os.environ.get("ACP_DSH_HOOKS"))
+        ),
+        ProtocolChannel.stdio(),
+        profile=ACP_DSH,
         tool_factories=("tests.integration._acp_dsh_entry:build_fake_tool",),
     )
 
