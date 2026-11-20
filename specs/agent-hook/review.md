@@ -3,53 +3,29 @@
 ## 最新结论
 
 - 结论: 通过，但有改进建议
-- 评审版本: 56e6865de8e40a64b1e3bed17f5b06546546f3c6
+- 评审版本: 72b3d9a39c3b5c9e90c66b65e56d7b9d3d8f48c7
 - 变更名: agent-hook（`specs/agent-hook/`）
-- 轮次: 第 3 轮（第二期 hook 首次评审）
+- 轮次: 第 4 轮（rebase 到 develop + 切到 6 点位 hook 机制）
 
 ### 阻塞项
 
-无。第二期 REQ-13 ~ REQ-20 / ACC-14 ~ ACC-22 逐条满足；ACC-23 按规格「测试约束」
-记为未取证（缺仓外 A 档插件），不构成阻塞。一期已通过的 REQ-1 ~ REQ-12 未被本轮改动回归。
+无。hook 机制已按需求方在 develop 的重写切换为 6 点位（`turn_start` / `model_pre` /
+`model_post` / `tool_pre` / `tool_post` / `turn_end`，进程内 `HookSet`），headless 只保留
+传输层；`tool_pre` 的 deny 短路、`tool_post` 的四类改写、`turn_start` 的 context 注入、
+关闭态零回归与 fail-open 均有可复跑用例与真实 dsh 端到端证据。
 
 ### 改进建议
 
-以下均为一般改进建议，不构成返工理由。W-1 ~ W-7 为一期评审遗留（本轮复核仍存在），
-W-8 ~ W-12 为本期新增。
-
-- W-1 `DefaultAgentFactory.resume` 接受 `{"input": str}` 续轮形状后直接丢弃负载
-  （`services/agent/factory.py:506-508`），headless 侧 `session.py:228` 也用 `payload` 只做校验、
-  真正执行的输入取 `params.input`。建议统一语义，或在 `normalize_resume_payload` 文档写明
-  「该形状仅供内部校验」。
-- W-2 `HeadlessSession.prepare()`（`session.py:167-173`）装配出的实例存进 `_pending_agent` 后
-  从未使用也从未 `stop()`；`_take_agent`（`session.py:442`）只把它置空。一期的死参数
-  `allow_pending` 已在本轮删除，剩余这半边仍建议收敛（`prepare` 结束即 `stop()`，或去掉暂存）。
-- W-3 未归类异常一律拼进对外可见文案：`f"{type(exc).__name__}: {exc}"`
-  （`session.py:315-318`、`cli.py:155`、`cli.py:182`）。上游错误体片段会经 `RUN_ERROR` 与响应回显；
-  REQ-11 / REQ-19 要求不输出凭据与完整请求体，建议对上游错误做一次归一化（只保留错误类与脱敏摘要）。
-- W-4 `close` 第二次调用经 `_session_for` 的 `ensure_open`（`cli.py:250-253`）直接报 `session.closed`，
-  使 `HeadlessSession.close()` 的 `already_closed`（`session.py:360-372`）在协议层不可达；
-  `SessionRegistry.create`（`session.py:638-649`）对同 `session_code` 直接覆盖且不关闭旧会话。
-- W-5 `cancel` 收敛超时走 `writer.finalize()`（`session.py:349-353`）补发取消终止事件后，
-  仍在运行的轮次还可能继续写出事件，破坏「以终止事件收尾」。建议超时后标记本轮已终止并丢弃后续事件。
-- W-6 REQ-4 / ACC-3（续流入口收敛）按一期技术方案「规格偏差与待修订」整体延后；`spec.md`
-  仍保留 REQ-4 / ACC-3 原文，建议后续变更同步修订，避免规格与实现长期不一致。
-- W-7 `tests/headless` 一期返工时出现过 1 例未捕获用例名的失败（`verification.md` 已如实记录）；
-  本轮三组套件各跑一次全绿、未复现，暂不视为缺陷。
-- W-8 `turn` 的 pending 中断前置检查在会话锁之外（`session.py:180-185`）：同会话并发两个 `turn`
-  时，后到者可能在前者以中断收尾前通过检查，随后带着 pending 中断拉图。命中后仍以结构化错误
-  收尾，属健壮性缺口；建议把该检查移到 `_drive_turn` 的会话锁内。
-- W-9 中断恢复轮若在执行期失败（`status=error`），`_pending_interrupts` 会被清空
-  （`session.py:287`），此后同一 pending 中断无法再用正确的 `interruptId` 恢复（返回
-  `resume_interrupt_not_found`）。ACC-21 只覆盖「校验失败」路径，建议失败路径保留 pending 缓存。
-- W-10 `keep_ask_memo` 对任意中断都置真（`session.py:277-280`），ITSM 审批中断也会保留
-  ask memo，与 pending 生命周期不一致；建议仅对 `aidev:hook_ask` 保留。
-- W-11 宿主回 `{"result": {}}`（缺 `decision`）时按 allow / accept 放行且不写 `hook_degraded`
-  （`core/hooks/bus.py:114-116`、`:130-135`）：与 REQ-18「`result` 形状不合法 → `invalid_shape`」
-  的边界口径不够明确，建议在接入文档写明「缺 `decision` 视为最宽松裁决、不降级」。
-- W-12 wrapper 顺序不变式只有同步链断言（`tests/core/nodes/tool/test_tool_node_hook_order.py`
-  仅比对同步链成员与顺序），异步链（`_chain_async_tool_call_wrappers`）无对应用例；建议补一条
-  异步链断言，防止后续重构把 `hook_pre` 移出链首而破坏 REQ-15 的「deny 早于审批」。
+- W-13 **规格未随机制重写**：`spec.md` / `plan.md` / `tasks.md` 仍描述旧三点
+  （`session_start` / `tool_pre` / `tool_post`）与 `ask` 中断；代码已按 develop 的 6 点位
+  机制落地。建议在下一轮需求 / 方案节点重写 REQ-13 ~ REQ-20 与 ACC-14 ~ ACC-23，
+  避免评审依据与实现长期分叉。
+- W-14 `ask` 语义在新机制中不存在：`tool_pre` 只能返回 `ToolMessage` / `Command` 短路，
+  宿主返回 `permissionDecision=ask` 时当前按 `deny` 处理并在 reason 中注明（`hook_bridge.py:299-312`）。
+  若仍需「转人工」，需要产品明确走平台审批（ITSM）还是扩点位。
+- W-1 ~ W-7 为一期 headless 遗留（resume 负载语义、prepare 暂存实例、上游异常回显、
+  close/create 重复语义、cancel 超时、REQ-4/ACC-3 偏差、偶发用例失败），本轮复核仍存在，
+  均不构成返工理由。
 
 <details>
 <summary>自动校验信息</summary>
@@ -58,22 +34,19 @@ W-8 ~ W-12 为本期新增。
 {
   "verdict": "PASS_WITH_WARNING",
   "change_name": "agent-hook",
-  "iteration": 3,
-  "reviewed_sha": "56e6865de8e40a64b1e3bed17f5b06546546f3c6",
+  "iteration": 4,
+  "reviewed_sha": "72b3d9a39c3b5c9e90c66b65e56d7b9d3d8f48c7",
   "blocking": [],
   "warnings": [
-    {"id": "W-1", "evidence": "factory.py:506-508 与 session.py:228：resume 负载 {\"input\": str} 被校验后丢弃，执行输入取 params.input", "suggestion": "统一语义，或在文档写明该形状仅供内部校验"},
-    {"id": "W-2", "evidence": "session.py:167-173 prepare() 装配实例后不 stop；session.py:442 只置空 _pending_agent", "suggestion": "prepare 结束即 stop，或移除暂存"},
-    {"id": "W-3", "evidence": "session.py:315-318、cli.py:155/182 把上游异常串写入 RUN_ERROR 与响应", "suggestion": "对上游错误做归一化与脱敏"},
-    {"id": "W-4", "evidence": "cli.py:250-253 使 close 的 already_closed 不可达；session.py:638-649 同 session_code 覆盖旧会话不关闭", "suggestion": "收敛重复 close / 重复 create 语义"},
-    {"id": "W-5", "evidence": "session.py:349-353 cancel 超时补发终止事件后，运行中的轮次仍可继续写事件", "suggestion": "超时后标记终止并丢弃后续事件"},
-    {"id": "W-6", "evidence": "spec.md 仍保留 REQ-4/ACC-3，plan.md 第 294-302 行登记为已批准偏差", "suggestion": "后续变更同步修订规格"},
-    {"id": "W-7", "evidence": "一期 verification.md 记录一次未捕获用例名的偶发失败；本轮三组套件未复现", "suggestion": "再现时保留完整输出以定位"},
-    {"id": "W-8", "evidence": "session.py:180-185 pending 中断前置检查在会话锁外，并发 turn 存在 TOCTOU 窗口", "suggestion": "把检查移入 _drive_turn 的会话锁内"},
-    {"id": "W-9", "evidence": "session.py:287 恢复轮执行期失败会清空 _pending_interrupts，同一 pending 中断此后无法恢复", "suggestion": "失败路径保留 pending 缓存"},
-    {"id": "W-10", "evidence": "session.py:277-280 keep_ask_memo 对任意中断置真，ITSM 中断也保留 ask memo", "suggestion": "仅对 aidev:hook_ask 保留 memo"},
-    {"id": "W-11", "evidence": "core/hooks/bus.py:114-116/130-135 缺 decision 时按最宽松放行且不写 hook_degraded", "suggestion": "在接入文档写明该边界口径"},
-    {"id": "W-12", "evidence": "test_tool_node_hook_order.py 只断言同步 wrapper 链，异步链顺序无用例", "suggestion": "补一条异步链顺序断言"}
+    {"id": "W-13", "evidence": "spec.md / plan.md / tasks.md 仍为旧三点 + ask，代码已切 6 点位", "suggestion": "下一轮需求/方案节点重写 REQ-13~20 与 ACC-14~23"},
+    {"id": "W-14", "evidence": "hook_bridge.py:299-312 把宿主 ask 落成 deny", "suggestion": "产品确认是否走 ITSM 审批或扩点位"},
+    {"id": "W-1", "evidence": "resume 负载 {"input": str} 校验后丢弃", "suggestion": "统一语义或写明仅供内部校验"},
+    {"id": "W-2", "evidence": "prepare() 装配实例不 stop", "suggestion": "prepare 结束即 stop"},
+    {"id": "W-3", "evidence": "上游异常串直接对外回显", "suggestion": "归一化与脱敏"},
+    {"id": "W-4", "evidence": "重复 close / 重复 create 语义未收敛", "suggestion": "二选一收敛"},
+    {"id": "W-5", "evidence": "cancel 超时后仍可能继续写事件", "suggestion": "超时后标记终止"},
+    {"id": "W-6", "evidence": "REQ-4/ACC-3 偏差仍在规格原文", "suggestion": "后续变更同步修订"},
+    {"id": "W-7", "evidence": "一期偶发用例失败未复现", "suggestion": "再现时保留完整输出"}
   ]
 }
 ```
@@ -284,3 +257,63 @@ ACC-23 按规格的测试约束记为未取证。冻结文档未被实现阶段�
 未发现正确性、安全或数据方面的阻塞项，约定验证无失败。
 
 本轮判 `PASS_WITH_WARNING`：阻塞项为空，遗留 W-1 ~ W-12 为一般改进建议，循环结束。
+
+## 第 4 轮
+
+### 评审范围
+
+- 上游把分支重写过：远端 `feature/agent-hook` 从本轮评审的 `95c67dae` 变为
+  `f68edb35`（整合 TUI headless 运行时），随后需求方在 `develop` 重写了 hook 机制
+  （`88ee4b06` feat(agent-plugin): 新增 6 点位 hook 协议与运行时注入机制）。
+- 本轮按需求方要求把工作分支 rebase 到 `origin/develop`（`88ee4b06`），并把 headless
+  与仓外 dsh 桥接件切到新机制。评审版本 `72b3d9a3`；rebase 后提交：
+  `c838d107`（原 feature 主体）、`cd9ba639`（TUI 运行时）、`72b3d9a3`（切 6 点位）。
+- 冲突处理：`graph.py` / `node.py` / `pydantic_models.py` / `chat.py` / `factory.py` /
+  `registry.py` 一律采用 develop 侧（新 hook 机制），再补回 headless 需要的非 hook 透传
+  （`interrupt_processor` / `injected_tools`）。
+
+### 机制切换
+
+| 维度 | 旧（一期/二期自建） | 新（develop） |
+| --- | --- | --- |
+| 点位 | 3 个：`session_start` / `tool_pre` / `tool_post` | 6 个：`turn_start` / `model_pre` / `model_post` / `tool_pre` / `tool_post` / `turn_end` |
+| 形态 | `HookBusProtocol` 鸭子类型 + headless 同步往返 | 进程内 `HookSet` + `HookRunner`（原生对象，5s 超时，fail-open） |
+| 短路 | `deny` → `ToolMessage`；`ask` → `interrupt()` | `tool_pre` 返回 `ToolMessage` / `Command` 短路；无 `ask` |
+| headless 角色 | 自己实现总线、ask 中断与恢复 | 只保留传输层 `headless/hook_bridge.py` |
+
+`headless/hook_bridge.py` 把 6 个点位接成宿主 NDJSON 往返：`HookSet` 处理器 → 请求行 →
+等待答复 → 翻译回 `ToolMessage` / `SystemMessage` / `HookRetry`；超时 / 宿主失败 /
+形状非法 fail-open 并写 `hook_degraded`。等待上限 3s（上限 4s），低于 `HookRunner` 的 5s。
+
+### 逐需求核对（对照旧规格）
+
+| 需求 | 结论 | 依据 |
+| --- | --- | --- |
+| REQ-13 启用方式与执行归属 | 部分满足（规格待重写） | `create.params.hooks` 仍随会话下发，宿主仍是判定执行方；点位名与载荷改由新机制定义（W-13） |
+| REQ-14 `session_start` | 由 `turn_start` 承接 | 处理器在最前面插一条 system，`tests/headless/test_hook_bridge.py::test_turn_start_context_reaches_system_prompt` |
+| REQ-15 `tool_pre` | 满足 | `deny` 返回 `ToolMessage(status="error")` 短路，工具零执行；载荷 `tool_name` / `tool_input` / `tool_use_id` |
+| REQ-16 `tool_post` | 满足 | `accept` / `block` / `content` / `context` 四类改写（`hook_bridge.py:314-350`） |
+| REQ-17 `ask` 与中断恢复 | **语义变化** | 新机制无 `ask`；`aidev:user_question` 恢复仍在，ITSM 中断仍显式失败（W-14） |
+| REQ-18 协议往返 | 满足 | 两类行、`<请求 id>#h<n>`、答复行分流、fail-open、`hook_degraded` |
+| REQ-19 关闭态零回归 | 满足 | 不传 `hooks` 时不注册处理器、无 `type=request`（`test_hooks_disabled_emits_no_request_lines`） |
+| REQ-20 文档 | 满足 | `docs/agent/HEADLESS_HOST.md` 第六节改写为 6 点位 + 传输层口径 |
+
+### 验证记录
+
+- `tests/headless` 65 passed（含新增 `test_hook_bridge.py` 10 条：关闭态、context 注入、
+  deny/allow、tool_post context、超时与宿主失败降级、协议形状、非法配置）。
+- `tests/services/agent` 445 passed；`tests/core/hook` 52 passed；`tests/core/nodes/tool` 147 passed。
+- 仓外 dsh 端到端（`probe/probe-hook-e2e.ts`，rebased 分支）：
+  `hook-deny` 工具 0 执行且 `hook/result(PreToolUse:deny)`、模型收到 stderr；
+  `hook-post` 工具执行 1 次并追加 `[hook context]`；`hook-allow` 正常执行；
+  `hook-ask` 落为 deny；`hook-context` 的 `turn_start` 注入在 system prompt 命中。
+- `hooks-smoke.ts`（宿主协议冒烟）：`@deepseek-ai/dsh-hook-protocol@0.2.1-rc.3` 导出可用，
+  matcher / exit 2 / additionalContext / 审计事件全部通过。
+
+### 结论
+
+rebase 后分支与 develop 的 hook 机制一致，headless 只保留传输层，仓外桥接件已按新点位重写；
+关闭态零回归、fail-open、审计事件与真实 dsh 链路均有证据。规格文档与实现已分叉（W-13）、
+`ask` 语义缺失需产品确认（W-14），二者属交付口径问题，不构成本轮代码阻塞。
+
+本轮判 `PASS_WITH_WARNING`。
