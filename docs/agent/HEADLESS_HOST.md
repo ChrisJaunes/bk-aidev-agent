@@ -163,131 +163,79 @@ headless 侧的中断恢复只接线 ask 类（`aidev:hook_ask` / `aidev:user_qu
 
 ---
 
-## 六、hooks 一节（第二期：`session_start` / `tool_pre` / `tool_post`）
+## 六、hooks 一节（6 点位，进程内处理器 + headless 传输）
 
-本仓对 hook 的职责只有两件：**上报**「哪个点发生了 + 载荷」，**接收**「裁决」。解析
-`hooks.json`、跑命令 hook、匹配 matcher、合并多份裁决、写宿主审计，全部属宿主（A 档插件）
-职责；本仓不解析配置、不执行命令，也不会在无宿主时自行裁决。
+hook 机制在 SDK 里是**进程内**的（`core/hook`）：`HookSet` 持有 6 个点位的处理器，
+`HookRunner` 按注入顺序分发，处理器直接读写 LangChain / LangGraph 原生对象。
+headless 侧只做一层**传输**：把点位变成一次 NDJSON 往返，让宿主（dsh 插件）能插话。
+本仓不解析 `hooks.json`、不跑命令、不实现 matcher —— 那些是宿主职责。
 
-### 6.1 启用方式与默认值
+### 6.1 六个点位
+
+| 点位 | 时机 | 载荷 | 处理器可返回 |
+| --- | --- | --- | --- |
+| `turn_start` | 图入口，一轮开始前 | `messages`（整表） | 新的消息列表（整表替换；常用注入一条 system） |
+| `model_pre` | 每次模型调用前 | `messages` | 新的消息列表 |
+| `model_post` | 每次模型调用成功后 | 助手消息（`content` / `tool_calls`） | `{"retry": true}` → `HookRetry`，其余忽略 |
+| `tool_pre` | 工具派发前 | `tool_name` / `tool_input` / `tool_use_id` | `{"decision":"allow"\|"deny","reason"}`；`deny` 早退不执行 |
+| `tool_post` | 工具本体返回后、净化前 | `tool_name` / `tool_use_id` / `tool_response` / `status` | `accept` / `block` / `content` / `context` |
+| `turn_end` | 本轮走到终点 | `turn_id` | 不等答复（通知型） |
+
+### 6.2 启用方式
 
 `create` 请求体的 `params.hooks`：
 
 ```json
-{"timeout_ms": 10000, "points": ["session_start", "tool_pre", "tool_post"]}
+{"timeout_ms": 3000, "points": ["turn_start", "tool_pre", "tool_post"]}
 ```
 
 | 字段 | 默认值 | 约束 |
 | --- | --- | --- |
-| `timeout_ms` | `10000` | 单点等待上限（毫秒）；必须是正整数，超过 1 小时按 1 小时钳制；非法 → `hook.value_invalid` |
-| `points` | 三点全开 | 只接受 `session_start` / `tool_pre` / `tool_post`；未知点位 → `hook.value_invalid` |
+| `timeout_ms` | `3000` | 单点等待上限；必须为正整数，上限 4000（`HookRunner` 对处理器有 5s 上限） |
+| `points` | 六点全开 | 只接受上表六个点位名；未知点位 → `hook.value_invalid` |
 
-- 只随 `create` 下发，不读进程级环境变量：不传即**完全关闭**（无 `type=request` 行、无
-  `hook_degraded` 事件、无可测量延迟）。平台路径不传该字段，因此不受影响。
-- 关闭态是零回归口径：stdout 行集合与一期逐字节一致。
+不传 `hooks` 即完全关闭：不注册任何处理器、不产生 `type=request` 行、图拓扑与基线一致。
 
-### 6.2 两类协议行与 `id` 派生
+### 6.3 两类协议行与 `id` 派生
 
-agent → host 的请求行：
+agent → host 请求行：
 
 ```json
 {"id": "req-1#h1", "type": "request", "method": "hook",
  "params": {"session_code": "s-1", "turn_id": "...", "point": "tool_pre",
-            "payload": {"tool_name": "demo", "tool_input": {"q": "x"}, "tool_use_id": "call_1"}}}
+            "payload": {"tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": "call_1"}}}
 ```
 
-host → agent 的答复行（二选一）：
+host → agent 答复行：`{"id": "req-1#h1", "ok": true, "result": {"decision": "allow"}}`
+或 `{"id": "req-1#h1", "ok": false, "error": {"code": "...", "message": "..."}}`。
 
-```json
-{"id": "req-1#h1", "ok": true, "result": {"decision": "allow"}}
-{"id": "req-1#h1", "ok": false, "error": {"code": "host_failed", "message": "..."}}
-```
+- `id` 为 `<本轮请求 id>#h<n>`，`n` 在会话内自 1 递增；
+- 答复行不产生响应行、不进入请求解析、不会被报成未知方法；
+- 请求行与事件行共用同一把写锁，不会交错。
 
-- `id` 由**发起该轮的请求 id** 派生为 `<该轮请求 id>#h<n>`；`n` 在同一会话内自 1 递增，
-  不随请求重置、不重复。宿主无需额外状态即可把答复路由回等待中的那一轮。
-- 答复行**不产生响应行**、**不进入请求解析**、不会被报成 `protocol.unknown_method`。
-- 未知 `id` 或畸形的答复行被忽略（仅记调试日志），不会让进程退出。
-- hook 请求行与事件行共用同一把写锁：任何并发场景下都不会出现两行交错。
+### 6.4 裁决语义
 
-### 6.3 三点载荷与裁决字段
+| 点位 | result | 落地 |
+| --- | --- | --- |
+| `turn_start` / `model_pre` | `{"context": "..."}` | 在消息表最前面插一条 system（不改账本、不改 `turn_id`） |
+| `tool_pre` | `{"decision": "deny", "reason": "..."}` | 返回 `ToolMessage(status="error")`，工具零执行；`ask` 无对应机制，按 `deny` 处理并在 reason 里说明 |
+| `tool_post` | `{"decision": "block", "reason": "..."}` | 模型只看到 reason，原结果不进上下文 |
+| `tool_post` | `{"decision": "content", "content": "..."}` | 替换模型可见结果 |
+| `tool_post` | `{"decision": "context", "context": "..."}` | 追加到同一结果尾部（`[hook context]` 分隔） |
+| `model_post` | `{"retry": true}` | 抛 `HookRetry`，模型链按既有重试策略重来 |
 
-| 点 | 触发时机 | 载荷 `payload` | 裁决 `result` |
-| --- | --- | --- | --- |
-| `session_start` | 每轮驱动前（`turn` 与 `resume` 都触发），装配之前 | `session_code`、`turn_id`、`first_turn`、`input` | `{"context": "<str>"}`；空或缺省 = 不注入 |
-| `tool_pre` | 工具派发前，**先于**既有审批与结果脱敏 | `tool_name`、`tool_input`、`tool_use_id` | `{"decision": "allow"\|"deny"\|"ask", "reason": "..."}` |
-| `tool_post` | 工具本体返回后、既有结果净化与截断之前 | `tool_name`、`tool_input`、`tool_use_id`、`tool_response` | `{"decision": "accept"\|"block"\|"content"\|"context", "reason"?, "content"?, "context"?}` |
-
-语义要点：
-
-- `session_start` 的 `context` 只进入本轮 system prompt（位于用户输入之前），不改写会话账本里的
-  user 原文、不改本轮 `turn_id`；`first_turn` 用于宿主区分首轮与后续轮。
-- `tool_pre` 的 `deny` 让工具本体零执行、不进审批与脱敏，模型收到含 `reason` 的工具结果；
-  `allow` 只是「hook 不拦」，之后仍完整走既有审批；`ask` 见 6.4。
-- `tool_post` 的 `block` 让模型只看到 `reason`；`content` 整体替换模型可见结果；`context` 追加到
-  同一结果尾部（与 `content` 同时给出时先替换再追加）。`tool_use_id` 与工具调用/结果的配对
-  关系不变，任何裁决都不会让工具本体重复执行。
-- 本期**不承诺** `updatedInput`（改工具参数）、`systemMessage`、`continue:false` 停整轮。
-- `create.params.tools` 是进程内注入工具的**测试 / 嵌入式接缝**，不是 stdio 协议承诺（宿主
-  不能通过 NDJSON 传对象）。
-
-### 6.4 `ask` 与中断恢复的宿主义务
-
-`tool_pre` 返回 `ask` 时，本轮以中断收尾：
-
-- 响应 `ok=true`、`result.status=interrupt`，`result.interrupts[0]` 含
-  `id` / `reason`（= `aidev:hook_ask`）/ `message` / `toolCallId` / `metadata`；
-- 事件侧仍是 `RUN_FINISHED(outcome.type="interrupt")`，不新增事件类型；`outcome.interrupts[0].id`
-  就是宿主组 `resume` 负载要用的 `interruptId`；
-- 工具本体零执行。
-
-宿主收到中断后组负载：
-
-```json
-{"id": "req-9", "method": "resume",
- "params": {"session_code": "s-1",
-            "resume": {"interruptId": "<outcome.interrupts[0].id>", "toolCallId": "<可选>", "decision": "allow", "reason": "<可选>"}}}
-```
-
-- `decision` 取 `allow`（工具执行、结果回模型）或 `deny`（工具零执行、模型收到拒绝说明）；
-  `aidev:user_question` 场景 `decision` 也可以是 `{"answers": [...]}`，原样交给工具。
-- 校验规则：`interruptId` 必须命中该会话当前 pending 中断（带 `toolCallId` 时一并校验）；
-  不命中 → `resume_interrupt_not_found`；形状不合法 → `resume_payload_unsupported`。
-  失败都不改图状态、不放行其它 pending；随后用正确的 `interruptId` 仍可恢复。
-- 一次 `resume` 只恢复一个中断；恢复后同一会话可继续 `turn`。若还有未恢复的 pending 中断，
-  `turn` 返回 `session.pending_interrupt`（不拉图）。
-- 同一 `tool_use_id` 的 `tool_pre` 只上报一次：恢复轮重放工具节点时不会重复打扰宿主。
-- 走恢复链路时 `first_turn` 语义与 `turn` 一致（按会话已驱动轮次判定）。
-
-**hook 不替代 ITSM 权限审批**：`allow` 之后仍完整走 `aidev:tool_approval`；`ask` 是额外一次
-人工裁决，不等于审批通过。headless 本期只接线 ask 类中断：`resume` 命中
-`aidev:tool_approval` 返回 `resume_interrupt_unsupported`，不改图状态、不放行其它 pending。
-因此「工具既配 ITSM 审批、又被 hook 配了 `ask`」时一轮可能出现两次中断，第二次（ITSM）本期
-无法恢复，会话停在该中断上 —— 宿主应避免对需审批工具下发 hook `ask`。
+任何裁决都不会让工具本体重复执行，也不改变 `tool_call_id` 配对。
 
 ### 6.5 fail-open 与 `hook_degraded`
 
-以下情形按该点**最宽松裁决**继续，并各写**恰好一条**既有 `CUSTOM` 事件
-（`name="hook_degraded"`，`value={"point", "reason"}`），不新增 `EventType`：
+超时、宿主 `ok=false`、`result` 不是对象、未给 `decision`：一律按「不干预」继续
+（返回 `None`），并写一条既有 `CUSTOM` 事件（`name="hook_degraded"`，`value={"point","reason"}`），
+不新增 `EventType`。降级只影响该点位，不阻断本轮。
 
-| 情形 | 该点取值 | `value.reason` |
-| --- | --- | --- |
-| 超过 `timeout_ms` | `tool_pre=allow` / `tool_post=accept` / `session_start` 不注入 | `timeout` |
-| 宿主回 `ok=false` | 同上 | `host_error` |
-| `result` 不是对象 | 同上 | `invalid_shape` |
-| `decision` 取值未知 | 同上 | `unknown_decision` |
-| 等待期间收到 `cancel` | 同上（**不写** `hook_degraded`） | — |
+### 6.6 宿主侧（dsh 插件）职责
 
-- 超时只降级、不阻断；`timeout_ms` 可由宿主收紧。
-- 等待期间发 `cancel` 时立即放弃等待并按取消语义收尾，不会等满超时。
-- 降级事件与业务事件共用同一通道与写锁；日志只记点位、裁决取值、耗时与降级原因。
-
-### 6.6 A 档插件接入与钉版本
-
-- 插件职责（仓外维护，不提交本仓）：读 `hooks.json`、按 `matcher` 匹配点位与工具、执行命令
-  hook、按「最严格」合并多份裁决（`exit 2` → `deny` / `block`）、写 `hook/invoked` 与
-  `hook/result` 审计。
-- 插件把本仓的 hook 请求行转成自己的 hook 事件、把裁决转成答复行；本仓不感知插件内部结构。
-- 插件若复用宿主自身的 hooks 原语，该面属**半私有导出**：必须**钉版本**（锁定宿主版本区间）
-  并加 **import 冒烟**用例，宿主小版本升级后先跑冒烟再放开。
-- 本文档不复制宿主源码，也不把宿主半私有导出描述成稳定 API；插件加载失败不影响本仓
-  ACC-14 ~ ACC-22 的判定（端到端证据单独记录）。
+- 读 `hooks.json`、按 matcher 选组、跑命令、合并多份裁决（最严格优先）、写 `hook/invoked` 与 `hook/result` 审计；
+- 把 Claude 方言的事件名映射到本仓点位：`SessionStart → turn_start`、`UserPromptSubmit → model_pre`、
+  `PreToolUse → tool_pre`、`PostToolUse → tool_post`、`Stop → turn_end`；
+- 复用宿主 hooks 原语属**半私有导出**：钉版本 + import 冒烟，升级后先跑冒烟；
+- 插件加载失败不影响本仓 headless 行为（关闭态零回归）。

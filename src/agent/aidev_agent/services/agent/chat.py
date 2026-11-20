@@ -310,7 +310,7 @@ class ChatCompletionAgent(BaseModel):
         if chat.interrupt_processor is not None:
             # execute() 的惰性构造只在 None 时生效，因此注入实现不会被覆盖
             self.interrupt_processor = chat.interrupt_processor
-        injected_tools = ctx.extra.get("injected_tools") or []
+        injected_tools = chat.injected_tools or []
         if injected_tools:
             # 进程内注入工具（headless create.params.tools 的测试 / 嵌入式接缝）
             self.tools = list(self.tools or []) + list(injected_tools)

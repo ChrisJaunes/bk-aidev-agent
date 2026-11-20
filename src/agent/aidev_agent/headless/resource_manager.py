@@ -209,3 +209,14 @@ class HeadlessResourceManager:
 
     def get_flow_agent_task_node_info(self, task_id: str, node_id: str, **kwargs) -> dict:
         self._unsupported("get_flow_agent_task_node_info")
+
+    # ---------------- 个人记忆（REQ-8：headless 无平台） ----------------
+
+    def memory_schemas(self, *, username: str = None, agent_code: str = None, **kwargs) -> dict:
+        self._unsupported("memory_schemas")
+
+    def memory_tool(self, payload: dict, *, username: str = None, **kwargs) -> dict:
+        self._unsupported("memory_tool")
+
+    def complete_memory_round(self, payload: dict, *, username: str = None, **kwargs) -> dict:
+        self._unsupported("complete_memory_round")
