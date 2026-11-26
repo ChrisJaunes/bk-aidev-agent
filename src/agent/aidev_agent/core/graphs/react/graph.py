@@ -1056,7 +1056,7 @@ class ReActAgentBuilder:
             builtin_tools.extend(self._personal_memory.make_tools())
 
         if self._ptc_settings is not None and self._ptc_settings.enabled:
-            from aidev_agent.core.ptc.tool import ExecutePythonTool
+            from aidev_agent.core.tools.ptc.tool import ExecutePythonTool
 
             builtin_tools.append(ExecutePythonTool(executor=None))
 
@@ -1544,7 +1544,7 @@ class ReActAgentBuilder:
         )
 
         if self._ptc_settings is not None and self._ptc_settings.enabled:
-            from aidev_agent.core.ptc.tool import ExecutePythonTool, PtcToolExecutor
+            from aidev_agent.core.tools.ptc.tool import ExecutePythonTool, PtcToolExecutor
 
             ptc_tools = [tool for tool in builtin_tools if isinstance(tool, ExecutePythonTool)]
             if ptc_tools:

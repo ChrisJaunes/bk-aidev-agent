@@ -35,7 +35,7 @@ class PaasPtcTransport:
             if self.sandbox_id is None:
                 # Dedicated backend: no skill PV state or credential injection.
                 self.sandbox_id = self.backend._ensure_sandbox()
-            asset = files("aidev_agent.core.ptc.sandbox_assets").joinpath("runner.py").read_bytes()
+            asset = files("aidev_agent.core.tools.ptc.sandbox_assets").joinpath("runner.py").read_bytes()
             self.backend.upload_file(self.sandbox_id, self.asset, asset)
             self._ready = True
 

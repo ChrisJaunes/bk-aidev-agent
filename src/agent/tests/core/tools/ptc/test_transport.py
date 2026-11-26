@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 from requests import HTTPError, Response
 
-from aidev_agent.core.ptc.protocol import PtcError
-from aidev_agent.core.ptc.transport import PaasPtcTransport
+from aidev_agent.core.tools.ptc.protocol import PtcError
+from aidev_agent.core.tools.ptc.transport import PaasPtcTransport
 from aidev_agent.core.tools.runtime_tools.paas_backend import ExecResult, PaasSandboxBackend
 
 

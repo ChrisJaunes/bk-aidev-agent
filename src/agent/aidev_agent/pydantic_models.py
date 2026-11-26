@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, StrictInt, model_validator
 
 from aidev_agent.config import settings
-from aidev_agent.core.ptc.settings import PtcSettings
+from aidev_agent.core.tools.ptc.settings import PtcSettings
 from aidev_agent.enums import FineGrainedScoreType, IndependentQueryMode
 
 

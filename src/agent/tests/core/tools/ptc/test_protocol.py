@@ -3,8 +3,8 @@
 import pytest
 from pydantic import ValidationError
 
-from aidev_agent.core.ptc.protocol import PtcError, encode, validate_event
-from aidev_agent.core.ptc.settings import PtcSettings
+from aidev_agent.core.tools.ptc.protocol import PtcError, encode, validate_event
+from aidev_agent.core.tools.ptc.settings import PtcSettings
 
 
 @pytest.mark.parametrize("value", [float("nan"), {"x": object()}, "x" * 50])

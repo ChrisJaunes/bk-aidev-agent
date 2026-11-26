@@ -12,8 +12,8 @@ from langgraph.graph.message import MessagesState
 
 from aidev_agent.core.graphs.react.graph import ReActAgentBuilder
 from aidev_agent.core.nodes.tool import build_tool_node
-from aidev_agent.core.ptc.session import PtcSessionManager
-from aidev_agent.core.ptc.tool import ExecutePythonTool, PtcToolExecutor
+from aidev_agent.core.tools.ptc.session import PtcSessionManager
+from aidev_agent.core.tools.ptc.tool import ExecutePythonTool, PtcToolExecutor
 from aidev_agent.pydantic_models import AgentExecutorKwargs, SecuritySettings
 
 

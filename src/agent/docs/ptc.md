@@ -91,7 +91,7 @@ SDK 直接使用 `ReActAgentBuilder` 时需提供 `ptc_settings` 和当前 Runti
 
 ```bash
 cd src/agent
-make test path=tests/core/ptc
+make test path=tests/core/tools/ptc
 ```
 
 测试以真实 Unix Socket 和后台子进程模拟独立 HTTP 命令，覆盖执行栈保留、N+1、

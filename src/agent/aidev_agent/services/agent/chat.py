@@ -41,8 +41,8 @@ from aidev_agent.core.ag_ui.utils import (
 )
 from aidev_agent.core.citations import uses_citations
 from aidev_agent.core.nodes.model import convert_chat_history_to_messages
-from aidev_agent.core.ptc.settings import PtcSettings
 from aidev_agent.core.tools.a2a_tools.types import AgentBackendType, AgentSpec
+from aidev_agent.core.tools.ptc.settings import PtcSettings
 from aidev_agent.core.tools.runtime_tools import RuntimeBackendResolver
 from aidev_agent.core.tools.runtime_tools.defer_manager import default_runtime_backend_defer_manager
 from aidev_agent.enums import AgentType, PromptRole
@@ -635,8 +635,8 @@ class ChatCompletionAgent(BaseModel):
         if not self.ptc_settings.enabled:
             return None
         if self.ptc_session_manager is None:
-            from aidev_agent.core.ptc.session import PtcSessionManager
-            from aidev_agent.core.ptc.transport import PaasPtcTransport
+            from aidev_agent.core.tools.ptc.session import PtcSessionManager
+            from aidev_agent.core.tools.ptc.transport import PaasPtcTransport
             from aidev_agent.core.tools.runtime_tools.paas_backend import PaasSandboxBackend
 
             if self.resource_manager is None:

@@ -4,8 +4,8 @@ import os
 
 import pytest
 
-from aidev_agent.core.ptc.protocol import PtcError
-from aidev_agent.core.ptc.session import PtcSessionManager
+from aidev_agent.core.tools.ptc.protocol import PtcError
+from aidev_agent.core.tools.ptc.session import PtcSessionManager
 
 
 class TestSession:

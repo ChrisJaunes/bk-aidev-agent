@@ -16,14 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from aidev_agent.core.ptc.protocol import PtcError, encode
-from aidev_agent.core.ptc.settings import PtcSettings
+from aidev_agent.core.tools.ptc.protocol import PtcError, encode
+from aidev_agent.core.tools.ptc.settings import PtcSettings
 
 
 class LocalBridge:
     def __init__(self):
         self.root = Path(tempfile.mkdtemp(prefix="ptct-", dir="/tmp"))
-        self.script = str(files("aidev_agent.core.ptc.sandbox_assets").joinpath("runner.py"))
+        self.script = str(files("aidev_agent.core.tools.ptc.sandbox_assets").joinpath("runner.py"))
         self.requests = []
         self.events = []
         self.drop_operation = None
