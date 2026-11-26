@@ -248,6 +248,10 @@ class LangGraphAgent:
                 )
                 break
 
+            # PTC keeps internal data and transient tool messages out of UI/history.
+            if event.get("metadata", {}).get("ptc_internal") is True:
+                continue
+
             current_node_name = event.get("metadata", {}).get("langgraph_node")
             event_type = event.get("event")
             self.active_run["id"] = event.get("run_id")
@@ -558,6 +562,8 @@ class LangGraphAgent:
         event: Any,
         state: State,  # noqa: ARG002
     ) -> AsyncGenerator[BaseEvent, None]:
+        if event.get("metadata", {}).get("ptc_internal") is True:
+            return
         event_type = event.get("event")
         # 上下文压缩的内部 LLM 调用不向前端展示，也不落库
         if event_type in (

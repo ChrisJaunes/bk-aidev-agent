@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, StrictInt, model_validator
 
 from aidev_agent.config import settings
+from aidev_agent.core.ptc.settings import PtcSettings
 from aidev_agent.enums import FineGrainedScoreType, IndependentQueryMode
 
 
@@ -1074,6 +1075,9 @@ class AgentExecutorKwargs(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
+    ptc_settings: PtcSettings = Field(default_factory=PtcSettings)
+    ptc_session_manager: Optional[Any] = Field(default=None, exclude=True)
+
     personal_memory_runtime: Optional[Any] = Field(default=None, description="宿主认证上下文绑定的个人记忆运行时")
 
     # 核心模型配置
@@ -1163,6 +1167,8 @@ class AgentExecutorKwargs(BaseModel):
 
 class AgentConfig(BaseModel):
     """智能体配置"""
+
+    ptc_settings: PtcSettings = Field(default_factory=PtcSettings, description="显式启用的 PTC 数据工具执行配置")
 
     agent_code: str = Field(..., description="智能体代码")
     agent_name: str = Field(..., description="智能体名称")

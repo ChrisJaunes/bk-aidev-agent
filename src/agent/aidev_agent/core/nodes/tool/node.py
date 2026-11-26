@@ -268,6 +268,44 @@ def build_tool_node(
     async_wrappers: Sequence[AsyncToolCallWrapper] | None = None,
     hook_runner: HookRunner | None = None,
 ) -> ToolNode:
+    """Build the standard tool pipeline, preserving its public contract."""
+    return _build_tool_node(
+        tools,
+        name=name,
+        tags=tags,
+        handle_tool_errors=handle_tool_errors,
+        messages_key=messages_key,
+        node_options=node_options,
+        security_settings=security_settings,
+        wrappers=wrappers,
+        async_wrappers=async_wrappers,
+        hook_runner=hook_runner,
+    )
+
+
+def build_programmatic_tool_node(tools, *, result_adapter, **kwargs) -> ToolNode:
+    """Reuse tool execution policies with an adapter before result publication."""
+    return _build_tool_node(tools, result_adapter=result_adapter, **kwargs)
+
+
+def _build_tool_node(
+    tools: Sequence[BaseTool | Callable],
+    *,
+    name: str = "tools",
+    tags: list[str] | None = None,
+    handle_tool_errors: bool
+    | str
+    | Callable[..., str]
+    | type[Exception]
+    | tuple[type[Exception], ...] = default_tool_call_handler,
+    messages_key: str = "messages",
+    node_options: ToolNodeSettings | None = None,
+    security_settings: SecuritySettings | None = None,
+    wrappers: Sequence[ToolCallWrapper] | None = None,
+    async_wrappers: Sequence[AsyncToolCallWrapper] | None = None,
+    hook_runner: HookRunner | None = None,
+    result_adapter: Callable[[ToolCallRequest, ToolMessage | Command], ToolMessage | Command] | None = None,
+) -> ToolNode:
     """构造带有中间件支持的 ToolNode。
 
     计时元数据（``use_timer``）与结果事件由两个独立 wrapper 提供：计时 wrapper 只写
@@ -316,6 +354,19 @@ def build_tool_node(
     # 其内依次是循环守卫 → 代理解包 → tool_pre → 结果出口净化链 → tool_post（最内层）。
     sync_wrapper_list: list[ToolCallWrapper] = [dispatch_tool_result_event]
     async_wrapper_list: list[AsyncToolCallWrapper] = [dispatch_tool_result_event_async]
+
+    # Adapt program data before the outer event wrapper publishes the result.
+    # Ordinary tools keep the original wrapper list and behavior.
+    if result_adapter is not None:
+
+        def adapt_sync(request, execute):
+            return result_adapter(request, execute(request))
+
+        async def adapt_async(request, execute):
+            return result_adapter(request, await execute(request))
+
+        sync_wrapper_list.append(adapt_sync)
+        async_wrapper_list.append(adapt_async)
 
     if node_options.enable_tool_loop_guard:
         loop_guard = LoopGuardPolicy(

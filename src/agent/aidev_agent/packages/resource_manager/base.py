@@ -588,6 +588,7 @@ class BaseResourceManager(abc.ABC):
             reasoning_effort=prompt_setting.get("reasoning_effort"),
             agent_info=agent_info,
             security_settings=SecuritySettings(**(agent_info.get("security_settings") or {})),
+            ptc_settings=agent_info.get("ptc_settings") or {},
         )
 
     def check_agent_call_permission(self, caller_app_code: str, username: Optional[str] = None, **kwargs) -> dict:

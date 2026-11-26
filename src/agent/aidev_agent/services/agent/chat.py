@@ -41,6 +41,7 @@ from aidev_agent.core.ag_ui.utils import (
 )
 from aidev_agent.core.citations import uses_citations
 from aidev_agent.core.nodes.model import convert_chat_history_to_messages
+from aidev_agent.core.ptc.settings import PtcSettings
 from aidev_agent.core.tools.a2a_tools.types import AgentBackendType, AgentSpec
 from aidev_agent.core.tools.runtime_tools import RuntimeBackendResolver
 from aidev_agent.core.tools.runtime_tools.defer_manager import default_runtime_backend_defer_manager
@@ -235,6 +236,9 @@ class ChatCompletionAgent(BaseModel):
             "不跟踪 URL 过期时间，key 为 (session_code, 归一化 PV 相对路径)；失败不入缓存。"
         ),
     )
+    ptc_settings: PtcSettings = Field(default_factory=PtcSettings, exclude=True)
+    ptc_session_manager: Any = Field(default=None, exclude=True)
+
     runtime_backend_resolver: Any = Field(
         default=None,
         exclude=True,
@@ -292,6 +296,7 @@ class ChatCompletionAgent(BaseModel):
         # SecuritySettings()——C2 裁决：兜底只保留在最外层 Chat 入口，ReActAgentBuilder 不再回落。
         if ctx.agent_config is not None:
             self.security_settings = ctx.agent_config.security_settings
+            self.ptc_settings = getattr(ctx.agent_config, "ptc_settings", PtcSettings())
         self.memory_agent_code = ctx.agent_code
         self.skills = builder.build_skills()
         self.tools = builder.build_tools()
@@ -626,6 +631,33 @@ class ChatCompletionAgent(BaseModel):
         # 用户主动停止时也释放资源
         self.release_resources()
 
+    def _get_ptc_session_manager(self):
+        if not self.ptc_settings.enabled:
+            return None
+        if self.ptc_session_manager is None:
+            from aidev_agent.core.ptc.session import PtcSessionManager
+            from aidev_agent.core.ptc.transport import PaasPtcTransport
+            from aidev_agent.core.tools.runtime_tools.paas_backend import PaasSandboxBackend
+
+            if self.resource_manager is None:
+                raise ValueError("PTC requires a request-bound resource manager")
+            info = self.executor_info or {}
+            backend = PaasSandboxBackend(
+                app_code=info.get("app_code") or settings.APP_CODE,
+                bk_username=info.get("executor") or "",
+                client=self.resource_manager.get_paas_sbx_client(info),
+                snapshot=self.ptc_settings.snapshot,
+                snapshot_entrypoint=[],
+                env_vars={},
+                workspace="/tmp",
+                ttl_seconds=self.ptc_settings.sandbox_ttl_seconds,
+                request_timeout=self.ptc_settings.http_timeout,
+            )
+            self.ptc_session_manager = PtcSessionManager(
+                PaasPtcTransport(backend, self.ptc_settings), self.ptc_settings
+            )
+        return self.ptc_session_manager
+
     def release_resources(self) -> None:
         """释放 agent 持有的资源（沙箱后端等）。
 
@@ -635,6 +667,13 @@ class ChatCompletionAgent(BaseModel):
         —— save() 登记记录供后续请求挂载复用，实例由 defer_manager 持有，TTL 到期或进程退出时真实销毁
         此方法是幂等的 — 多次调用不会产生副作用
         """
+        if self.ptc_session_manager is not None:
+            try:
+                self.ptc_session_manager.close()
+            except Exception:
+                logger.warning("PTC sandbox cleanup failed", exc_info=True)
+            finally:
+                self.ptc_session_manager = None
         if self.runtime_backend_resolver is not None:
             try:
                 self.runtime_backend_resolver.close()
@@ -1650,6 +1689,8 @@ class ChatCompletionAgent(BaseModel):
             )
         with recording_span("agent.chat.graph.build", attributes={"agent.session.code": self.thread_id}):
             return self.agent_cls.get_agent_executor(
+                ptc_settings=self.ptc_settings,
+                ptc_session_manager=self._get_ptc_session_manager(),
                 personal_memory_runtime=personal_memory_runtime,
                 llm=self.chat_model,
                 non_thinking_llm=self.chat_model_non_thinking or self.chat_model,

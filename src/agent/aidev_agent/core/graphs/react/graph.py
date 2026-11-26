@@ -249,6 +249,8 @@ class ReActAgentBuilder:
         ] = {}  # runtime_name -> param extractor (skill, config) -> dict
         # 工具设置
         self._extra_tools: list[BaseTool] = []
+        self._ptc_settings = None
+        self._ptc_session_manager = None
         self._enable_runtime_tool: bool = False
         self._runtime_backend_resolver = None
         self._enable_security_runtime: bool = True  # 默认启用安全校验
@@ -656,6 +658,8 @@ class ReActAgentBuilder:
 
     def set_bkai_options(self, options: AgentExecutorKwargs) -> "ReActAgentBuilder":
         """将 BkAi 平台通用配置（AgentExecutorKwargs）映射到 builder 内部状态。"""
+        self._ptc_settings = options.ptc_settings
+        self._ptc_session_manager = options.ptc_session_manager
         if options.personal_memory_runtime is not None:
             self.enable_personal_memory(options.personal_memory_runtime)
         if options.resource_manager is not None:
@@ -1050,6 +1054,11 @@ class ReActAgentBuilder:
 
         if self._personal_memory is not None:
             builtin_tools.extend(self._personal_memory.make_tools())
+
+        if self._ptc_settings is not None and self._ptc_settings.enabled:
+            from aidev_agent.core.ptc.tool import ExecutePythonTool
+
+            builtin_tools.append(ExecutePythonTool(executor=None))
 
         if settings.BKAI_TOOL_NAME_DEDUPE_ENABLED:
             # 延迟加载开启时元工具名同样是内置保留名，在唯一一次去重里一并占位
@@ -1533,6 +1542,26 @@ class ReActAgentBuilder:
             ignore_errors=use_structured_response,
             langchain_middleware=self._langchain_middleware,
         )
+
+        if self._ptc_settings is not None and self._ptc_settings.enabled:
+            from aidev_agent.core.ptc.tool import ExecutePythonTool, PtcToolExecutor
+
+            ptc_tools = [tool for tool in builtin_tools if isinstance(tool, ExecutePythonTool)]
+            if ptc_tools:
+                if self._ptc_session_manager is None or use_structured_response:
+                    raise ValueError("PTC requires a session manager and a tool-calling model")
+                executor = PtcToolExecutor(
+                    self._ptc_session_manager,
+                    self._ptc_settings,
+                    self._security_settings,
+                    middleware=self._langchain_middleware,
+                    hook_runner=hook_runner,
+                    known_secrets=[(self._executor_info or {}).get(key) for key in ("access_token", "app_secret")],
+                )
+                executor.bind([tool for tool in tools if all(tool is not builtin for builtin in builtin_tools)])
+                for tool in ptc_tools:
+                    tool.executor = executor
+                    tool.description += " Permitted data tools: " + ", ".join(sorted(executor.tools))
 
         # 两步RAG模式：根据 enable_knowledge_node 决定是否创建独立的 knowledge_node
         knowledge_node = self._prepare_agent_knowledge_node(

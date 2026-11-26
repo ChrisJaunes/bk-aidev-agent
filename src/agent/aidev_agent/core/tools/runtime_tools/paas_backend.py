@@ -252,6 +252,7 @@ class PaasSandboxBackend(RuntimeBackend):
         workspace: str | None = None,
         ttl_seconds: int | None = None,
         extra_sensitive_values: list[str] | None = None,
+        request_timeout: int | None = None,
     ) -> None:
         """初始化 PaaS Sandbox 后端。
 
@@ -272,6 +273,7 @@ class PaasSandboxBackend(RuntimeBackend):
 
         # 认证属性
         self._app_code = app_code
+        self._request_timeout = request_timeout
         self._bk_username = bk_username
         self._extra_sensitive_values = extra_sensitive_values or []
         self.client = client
@@ -360,6 +362,7 @@ class PaasSandboxBackend(RuntimeBackend):
         response = self.client.create_sandbox.request(
             json=payload,
             path_params={"app_code": self._app_code},
+            **({"timeout": self._request_timeout} if self._request_timeout is not None else {}),
             **_trace_request_kwargs(),
         )
         response.raise_for_status()
@@ -409,6 +412,7 @@ class PaasSandboxBackend(RuntimeBackend):
         response = self.client.exec_command.request(
             json={"cmd": cmd},
             path_params={"sandbox_id": sandbox_id},
+            **({"timeout": timeout} if timeout is not None else {}),
             **_trace_request_kwargs(),
         )
         response.raise_for_status()
@@ -441,6 +445,7 @@ class PaasSandboxBackend(RuntimeBackend):
         response = self.client.upload_file.request(
             files={"file": (filename, content), "path": (None, path)},
             path_params={"sandbox_id": sandbox_id},
+            **({"timeout": self._request_timeout} if self._request_timeout is not None else {}),
             **_trace_request_kwargs(),
         )
         response.raise_for_status()
